@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, PartialEq)]
 pub enum CoreEvent {
     AssistantChunk(String),
+    Error(String),
 }
+
+const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
+const MODEL: &str = "mistral-nemo";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OllamaMessage {
@@ -36,6 +40,36 @@ fn extract_reply(json: &str) -> Result<String> {
     Ok(response.message.content)
 }
 
+fn to_core_event(fetch_result: std::result::Result<String, String>) -> CoreEvent {
+    match fetch_result {
+        Ok(body) => match extract_reply(&body) {
+            Ok(text) => CoreEvent::AssistantChunk(text),
+            Err(e) => CoreEvent::Error(e.to_string()),
+        },
+        Err(message) => CoreEvent::Error(message),
+    }
+}
+
+fn fetch_ollama_reply(text: &str) -> std::result::Result<String, String> {
+    let request = ChatRequest {
+        model: MODEL.to_string(),
+        messages: vec![OllamaMessage {
+            role: "user".to_string(),
+            content: text.to_string(),
+        }],
+        stream: false,
+    };
+
+    let mut response = ureq::post(OLLAMA_URL)
+        .send_json(&request)
+        .map_err(|e| e.to_string())?;
+
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())
+}
+
 pub struct Core {
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
@@ -56,8 +90,8 @@ impl Core {
     pub fn submit_user_message(&mut self, text: String) {
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let reply = format!("echo: {text}");
-            let _ = tx.send(CoreEvent::AssistantChunk(reply));
+            let event = to_core_event(fetch_ollama_reply(&text));
+            let _ = tx.send(event);
         });
     }
 
@@ -73,7 +107,6 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     // Ollama's /api/chat request body: model name, chat history, and
     // stream: false so the response arrives as one JSON object rather
@@ -131,35 +164,32 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // poll_events() is non-blocking, so it can race a reply that hasn't
-    // arrived yet. Retry on the test's side until something shows up.
-    fn poll_until_nonempty(core: &mut Core, timeout: Duration) -> Vec<CoreEvent> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let events = core.poll_events();
-            if !events.is_empty() {
-                return events;
-            }
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for a CoreEvent");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    // to_core_event() is the pure decision logic that turns "did the
+    // Ollama request succeed" into a CoreEvent, kept separate from the
+    // actual ureq I/O so these three cases don't need a live server.
+    #[test]
+    fn to_core_event_returns_assistant_chunk_for_a_well_formed_response() {
+        let body = r#"{ "message": { "role": "assistant", "content": "hi there" }, "done": true }"#
+            .to_string();
+
+        let event = to_core_event(Ok(body));
+
+        assert_eq!(event, CoreEvent::AssistantChunk("hi there".to_string()));
     }
 
-    // Proves the thread + mpsc round-trip end to end: submitting a message
-    // spawns a thread, and its reply shows up via poll_events() afterward.
     #[test]
-    fn submit_user_message_replies_on_a_background_thread() {
-        let mut core = Core::new();
+    fn to_core_event_returns_error_for_a_malformed_response_body() {
+        let body = "{ not valid json".to_string();
 
-        core.submit_user_message("hello".to_string());
+        let event = to_core_event(Ok(body));
 
-        let events = poll_until_nonempty(&mut core, Duration::from_secs(1));
+        assert!(matches!(event, CoreEvent::Error(_)));
+    }
 
-        assert_eq!(
-            events,
-            vec![CoreEvent::AssistantChunk("echo: hello".to_string())]
-        );
+    #[test]
+    fn to_core_event_returns_error_when_the_request_itself_failed() {
+        let event = to_core_event(Err("connection refused".to_string()));
+
+        assert!(matches!(event, CoreEvent::Error(_)));
     }
 }
