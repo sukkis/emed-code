@@ -123,5 +123,9 @@ below points at the one that applies.
    `ARCHITECTURE.md`, and/or `SECURITY.md` for whatever this step made
    stale or newly true; update `docs/<topic>.md`'s status if it's
    tracking this step.
-6. Stop. Discuss what's next — the next step, or what's deferred and
+6. Offer a one-line commit message for the step's diff, unprompted —
+   don't wait to be asked. Never run `git commit` (or `git add`)
+   yourself; committing is always the user's action, on their own
+   schedule, even right after offering the message.
+7. Stop. Discuss what's next — the next step, or what's deferred and
    why — before starting another one.
