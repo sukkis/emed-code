@@ -42,6 +42,12 @@ below points at the one that applies.
   whatever's durable moves into README/ARCHITECTURE/SECURITY — `docs/`
   itself is the trail that got us there, not the destination. It's fine
   for it to go stale once an increment closes.
+- **Never point at `docs/<topic>.md` (or anything else under `docs/`)
+  from code comments, doc comments, or README/ARCHITECTURE/SECURITY.**
+  Those files aren't in the repo, so the reference is dangling for
+  anyone else who checks it out. If a comment needs the *why*, either
+  say it inline or put the durable version in ARCHITECTURE.md/SECURITY.md
+  and reference that instead.
 
 ## Pace: Human Speed, Not Machine Speed
 - Work in the smallest increment that is still a coherent step — one
@@ -117,5 +123,9 @@ below points at the one that applies.
    `ARCHITECTURE.md`, and/or `SECURITY.md` for whatever this step made
    stale or newly true; update `docs/<topic>.md`'s status if it's
    tracking this step.
-6. Stop. Discuss what's next — the next step, or what's deferred and
+6. Offer a one-line commit message for the step's diff, unprompted —
+   don't wait to be asked. Never run `git commit` (or `git add`)
+   yourself; committing is always the user's action, on their own
+   schedule, even right after offering the message.
+7. Stop. Discuss what's next — the next step, or what's deferred and
    why — before starting another one.
