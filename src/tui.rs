@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::{Core, CoreEvent};
@@ -20,15 +20,25 @@ fn format_core_event(event: CoreEvent) -> String {
 }
 
 // offset is "how many lines scrolled up from the bottom" (0 = latest).
-// Clamped to the last line index so it can't scroll past the top —
-// including when the log is empty, where that index is 0.
-fn scroll_up(offset: usize, log_len: usize, step: usize) -> usize {
-    let max = log_len.saturating_sub(1);
-    (offset + step).min(max)
+// Unclamped here — the real ceiling (can't scroll past the top) depends
+// on the wrapped *line* count, which needs the render width, not
+// available at key-press time. That clamp happens in chat_scroll_skip
+// instead, at render time.
+fn scroll_up(offset: usize, step: usize) -> usize {
+    offset + step
 }
 
 fn scroll_down(offset: usize, step: usize) -> usize {
     offset.saturating_sub(step)
+}
+
+// Converts "how many lines scrolled up from the bottom" into "how many
+// lines to skip from the top" for Paragraph::scroll — the render-time
+// clamp that keeps scrolling sane regardless of how large offset gets
+// (an over-large offset just saturates to 0, "scrolled all the way up").
+fn chat_scroll_skip(total_lines: usize, visible_height: usize, scroll_offset: usize) -> u16 {
+    let max_skip = total_lines.saturating_sub(visible_height);
+    max_skip.saturating_sub(scroll_offset) as u16
 }
 
 fn display_width(c: char) -> usize {
@@ -92,6 +102,22 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     chunks
 }
 
+// Splits on real line breaks first (preserving blank lines and each
+// line's own leading indentation), then word-wraps each individual
+// line only if it's actually too wide. Calling wrap_line directly on a
+// whole multi-paragraph block would strip every embedded newline (it
+// only expects a single already-split line), collapsing paragraph
+// structure entirely.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return wrap_line("", width);
+    }
+
+    text.lines()
+        .flat_map(|line| wrap_line(line, width))
+        .collect()
+}
+
 pub fn is_quit_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -104,15 +130,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let chat_block = Block::bordered().title("emed-code");
     let chat_inner = chat_block.inner(chat_area);
-    let total_lines = app.log().len();
-    let visible_height = chat_inner.height as usize;
-    let max_skip = total_lines.saturating_sub(visible_height);
-    let skip = max_skip.saturating_sub(app.scroll_offset()) as u16;
 
-    let chat_text = app.log().join("\n");
+    let wrapped_lines: Vec<String> = app
+        .log()
+        .iter()
+        .flat_map(|entry| wrap_text(entry, chat_inner.width as usize))
+        .collect();
+    let skip = chat_scroll_skip(
+        wrapped_lines.len(),
+        chat_inner.height as usize,
+        app.scroll_offset(),
+    );
+
+    let chat_text = wrapped_lines.join("\n");
     let chat = Paragraph::new(chat_text)
         .block(chat_block)
-        .wrap(Wrap { trim: false })
         .scroll((skip, 0));
     frame.render_widget(chat, chat_area);
 
@@ -189,13 +221,9 @@ impl App {
 
         match key.code {
             KeyCode::Enter => self.submit(),
-            KeyCode::Up => {
-                self.scroll_offset = scroll_up(self.scroll_offset, self.log.len(), SCROLL_STEP)
-            }
+            KeyCode::Up => self.scroll_offset = scroll_up(self.scroll_offset, SCROLL_STEP),
             KeyCode::Down => self.scroll_offset = scroll_down(self.scroll_offset, SCROLL_STEP),
-            KeyCode::PageUp => {
-                self.scroll_offset = scroll_up(self.scroll_offset, self.log.len(), PAGE_SCROLL_STEP)
-            }
+            KeyCode::PageUp => self.scroll_offset = scroll_up(self.scroll_offset, PAGE_SCROLL_STEP),
             KeyCode::PageDown => {
                 self.scroll_offset = scroll_down(self.scroll_offset, PAGE_SCROLL_STEP)
             }
@@ -308,6 +336,68 @@ mod tests {
         assert!(
             content.contains("message"),
             "expected the long line to wrap rather than being cut off: {content:?}"
+        );
+    }
+
+    // Regression coverage for the bug this step fixes: with the old
+    // entry-count-based scroll math, a single long entry wrapping into
+    // many lines left the view stuck unable to show or scroll to new
+    // content. 40 short words at width 8 wrap into far more lines than
+    // the ~10 visible rows (a generous margin — this isn't testing an
+    // exact boundary, just that scrolling meaningfully happens at all).
+    fn type_and_submit(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+    }
+
+    fn rendered_content(app: &App) -> String {
+        let backend = TestBackend::new(10, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn default_scroll_shows_the_end_of_a_long_wrapped_message() {
+        let mut app = App::new();
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+
+        let content = rendered_content(&app);
+
+        assert!(
+            content.contains("w40"),
+            "expected the most recent part of a long message to be visible by default: {content:?}"
+        );
+        assert!(
+            !content.contains("w1 "),
+            "expected the earliest part of a long message to have scrolled out of view by default: {content:?}"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_reveals_the_start_of_a_long_wrapped_message() {
+        let mut app = App::new();
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+
+        for _ in 0..30 {
+            app.handle_key(press(KeyCode::Up));
+        }
+
+        let content = rendered_content(&app);
+
+        assert!(
+            content.contains("w1 "),
+            "expected scrolling up enough to reveal the start of a long message: {content:?}"
         );
     }
 
@@ -469,19 +559,15 @@ mod tests {
         );
     }
 
+    // scroll_up no longer clamps against log length — that was always
+    // the wrong ceiling (it should be wrapped *line* count, not entry
+    // count, and the render width needed to know that isn't available
+    // at key-press time anyway). The real clamp now lives entirely in
+    // chat_scroll_skip, which runs at render time where the width is
+    // actually known.
     #[test]
     fn scroll_up_increases_offset_by_step() {
-        assert_eq!(scroll_up(0, 10, 1), 1);
-    }
-
-    #[test]
-    fn scroll_up_is_clamped_to_the_last_line_index() {
-        assert_eq!(scroll_up(0, 10, 100), 9);
-    }
-
-    #[test]
-    fn scroll_up_on_an_empty_log_stays_at_zero() {
-        assert_eq!(scroll_up(0, 0, 1), 0);
+        assert_eq!(scroll_up(0, 1), 1);
     }
 
     #[test]
@@ -495,12 +581,28 @@ mod tests {
     }
 
     #[test]
-    fn up_key_does_nothing_on_an_empty_log() {
-        let mut app = App::new();
+    fn chat_scroll_skip_shows_the_bottom_by_default() {
+        assert_eq!(chat_scroll_skip(10, 4, 0), 6);
+    }
 
-        app.handle_key(press(KeyCode::Up));
+    #[test]
+    fn chat_scroll_skip_moves_up_as_offset_increases() {
+        assert_eq!(chat_scroll_skip(10, 4, 2), 4);
+    }
 
-        assert_eq!(app.scroll_offset(), 0);
+    #[test]
+    fn chat_scroll_skip_is_clamped_to_the_top() {
+        assert_eq!(chat_scroll_skip(10, 4, 100), 0);
+    }
+
+    #[test]
+    fn chat_scroll_skip_is_zero_when_all_content_already_fits() {
+        assert_eq!(chat_scroll_skip(3, 10, 0), 0);
+    }
+
+    #[test]
+    fn chat_scroll_skip_on_an_empty_log() {
+        assert_eq!(chat_scroll_skip(0, 4, 0), 0);
     }
 
     #[test]
@@ -580,5 +682,38 @@ mod tests {
     #[test]
     fn wrap_line_with_zero_width_returns_no_chunks() {
         assert_eq!(wrap_line("hello", 0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wrap_text_preserves_blank_lines_between_paragraphs() {
+        assert_eq!(
+            wrap_text("para one\n\npara two", 20),
+            vec![
+                "para one".to_string(),
+                String::new(),
+                "para two".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_text_preserves_indentation_of_each_line() {
+        assert_eq!(
+            wrap_text("  indented line\nnormal line", 30),
+            vec!["  indented line".to_string(), "normal line".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_still_word_wraps_a_line_that_is_too_wide() {
+        assert_eq!(
+            wrap_text("hello world", 8),
+            vec!["hello ".to_string(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_of_an_empty_string_returns_one_empty_chunk() {
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
     }
 }

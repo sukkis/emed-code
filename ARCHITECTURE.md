@@ -146,12 +146,31 @@ Confirmed while evaluating this: emed's `Lexer` trait
 borrowed from emed (a V2+ item, not Phases 1–4), that reuse is
 unaffected by any of the above either way.
 
-Known gap carried forward: `wrap_line` exists and is tested, but isn't
-wired into `draw` yet — the scroll/visible-window math still counts log
-*entries* rather than rendered *lines*, which undercounts once a long
-entry actually wraps. Wiring this in (and using the resulting exact
-line count for scroll clamping, dropping `Paragraph::wrap` itself so
-counted and rendered lines can't disagree) is the very next step.
+`wrap_line` is now wired into `draw` via `wrap_text(text: &str, width:
+usize) -> Vec<String>`, not called directly on a whole log entry.
+`wrap_line` only expects a single already-`\n`-free line (matching its
+origin: one rope buffer line); calling it straight on a multi-paragraph
+entry stripped every embedded newline, collapsing paragraph breaks and
+indentation into one continuous run before width-wrapping. `wrap_text`
+splits on real line breaks first (`.lines()`, which preserves blank
+lines and each line's own leading whitespace) and only sends individual
+lines to `wrap_line` for width-wrapping. The resulting flat line count
+now drives both rendering and `chat_scroll_skip`'s scroll math, so
+counted and rendered lines can't disagree — this was the whole point of
+doing the wrapping ourselves instead of splitting the responsibility
+between our own line-counting and ratatui's separate `Paragraph::wrap`.
+
+Known gap: `scroll_up` (`offset + step`, unconditional) relies entirely
+on `chat_scroll_skip`'s render-time saturation to keep the *rendered*
+result correct — but the internal `scroll_offset` counter itself can
+overshoot the true top with no ceiling. `scroll_down` afterward has to
+"pay off" that overshoot step by step before the visible view starts
+moving again, which is technically correct but feels unresponsive.
+Fixing this needs `App` to know the true ceiling (total wrapped lines
+minus visible height), which isn't available at key-press time — it
+requires feeding the last-rendered width/height back from `draw`,
+meaning `draw` taking `&mut App` rather than `&App`. Deferred to its own
+step rather than folded in here.
 
 ## Error handling: plain strings for now, no bespoke error type yet
 
