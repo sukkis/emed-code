@@ -1,9 +1,13 @@
 test:
     cargo test --features local
 
-ci:
+fmt: 
     cargo fmt --check
+
+clippy:
     cargo clippy -- -D warnings
+    
+ci:
     cargo test
 
-all: ci
+all: fmt clippy ci

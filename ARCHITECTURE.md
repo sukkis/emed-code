@@ -54,6 +54,28 @@ being invented fresh here. `just ci` runs plain `cargo test` (the
 `local`-gated files compile to zero tests), `just test` runs with
 `--features local` for full local coverage.
 
+## No separate `crossterm` dependency — use ratatui's re-export
+
+`tui` code imports crossterm types via `ratatui::crossterm::...`, not a
+directly-added `crossterm` line in `Cargo.toml`. `ratatui`'s `crossterm`
+feature (on by default) pulls in a specific crossterm version internally
+and re-exports it at `ratatui::crossterm`. Adding our own separate
+`crossterm` dependency risks Cargo resolving a *different* version than
+the one `ratatui` itself was built against for the same functionality —
+using the re-export guarantees they're always the same one.
+
+## Terminal setup/teardown: `ratatui::run`, not hand-rolled
+
+`main.rs` wraps its event loop in `ratatui::run(|terminal| { ... })`
+rather than manually calling crossterm's raw-mode/alternate-screen
+functions. `run` calls `ratatui::init()` (enables raw mode + alternate
+screen, installs a panic hook that restores the terminal even if the
+closure panics) before running the closure, then unconditionally calls
+`ratatui::restore()` after — including on an early return via `?`. This
+means panic-safe terminal restoration doesn't need any code of our own;
+it comes from using this helper instead of managing terminal state
+directly.
+
 ## Error handling: plain strings for now, no bespoke error type yet
 
 Provider errors currently collapse to `String` (via `.to_string()` on
