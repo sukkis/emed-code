@@ -101,6 +101,58 @@ means panic-safe terminal restoration doesn't need any code of our own;
 it comes from using this helper instead of managing terminal state
 directly.
 
+## Main loop timing: poll with a timeout, not a blocking read
+
+`main.rs`'s loop uses `event::poll(Duration::from_millis(100))` rather
+than a blocking `event::read()`. A blocking read would mean `Core`
+replies arriving while the user isn't typing go unnoticed until the
+next keypress happens to trigger a redraw. `poll` returns immediately
+the moment a real key event is ready — the timeout only bounds how long
+it's willing to wait when *nothing* happens, so typing latency is
+unaffected; only "is there anything new from `Core`" carries up to
+100ms of lag, and only during idle time. Getting genuinely zero-latency
+wakeups (no timeout at all) would require unifying keyboard input and
+`Core`'s replies into one channel the loop blocks on indefinitely —
+`std::sync::mpsc` can't select across two independently-typed channels,
+so that would mean either reworking `Core` to report via an injected
+callback/sender instead of owning its own internal channel, or adding
+`crossbeam-channel` for real multi-channel `select!`. Not worth it for
+100ms of harmless idle-only lag; revisit if that ever stops being true.
+
+## Text wrapping: ported from emed, not a shared dependency
+
+Long chat lines are wrapped with a standalone `wrap_line(line: &str,
+width: usize) -> Vec<String>` (word-wrap on spaces, hard-break a single
+word longer than the width, real `unicode-width` character
+measurement) — the same approach as emed's `src/wrap.rs`, ported rather
+than depended on. `emed`'s `wrapped_lines` is a method on `EditorState`
+(its whole rope-backed buffer/cursor/undo state), not a standalone
+function, so reusing it directly would mean constructing a full
+`EditorState` for something conceptually self-contained.
+
+Also considered and declined: adopting `ropey` more broadly, for
+consistency with emed. `InputBox` (a single short line, edited only at
+its end) and the log (an append-only transcript, never edited in
+place) don't have the shape `ropey` is for — efficient arbitrary-
+position edits in a large, actively-edited document. `String` and
+`Vec<String>` already fit both. If a future piece genuinely needs that
+(not currently planned — Phase 4's diff view is confirm-only, not
+inline-editable), that's a fresh decision for that piece specifically,
+not a reason to convert what's here now.
+
+Confirmed while evaluating this: emed's `Lexer` trait
+(`tokenize_line(&self, line: &str, in_comment: bool)`) takes a plain
+`&str` with zero `ropey` involvement, so if syntax highlighting is ever
+borrowed from emed (a V2+ item, not Phases 1–4), that reuse is
+unaffected by any of the above either way.
+
+Known gap carried forward: `wrap_line` exists and is tested, but isn't
+wired into `draw` yet — the scroll/visible-window math still counts log
+*entries* rather than rendered *lines*, which undercounts once a long
+entry actually wraps. Wiring this in (and using the resulting exact
+line count for scroll clamping, dropping `Paragraph::wrap` itself so
+counted and rendered lines can't disagree) is the very next step.
+
 ## Error handling: plain strings for now, no bespoke error type yet
 
 Provider errors currently collapse to `String` (via `.to_string()` on

@@ -12,6 +12,7 @@ local = []
 [dependencies]
 ratatui = "0.30.2"
 ureq = { version = "3.3.0", features = ["json"] }
+unicode-width = "0.2.2"
 anyhow = "1.0.104"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

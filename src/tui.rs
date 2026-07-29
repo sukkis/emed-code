@@ -5,6 +5,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use crate::core::{Core, CoreEvent};
 
@@ -28,6 +29,67 @@ fn scroll_up(offset: usize, log_len: usize, step: usize) -> usize {
 
 fn scroll_down(offset: usize, step: usize) -> usize {
     offset.saturating_sub(step)
+}
+
+fn display_width(c: char) -> usize {
+    match c {
+        '\t' => 4,
+        '\n' | '\r' => 0,
+        _ => c.width().unwrap_or(0),
+    }
+}
+
+// Ported from emed's src/wrap.rs (wrapped_lines), adapted to a plain
+// &str instead of a rope-buffer line. Breaks at the nearest space at or
+// before the width limit, keeping the space attached to the end of the
+// earlier chunk; a word with no space that's itself longer than width
+// is hard-broken, since there's no space to back up to. Concatenating
+// all returned chunks reproduces the original line exactly. An empty
+// line still returns one (empty) chunk — unlike emed's version, which
+// leaves that to a separate caller we don't have here.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let chars: Vec<char> = line.chars().filter(|&c| c != '\n').collect();
+
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0;
+    let mut cols_used = 0;
+    let mut last_space_index: Option<usize> = None;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let char_width = display_width(chars[i]);
+
+        if cols_used + char_width > width {
+            let break_at = last_space_index.map_or(i, |space| space + 1);
+            chunks.push(chars[chunk_start..break_at].iter().collect());
+
+            chunk_start = break_at;
+            i = chunk_start;
+            cols_used = 0;
+            last_space_index = None;
+            continue;
+        }
+
+        if chars[i] == ' ' {
+            last_space_index = Some(i);
+        }
+        cols_used += char_width;
+        i += 1;
+    }
+
+    if chunk_start < chars.len() {
+        chunks.push(chars[chunk_start..].iter().collect());
+    }
+
+    chunks
 }
 
 pub fn is_quit_key(key: &KeyEvent) -> bool {
@@ -472,5 +534,51 @@ mod tests {
         app.handle_key(press(KeyCode::PageUp));
 
         assert!(app.scroll_offset() > 1);
+    }
+
+    #[test]
+    fn display_width_of_a_plain_ascii_char_is_one() {
+        assert_eq!(display_width('a'), 1);
+    }
+
+    #[test]
+    fn display_width_of_a_wide_char_is_two() {
+        assert_eq!(display_width('中'), 2);
+    }
+
+    #[test]
+    fn display_width_of_tab_is_four() {
+        assert_eq!(display_width('\t'), 4);
+    }
+
+    #[test]
+    fn wrap_line_returns_the_line_unchanged_when_it_fits() {
+        assert_eq!(wrap_line("hello", 20), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn wrap_line_wraps_on_a_space_keeping_it_with_the_earlier_chunk() {
+        assert_eq!(
+            wrap_line("hello world", 8),
+            vec!["hello ".to_string(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_line_hard_breaks_a_word_longer_than_the_width() {
+        assert_eq!(
+            wrap_line("abcdefgh", 3),
+            vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_line_of_an_empty_string_returns_one_empty_chunk() {
+        assert_eq!(wrap_line("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrap_line_with_zero_width_returns_no_chunks() {
+        assert_eq!(wrap_line("hello", 0), Vec::<String>::new());
     }
 }
