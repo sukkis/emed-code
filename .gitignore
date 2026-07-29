@@ -1,0 +1,7 @@
+/target
+
+# internal scratch pad
+/docs
+
+# Emacs backup files
+*~
