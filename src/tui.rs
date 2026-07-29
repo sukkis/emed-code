@@ -22,8 +22,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let chat = Paragraph::new(chat_text).block(Block::bordered().title("emed-code"));
     frame.render_widget(chat, chat_area);
 
-    let input = Paragraph::new(app.input_buffer()).block(Block::bordered().title("input"));
+    let input_block = Block::bordered().title("input");
+    let input_inner = input_block.inner(input_area);
+    let input = Paragraph::new(app.input_buffer()).block(input_block);
     frame.render_widget(input, input_area);
+
+    let cursor_x = input_inner.x + app.input_buffer().chars().count() as u16;
+    frame.set_cursor_position((cursor_x, input_inner.y));
 }
 
 #[derive(Debug, Default)]
@@ -151,6 +156,32 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // Input area is the bottom 3 rows of a 20x6 backend (Length(3)),
+    // bordered on all sides, so its inner content row is (1..19, 4).
+    #[test]
+    fn cursor_is_at_the_start_of_the_input_box_when_empty() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((1, 4));
+    }
+
+    #[test]
+    fn cursor_is_positioned_after_the_typed_text() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
     }
 
     #[test]
