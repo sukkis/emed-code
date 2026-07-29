@@ -9,9 +9,10 @@ lives locally under `docs/` (gitignored, not part of this record).
 `core` (`src/core.rs`) holds conversation state and provider round-trips;
 it has zero `ratatui`/`crossterm` imports. It exposes exactly two entry
 points: `submit_user_message(&mut self, text: String)` and
-`poll_events(&mut self) -> Vec<CoreEvent>`. The `tui` module (not yet
-built) will own all rendering/input state and talk to `core` only
-through that pair of calls. Keeping the boundary this narrow is what
+`poll_events(&mut self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all
+rendering/input state — `InputBox` (typed text), `App` (owns `InputBox`
+plus the message log and the one `Core` instance) — and talks to `core`
+only through that pair of calls. Keeping the boundary this narrow is what
 lets `core` be tested with zero terminal/rendering setup at all.
 
 ## Concurrency: thread + `mpsc`, no async runtime
@@ -41,6 +42,30 @@ This means the interesting behavior (what happens on a malformed
 response vs. a failed request) is covered by fast, deterministic unit
 tests, and the untestable-without-a-real-server sliver is kept as thin
 as possible.
+
+## `App`-level tests don't mock `Core`
+
+`App::handle_key`'s tests (Enter submits, non-Enter forwards to
+`InputBox`) only assert on `App`'s own observable state — log content,
+input cleared — never on whether `Core::submit_user_message` "really"
+ran. Introducing a trait/mock seam for `Core` purely to make that one
+extra assertion possible isn't earning its keep: `Core`'s own behavior
+is already covered by its own tests (see "Testing strategy" above), and
+the full path (type → Enter → see a reply) still gets a real check by
+running the app. Revisit if `App`-level logic grows complex enough that
+"was `Core` engaged correctly" stops being obvious from reading the one
+line that calls it.
+
+## Quit-key detection is a pure predicate, not inline in `main.rs`
+
+`is_quit_key(&KeyEvent) -> bool` (in `tui.rs`) decides whether a key
+event should end the program (currently Ctrl-C or Ctrl-Q); `main.rs`
+just calls it before forwarding anything else to `App`. The surrounding
+loop (reading real events from a real terminal) can't be unit-tested,
+but the decision itself doesn't need a terminal at all — same
+pure-logic-vs-thin-shell split as `Core`'s provider code. This is also
+why `main.rs` has stayed free of its own crossterm imports beyond
+`event`/`Event`: the crossterm-type-level work happens in `tui.rs`.
 
 ## The `local` Cargo feature: gating tests that need a real external service
 

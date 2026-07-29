@@ -2,18 +2,27 @@
 // through Core::submit_user_message/poll_events.
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Paragraph};
 
-pub fn draw(frame: &mut Frame) {
+use crate::core::Core;
+
+pub fn is_quit_key(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
+}
+
+pub fn draw(frame: &mut Frame, app: &App) {
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
 
-    let chat = Paragraph::new("").block(Block::bordered().title("emed-code"));
+    let chat_text = app.log().join("\n");
+    let chat = Paragraph::new(chat_text).block(Block::bordered().title("emed-code"));
     frame.render_widget(chat, chat_area);
 
-    let input = Paragraph::new("").block(Block::bordered().title("input"));
+    let input = Paragraph::new(app.input_buffer()).block(Block::bordered().title("input"));
     frame.render_widget(input, input_area);
 }
 
@@ -44,6 +53,62 @@ impl InputBox {
     pub fn buffer(&self) -> &str {
         &self.buffer
     }
+
+    // Leaves an empty buffer in place, returning what it held.
+    fn take(&mut self) -> String {
+        std::mem::take(&mut self.buffer)
+    }
+}
+
+pub struct App {
+    input: InputBox,
+    log: Vec<String>,
+    core: Core,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self {
+            input: InputBox::new(),
+            log: Vec::new(),
+            core: Core::new(),
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Enter => self.submit(),
+            _ => self.input.handle_key(key),
+        }
+    }
+
+    fn submit(&mut self) {
+        let text = self.input.take();
+        if text.is_empty() {
+            return;
+        }
+
+        self.core.submit_user_message(text.clone());
+        self.log.push(text);
+    }
+
+    pub fn log(&self) -> &[String] {
+        &self.log
+    }
+
+    pub fn input_buffer(&self) -> &str {
+        self.input.buffer()
+    }
 }
 
 #[cfg(test)]
@@ -61,7 +126,8 @@ mod tests {
         let backend = TestBackend::new(20, 6);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| draw(frame)).unwrap();
+        let app = App::new();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
 
         let content: String = terminal
             .backend()
@@ -131,5 +197,73 @@ mod tests {
         ));
 
         assert_eq!(input.buffer(), "");
+    }
+
+    // These only check App's own observable state (log content, input
+    // cleared) — not whether Core "really" got called. Core's own
+    // correctness is already covered by its own tests; asserting on it
+    // here too would mean adding a mock/seam purely to make that
+    // assertion possible, which isn't earning its keep yet.
+    #[test]
+    fn enter_with_non_empty_input_appends_to_log_and_clears_input() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.log(), &["hi".to_string()]);
+        assert_eq!(app.input_buffer(), "");
+    }
+
+    #[test]
+    fn enter_with_empty_input_does_nothing() {
+        let mut app = App::new();
+
+        app.handle_key(press(KeyCode::Enter));
+
+        assert!(app.log().is_empty());
+    }
+
+    #[test]
+    fn non_enter_keys_are_forwarded_to_the_input_box() {
+        let mut app = App::new();
+
+        app.handle_key(press(KeyCode::Char('a')));
+
+        assert_eq!(app.input_buffer(), "a");
+    }
+
+    #[test]
+    fn ctrl_c_is_a_quit_key() {
+        assert!(is_quit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn ctrl_q_is_a_quit_key() {
+        assert!(is_quit_key(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn plain_c_without_control_is_not_a_quit_key() {
+        assert!(!is_quit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn ctrl_c_release_is_not_a_quit_key() {
+        assert!(!is_quit_key(&KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release
+        )));
     }
 }
