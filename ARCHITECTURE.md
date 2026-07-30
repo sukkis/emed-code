@@ -57,10 +57,11 @@ infer that for an arbitrary `dyn LlmClient`, so it's stated explicitly.
 
 Provider errors are `ChatError` (`Connection`, `MalformedResponse`,
 `Auth`), with hand-written `Display`/`std::error::Error` impls rather
-than `thiserror`-derived ones — see `docs/project-plan.md`'s Dependency
-Discipline note: a handful of variants is a small, genuinely instructive
-amount of code for a learning-focused project, not boilerplate worth a
-dependency. `Auth` exists for Mistral's API-key rejection case, which
+than `thiserror`-derived ones — per this project's Dependency Discipline
+(parent `CLAUDE.md`), a handful of variants is a small, genuinely
+instructive amount of code for a learning-focused project, not
+boilerplate worth a dependency. `Auth` exists for Mistral's API-key
+rejection case, which
 `OllamaClient` has no way to hit (no credentials involved) but the enum
 is shared across every `LlmClient` impl.
 

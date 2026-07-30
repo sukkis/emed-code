@@ -382,11 +382,13 @@ name = "emed-code"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "getfrompass",
  "ratatui",
  "serde",
  "serde_json",
  "unicode-width",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -522,6 +524,15 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "getfrompass"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf4363747f53bb311c1f7adec7c80e4c44efb3e9950ce02da2685151b595de27"
+dependencies = [
+ "zeroize",
 ]
 
 [[package]]
