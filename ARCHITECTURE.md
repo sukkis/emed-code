@@ -6,14 +6,28 @@ lives locally under `docs/` (gitignored, not part of this record).
 
 ## `core` / `tui` / `cli` module split
 
-`core` (`src/core.rs`) holds conversation state and provider round-trips;
-it has zero `ratatui`/`crossterm` imports. It exposes exactly two entry
-points: `submit_user_message(&mut self, text: String)` and
-`poll_events(&mut self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all
-rendering/input state — `InputBox` (typed text), `App` (owns `InputBox`
-plus the message log and the one `Core` instance) — and talks to `core`
-only through that pair of calls. Keeping the boundary this narrow is what
-lets `core` be tested with zero terminal/rendering setup at all.
+`core` (`src/core.rs` plus `src/core/{ollama,mistral,credentials}.rs`)
+holds conversation state and provider round-trips; it has zero
+`ratatui`/`crossterm` imports. It exposes exactly two entry points:
+`submit_user_message(&mut self, text: String)` and `poll_events(&mut
+self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all rendering/input
+state — `InputBox` (typed text), `App` (owns `InputBox` plus the message
+log and the one `Core` instance) — and talks to `core` only through that
+pair of calls. Keeping the boundary this narrow is what lets `core` be
+tested with zero terminal/rendering setup at all.
+
+Internally, `core.rs` itself only holds what's genuinely shared across
+providers — `Core`, `CoreEvent`, `ChatError`, the `LlmClient` trait, and
+`to_core_event` — and re-exports each submodule's public items (`pub
+use ollama::OllamaClient`, etc.) so nothing outside `core` needs to know
+about this internal layout; `cli.rs`'s `crate::core::OLLAMA_MODEL`/
+`crate::core::MISTRAL_MODEL` and `main.rs`'s `emed_code::core::{...}`
+imports are unaffected by it. Split out once `core.rs` reached ~525
+lines (two providers' request/response types, fetch/extract functions,
+clients, and credential resolution all in one file) — a pure move, no
+behavior change, done ahead of Phase 3 adding tool-calling/`SandboxPath`
+to `core` too, which would have made the file considerably harder to
+navigate by the time that landed.
 
 `cli` (`src/cli.rs`) is a third, smaller module for command-line flag
 parsing — it's neither conversation state nor rendering/input state, so
@@ -89,6 +103,20 @@ generic "wasn't valid JSON at all" is a more useful message than "also
 didn't look like an error envelope"). This means a real Mistral auth
 failure comes back as `ChatError::Auth("Unauthorized")`, not lumped in
 with genuinely malformed responses.
+
+**Known limitation, deliberately deferred**: `ChatError::Connection`
+flattens whatever `ureq` produced (connection refused, timeout, DNS
+failure, TLS error, ...) into one `String` via `.to_string()`. That's
+fine today — nothing currently needs to tell those cases apart. It stops
+being fine the day retry-vs-fail-fast logic is written (expected in
+Phase 3's agent loop, once Ollama's tool-calling reliability needs more
+than plain retry-with-backoff): a string can't be pattern-matched
+on to decide "retry this" vs. "give up," so `Connection` would need to
+become its own small enum (e.g. `Timeout`, `Refused`, `DnsFailure`,
+`Other(String)`) capturing `ureq::Error`'s actual variants instead of
+collapsing them. Revisit at that point, not before — this is exactly the
+"don't design for hypothetical future requirements" call, made
+explicitly rather than silently.
 
 ## Credentials: `MistralClient` takes an already-resolved key
 
