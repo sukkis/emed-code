@@ -157,11 +157,52 @@ fn extract_mistral_reply(json: &str) -> Result<String, ChatError> {
     }
 }
 
+const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
+const MISTRAL_MODEL: &str = "mistral-small-latest";
+
+fn fetch_mistral_reply(api_key: &str, text: &str) -> Result<String, ChatError> {
+    let request = MistralRequest {
+        model: MISTRAL_MODEL.to_string(),
+        messages: vec![MistralMessage {
+            role: "user".to_string(),
+            content: text.to_string(),
+        }],
+        stream: false,
+    };
+
+    let mut response = ureq::post(MISTRAL_URL)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send_json(&request)
+        .map_err(|e| ChatError::Connection(e.to_string()))?;
+
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| ChatError::Connection(e.to_string()))
+}
+
+pub struct MistralClient {
+    api_key: Zeroizing<String>,
+}
+
+impl MistralClient {
+    pub fn new(api_key: Zeroizing<String>) -> Self {
+        MistralClient { api_key }
+    }
+}
+
+impl LlmClient for MistralClient {
+    fn send(&self, message: &str) -> Result<String, ChatError> {
+        let body = fetch_mistral_reply(&self.api_key, message)?;
+        extract_mistral_reply(&body)
+    }
+}
+
 const MISTRAL_PASS_KEY: &str = "emed-code/mistral/api_key";
 const MISTRAL_API_KEY_ENV_VAR: &str = "MISTRAL_API_KEY";
 
 #[derive(Debug, PartialEq)]
-enum CredentialSource {
+pub enum CredentialSource {
     Pass,
     EnvVar,
 }
@@ -180,7 +221,7 @@ fn resolve_mistral_api_key(
     env_var_value.map(|key| (Zeroizing::new(key), CredentialSource::EnvVar))
 }
 
-fn credential_log_message(source: &CredentialSource) -> &'static str {
+pub fn credential_log_message(source: &CredentialSource) -> &'static str {
     match source {
         CredentialSource::Pass => "Mistral key: from getfrompass",
         CredentialSource::EnvVar => {
@@ -192,7 +233,7 @@ fn credential_log_message(source: &CredentialSource) -> &'static str {
 // The real getfrompass/env var lookup. Not unit tested directly — same
 // as fetch_ollama_reply — see resolve_mistral_api_key for the tested
 // decision logic this just feeds real values into.
-fn lookup_mistral_api_key() -> Option<(Zeroizing<String>, CredentialSource)> {
+pub fn lookup_mistral_api_key() -> Option<(Zeroizing<String>, CredentialSource)> {
     let pass_value = getfrompass::try_get_from_pass(MISTRAL_PASS_KEY);
     let env_var_value = std::env::var(MISTRAL_API_KEY_ENV_VAR).ok();
     resolve_mistral_api_key(pass_value, env_var_value)
@@ -461,5 +502,15 @@ mod tests {
             credential_log_message(&CredentialSource::EnvVar),
             "Mistral key: from env var (no value emed-code/mistral/api_key from getfrompass)"
         );
+    }
+
+    // Compile-time proof that MistralClient satisfies LlmClient, same as
+    // ollama_client_implements_llm_client above. send() needs a real
+    // network round-trip (and a real API key), which stays out of scope
+    // for a unit test — see tests/real_mistral_smoke_test.rs.
+    #[test]
+    fn mistral_client_implements_llm_client() {
+        fn assert_is_llm_client<C: LlmClient>() {}
+        assert_is_llm_client::<MistralClient>();
     }
 }

@@ -25,12 +25,14 @@ one request and waits for the complete reply). `Up`/`Down`/`PageUp`/
 just test
 ```
 
-runs everything, including tests that talk to a real local Ollama
-instance (model: `mistral-nemo`, see `ollama list` to check it's
-pulled) — a request/response smoke test plus a short mini-session
-(send a message, scroll, send a follow-up). `just ci` (or plain `cargo
-test`) skips those and runs only what doesn't depend on anything
-outside the checkout.
+runs everything, including tests that talk to real external services:
+a local Ollama instance (model: `mistral-nemo`, see `ollama list` to
+check it's pulled) — a request/response smoke test plus a short
+mini-session (send a message, scroll, send a follow-up) — and the real
+Mistral API, which needs an API key available either via `getfrompass`
+(`emed-code/mistral/api_key`) or the `MISTRAL_API_KEY` env var. `just
+ci` (or plain `cargo test`) skips those and runs only what doesn't
+depend on anything outside the checkout.
 
 ## Roadmap
 

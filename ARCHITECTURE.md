@@ -69,15 +69,32 @@ is shared across every `LlmClient` impl.
 can send back one of two shapes on any given request — a success
 envelope (`{"choices": [...]}`) or an error envelope (`{"message": ...,
 "request_id": ...}`, e.g. on a 401), and there's no HTTP status code
-available at this pure-parsing layer to tell them apart up front (that
-arrives in Step 4, alongside the real network call). So it tries the
-success shape first; if that fails to deserialize, it tries the error
-shape; if that also fails, it surfaces the *original* success-shape
-parse error as `ChatError::MalformedResponse` rather than the second
-attempt's (a generic "wasn't valid JSON at all" is a more useful message
-than "also didn't look like an error envelope"). This means a real
-Mistral auth failure comes back as `ChatError::Auth("Unauthorized")`,
-not lumped in with genuinely malformed responses.
+available at this pure-parsing layer to tell them apart up front — that
+information lives in the HTTP response `fetch_mistral_reply` receives,
+one layer up, but the body text alone is all `extract_mistral_reply`
+gets to work with. So it tries the success shape first; if that fails
+to deserialize, it tries the error shape; if that also fails, it
+surfaces the *original* success-shape parse error as
+`ChatError::MalformedResponse` rather than the second attempt's (a
+generic "wasn't valid JSON at all" is a more useful message than "also
+didn't look like an error envelope"). This means a real Mistral auth
+failure comes back as `ChatError::Auth("Unauthorized")`, not lumped in
+with genuinely malformed responses.
+
+## Credentials: `MistralClient` takes an already-resolved key
+
+`MistralClient::new(api_key: Zeroizing<String>)` takes the key directly
+rather than performing the `getfrompass`/env-var lookup itself.
+Resolving *which* source supplies the key (`resolve_mistral_api_key`/
+`lookup_mistral_api_key`) and deciding what happens if neither source has
+one are startup-wiring concerns — that's the CLI/provider-selection
+code's job, not `MistralClient`'s. This keeps `MistralClient` scoped to
+one responsibility: given a key, do the HTTP round-trip and map errors
+correctly. `lookup_mistral_api_key` tries `getfrompass` first (key
+`emed-code/mistral/api_key`), falling back to the `MISTRAL_API_KEY` env
+var only when `getfrompass` yields no value — see `SECURITY.md` for the
+credential-handling specifics (never logging the value, only ever
+calling the non-panicking `try_get_from_pass`).
 
 ## Testing strategy: pure decision logic vs. a thin I/O shell
 
@@ -85,12 +102,16 @@ Provider integration code is split so the actual network call is as
 small and dumb as possible, with everything else a plain function over
 data:
 
-- `fetch_ollama_reply` — the only part that touches `ureq`. Collapses
-  every failure mode (connection refused, timeout, non-2xx status) into
-  `Result<String, ChatError>` (specifically `ChatError::Connection`).
-- `extract_reply` — pure: parses a response body into the reply text or
-  `ChatError::MalformedResponse`. Tested with fixture JSON strings, no
-  network involved. `OllamaClient::send` is just these two calls chained.
+- `fetch_ollama_reply`/`fetch_mistral_reply` — the only parts that touch
+  `ureq`. Collapse every failure mode (connection refused, timeout,
+  non-2xx status) into `Result<String, ChatError>` (specifically
+  `ChatError::Connection`). Neither has a unit test of its own; each has
+  a `local`-feature-gated smoke test instead (see "The `local` Cargo
+  feature" below).
+- `extract_reply`/`extract_mistral_reply` — pure: parse a response body
+  into the reply text or a `ChatError`. Tested with fixture JSON
+  strings, no network involved. `OllamaClient::send`/`MistralClient::send`
+  are each just their provider's fetch-then-extract call chained.
 - `to_core_event` — pure and now provider-agnostic: takes the
   `Result<String, ChatError>` a `LlmClient::send` call already produced
   (fetch *and* parse are done by then) and wraps it into a `CoreEvent`.
@@ -129,9 +150,11 @@ why `main.rs` has stayed free of its own crossterm imports beyond
 
 ## The `local` Cargo feature: gating tests that need a real external service
 
-Some behavior can only be verified against a real local service (here:
-Ollama). Those tests are never part of a plain `cargo test` or CI run —
-they live in their own file under `tests/`, gated with
+Some behavior can only be verified against a real external service —
+Ollama locally, or the real Mistral API (`tests/real_ollama_smoke_test.rs`,
+`tests/real_mistral_smoke_test.rs`). Those tests are never part of a
+plain `cargo test` or CI run — they live in their own file under
+`tests/`, gated with
 `#![cfg(feature = "local")]` at the top of the file, and only run via
 `cargo test --features local` (or `just test`). This mirrors the same
 convention already used in `emed` and `personal-cloud-mcp`, so it isn't
@@ -248,13 +271,3 @@ slightly as new lines land below — not a full freeze, which was an
 explicit, accepted trade-off (avoids needing an absolute-position
 representation, which isn't knowable at key-press time for the same
 reason `max_scroll` above isn't).
-
-## Error handling: plain strings for now, no bespoke error type yet
-
-Provider errors currently collapse to `String` (via `.to_string()` on
-whatever `ureq`/`serde_json` produced) rather than a dedicated error
-enum. There's no retry-vs-fail-fast or timeout-vs-auth-failure logic yet
-that would need to distinguish failure kinds, so there's nothing for a
-bespoke type to buy right now. A hand-written `ChatError` (no
-`thiserror` — see Dependency Discipline) is expected once multi-provider
-retry/fallback logic needs to tell those cases apart.
