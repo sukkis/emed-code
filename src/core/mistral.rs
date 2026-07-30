@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::{ChatError, LlmClient, LlmResponse, Message, ToolDefinition};
+use super::{ChatError, LlmClient, LlmResponse, Message, ToolCall, ToolDefinition};
 
 const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
 pub(crate) const MISTRAL_MODEL: &str = "mistral-small-latest";
@@ -35,11 +35,63 @@ struct MistralRequest {
     stream: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct MistralFunctionDef {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct MistralTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: MistralFunctionDef,
+}
+
+fn to_mistral_tools(tools: &[ToolDefinition]) -> Vec<MistralTool> {
+    tools
+        .iter()
+        .map(|tool| MistralTool {
+            kind: "function".to_string(),
+            function: MistralFunctionDef {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            },
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct MistralFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MistralToolCall {
+    id: String,
+    function: MistralFunctionCall,
+}
+
+// Mistral sends back either plain text (content: Some(...), tool_calls
+// empty/absent) or a tool-calling turn (content: null, tool_calls
+// populated) — never both meaningfully at once. #[serde(default)] on
+// tool_calls keeps a plain-text response, which omits the field
+// entirely, deserializing fine.
+#[derive(Debug, Deserialize)]
+struct MistralResponseMessage {
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<MistralToolCall>,
+}
+
 // One candidate completion. Mistral's API can in principle return more
 // than one (the "choices" array), but we only ever read choices[0].
 #[derive(Debug, Deserialize)]
 struct MistralChoice {
-    message: MistralMessage,
+    message: MistralResponseMessage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,14 +107,35 @@ struct MistralErrorResponse {
     message: String,
 }
 
-fn extract_mistral_reply(json: &str) -> Result<String, ChatError> {
+fn extract_mistral_reply(json: &str) -> Result<LlmResponse, ChatError> {
     match serde_json::from_str::<MistralResponse>(json) {
-        Ok(response) => response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.content)
-            .ok_or_else(|| ChatError::MalformedResponse("no choices in response".to_string())),
+        Ok(response) => {
+            let message = response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| ChatError::MalformedResponse("no choices in response".to_string()))?
+                .message;
+
+            if message.tool_calls.is_empty() {
+                message.content.map(LlmResponse::Text).ok_or_else(|| {
+                    ChatError::MalformedResponse(
+                        "response has neither content nor tool_calls".to_string(),
+                    )
+                })
+            } else {
+                let tool_calls = message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect();
+                Ok(LlmResponse::ToolCalls(tool_calls))
+            }
+        }
         Err(parse_error) => match serde_json::from_str::<MistralErrorResponse>(json) {
             Ok(error) => Err(ChatError::Auth(error.message)),
             Err(_) => Err(ChatError::MalformedResponse(parse_error.to_string())),
@@ -111,8 +184,7 @@ impl LlmClient for MistralClient {
     ) -> Result<LlmResponse, ChatError> {
         let mistral_messages = to_mistral_messages(messages);
         let body = fetch_mistral_reply(&self.api_key, &self.model, mistral_messages)?;
-        let text = extract_mistral_reply(&body)?;
-        Ok(LlmResponse::Text(text))
+        extract_mistral_reply(&body)
     }
 }
 
@@ -175,7 +247,47 @@ mod tests {
 
         let reply = extract_mistral_reply(json).unwrap();
 
-        assert_eq!(reply, "hi there");
+        assert_eq!(reply, LlmResponse::Text("hi there".to_string()));
+    }
+
+    // Real Mistral tool-calling response shape, confirmed against
+    // Mistral's own function-calling docs, not guessed: content is
+    // null, the reply lives in a tool_calls array instead, each entry
+    // wrapping a function.name/function.arguments pair (arguments as a
+    // JSON string, not a nested object).
+    #[test]
+    fn extract_mistral_reply_parses_tool_calls_from_a_tool_calling_response() {
+        let json = r#"{
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "D681PevKs",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\": \"notes.txt\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let reply = extract_mistral_reply(json).unwrap();
+
+        assert_eq!(
+            reply,
+            LlmResponse::ToolCalls(vec![ToolCall {
+                id: "D681PevKs".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{\"path\": \"notes.txt\"}".to_string(),
+            }])
+        );
     }
 
     #[test]
@@ -241,6 +353,47 @@ mod tests {
                     content: "hi there".to_string()
                 },
             ]
+        );
+    }
+
+    // Confirmed against Mistral's own function-calling docs: a tool's
+    // JSON schema goes under type: "function" / function: {name,
+    // description, parameters}, not flattened at the top level.
+    #[test]
+    fn to_mistral_tools_maps_tool_definition_to_the_expected_schema() {
+        let tools = vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file's contents.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"]
+            }),
+        }];
+
+        let mapped = to_mistral_tools(&tools);
+        let value = serde_json::to_value(&mapped).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file's contents.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" }
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                }
+            ])
         );
     }
 }

@@ -180,6 +180,28 @@ permission denied, deleted mid-flight), and `MalformedArguments`/
 carry a raw `std::io::Error` or any other type whose `Display` isn't
 under this project's own control.
 
+`tool_definitions() -> Vec<ToolDefinition>` (also in `tools.rs`, next to
+`dispatch`, not off in `core.rs`) is the fixed list actually advertised
+to a provider — kept beside `dispatch`'s match arms specifically so the
+two can't silently drift apart; a test asserts the names match. Each
+provider maps `ToolDefinition` into its own wire-format tool-schema type
+(`MistralTool`/`MistralFunctionDef` in `mistral.rs`, confirmed against
+Mistral's function-calling docs: `{"type": "function", "function":
+{name, description, parameters}}`) via a `to_mistral_tools` function,
+mirroring how `Message` gets mapped into each provider's own message
+type.
+
+On the response side, `extract_mistral_reply` now returns
+`Result<LlmResponse, ChatError>` directly (not a bare `String`) — Mistral
+sends back either plain text (`content: Some(...)`, no `tool_calls`) or
+a tool-calling turn (`content: null`, `tool_calls` populated), never
+both meaningfully at once, so the function branches on
+`message.tool_calls.is_empty()` rather than needing a separate
+provider-facing concept of "did the model call a tool." Deserializing
+into `MistralResponseMessage` uses `#[serde(default)]` on `tool_calls`
+so a plain-text response — which omits that field entirely — still
+deserializes without needing an `Option`.
+
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 
 Provider errors are `ChatError` (`Connection`, `MalformedResponse`,

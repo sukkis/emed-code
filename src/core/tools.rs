@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
 
-use super::{SandboxError, SandboxPath, ToolCall};
+use super::{SandboxError, SandboxPath, ToolCall, ToolDefinition};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum ToolError {
@@ -49,6 +49,43 @@ fn list_files(root: &Path, requested: &Path) -> Result<String, ToolError> {
     }
     names.sort();
     Ok(names.join("\n"))
+}
+
+// The list of tools actually advertised to a provider. Kept next to
+// dispatch()'s match arms (not off in core.rs) specifically so the two
+// can't drift apart silently — see the names-match test below.
+pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read the contents of a file within the project directory.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file, relative to the project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_files".to_string(),
+            description: "List files and directories within a directory in the project."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the directory, relative to the project root. Use \".\" for the project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+    ]
 }
 
 // Matches on the tool name first, then parses that specific tool's
@@ -200,5 +237,20 @@ mod tests {
         let result = dispatch(root.path(), &tool_call);
 
         assert_eq!(result, Err(ToolError::MalformedArguments));
+    }
+
+    // Guards against drift between what's advertised to the model and
+    // what dispatch() actually recognizes — a typo in either place
+    // would otherwise only surface as a confusing runtime UnknownTool
+    // error against a real provider.
+    #[test]
+    fn tool_definitions_names_match_dispatchs_known_tool_names() {
+        let definitions = tool_definitions();
+        let names: Vec<&str> = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["read_file", "list_files"]);
     }
 }

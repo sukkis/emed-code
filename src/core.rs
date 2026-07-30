@@ -40,13 +40,15 @@ pub enum Message {
     Assistant { content: String },
 }
 
-// Describes one tool the model may call. Minimal for now — a
-// parameters JSON schema arrives once tool schema/dispatch actually
-// need one; nothing constructs a non-empty ToolDefinition list yet.
-#[derive(Debug, Clone)]
+// Describes one tool the model may call. `parameters` is a JSON schema
+// (Mistral's own tool-schema shape — see core::tools::tool_definitions
+// and core::mistral::to_mistral_tools), kept as serde_json::Value rather
+// than a typed struct since its shape varies per tool.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 // One requested tool invocation. `arguments` stays a raw JSON string —
