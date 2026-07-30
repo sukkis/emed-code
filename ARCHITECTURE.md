@@ -260,6 +260,18 @@ meaningful in-progress state worth a second event), then loop again
 with the updated history; any `ChatError` means done (send
 `CoreEvent::Error`, return).
 
+`CoreEvent::ToolCall.result` is `Result<String, String>`, not a
+flattened `String` — refined after manual testing surfaced a real
+problem: asking the agent to read several files rendered their entire
+contents straight into the chat log, which was unpleasant to actually
+use, not just noisy. `Message::ToolResult`'s `content` (what the *model*
+sees on the next turn) still carries the full success-or-error text
+either way — only what reaches the `CoreEvent` (and therefore the TUI)
+distinguishes them, so `tui.rs`'s `format_core_event` can show just
+`"ok"` on success (the payload is for the model, not something the log
+needs to echo back at the user) while still showing an error's actual
+message in full (short and useful, unlike a whole file's contents).
+
 `MAX_TOOL_CALLS` (40) bounds the running count of *individual* tool
 calls across the whole loop, not rounds — a round-based cap wouldn't
 actually bound the risk it's meant to (a model batching many calls into

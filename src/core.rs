@@ -37,7 +37,12 @@ pub enum CoreEvent {
         id: String,
         name: String,
         arguments: String,
-        result: String,
+        // Ok/Err, not a flattened String: lets the TUI show only "ok"
+        // on success (a read_file result could be an entire file's
+        // contents — useful to the model, not something the chat log
+        // should echo back at the user) while still showing an error's
+        // actual (short, useful) message in full.
+        result: Result<String, String>,
     },
     Error(String),
 }
@@ -166,19 +171,23 @@ fn run_agent_loop(
                     history.push(Message::ToolCalls {
                         calls: vec![call.clone()],
                     });
-                    let result = match dispatch(root, &call) {
-                        Ok(output) => output,
+                    // The model needs the full content either way (what
+                    // was read, or why it failed) — only the CoreEvent
+                    // sent to the TUI distinguishes Ok from Err.
+                    let dispatch_result = dispatch(root, &call);
+                    let content_for_history = match &dispatch_result {
+                        Ok(output) => output.clone(),
                         Err(e) => e.to_string(),
                     };
                     history.push(Message::ToolResult {
                         tool_call_id: call.id.clone(),
-                        content: result.clone(),
+                        content: content_for_history,
                     });
                     let _ = tx.send(CoreEvent::ToolCall {
                         id: call.id,
                         name: call.name,
                         arguments: call.arguments,
-                        result,
+                        result: dispatch_result.map_err(|e| e.to_string()),
                     });
                 }
                 // Loop again with the updated history.
@@ -256,9 +265,13 @@ impl Core {
                             arguments: arguments.clone(),
                         }],
                     });
+                    let content = match result {
+                        Ok(output) => output.clone(),
+                        Err(error) => error.clone(),
+                    };
                     self.history.push(Message::ToolResult {
                         tool_call_id: id.clone(),
-                        content: result.clone(),
+                        content,
                     });
                 }
                 CoreEvent::Error(_) => {}
@@ -478,13 +491,44 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 arguments: r#"{"path": "notes.txt"}"#.to_string(),
-                result: "hello".to_string(),
+                result: Ok("hello".to_string()),
             }
         );
         assert_eq!(
             events[1],
             CoreEvent::AssistantChunk("done reading".to_string())
         );
+    }
+
+    // The point of this fix: a failed dispatch (e.g. a missing file)
+    // must surface as Err in the CoreEvent, not get silently flattened
+    // into a success-shaped string — that's what let the TUI tell
+    // "it worked" apart from "it didn't" without needing the payload.
+    #[test]
+    fn agent_loop_reports_a_failed_tool_call_as_an_error_result() {
+        let root = TempDir::new();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": "does-not-exist.txt"}"#.to_string(),
+        };
+
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("done".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("read a missing file".to_string());
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+
+        match &events[0] {
+            CoreEvent::ToolCall { result, .. } => {
+                assert!(result.is_err(), "expected an error result, got {result:?}");
+            }
+            other => panic!("expected a ToolCall event, got {other:?}"),
+        }
     }
 
     #[test]

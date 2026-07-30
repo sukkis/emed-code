@@ -69,12 +69,26 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   tested** — a scripted client that never stops requesting tool calls
   is proven to terminate with a clear error after exactly 40 individual
   calls, not hang or loop unboundedly.
-- **Tool-call transparency in the running TUI.** Every tool invocation
-  (name, arguments, and result) renders in the chat log with its own
-  `"tool: "` prefix, distinct from `"emed-code: "` (assistant replies)
-  and `"error: "` — extends the same transparency reasoning behind the
-  provider indicator above to tool activity specifically: a user can
-  see exactly what the agent read, not just that something happened.
+- **Tool-call transparency in the running TUI, without echoing file
+  contents into it (refined 2026-07-30, after manual testing).** Every
+  tool invocation (name, arguments, success/failure) renders in the chat
+  log with its own `"tool: "` prefix, distinct from `"emed-code: "`
+  (assistant replies) and `"error: "` — extends the same transparency
+  reasoning behind the provider indicator above to tool activity
+  specifically: a user can see exactly which call ran and whether it
+  succeeded, not just that something happened. On success, only `"ok"`
+  is shown — not the actual result content (`Message::ToolResult` still
+  carries the full content to the model regardless, per its own turn in
+  the conversation; only what's *displayed* changes). A read file's
+  contents are still sent to the LLM provider either way — this doesn't
+  change that (see the content-sensitivity-filtering backlog item below
+  for the actual exposure surface) — but it does mean file contents
+  aren't *also* echoed into the user's own terminal scrollback/tmux pane,
+  which is a real, if secondary, reduction in accidental-exposure
+  surface (screen-sharing, terminal history, etc.), discovered as a
+  usability rough edge during manual testing (dumping whole files into
+  the log made using the feature genuinely unpleasant, not just a
+  privacy nicety).
 
 ## Backlog (not yet implemented)
 
