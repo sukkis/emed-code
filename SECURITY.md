@@ -55,15 +55,29 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   theoretical one. Rejection errors (`SandboxError::Escapes`/`NotFound`)
   are fixed, hand-written strings that never include the actual resolved
   path, so a rejected symlink's real target isn't itself disclosed via
-  the error. **Not yet wired into a real tool** — `read_file`/
-  `list_files` (Phase 3's next step) are what will actually call this.
+  the error. **Now wired into a real, live code path**: `Core`'s agent
+  loop calls `tools::dispatch`, which calls `read_file`/`list_files`,
+  which construct a `SandboxPath` before touching the filesystem at all
+  — this is no longer only exercised by tests. It's still not reachable
+  from the *real* Mistral API today, though: the actual HTTP request
+  doesn't advertise any tools yet (`to_mistral_tools` isn't wired into
+  `MistralClient::send` until the next step), so Mistral has no way to
+  request a tool call in practice yet, even though `Core`'s own
+  machinery would correctly execute one if it did. A fake test client
+  already exercises the full path end-to-end.
+- **The 40-tool-call cap and per-batch rejection are implemented and
+  tested** — a scripted client that never stops requesting tool calls
+  is proven to terminate with a clear error after exactly 40 individual
+  calls, not hang or loop unboundedly.
 
 ## Backlog (not yet implemented)
 
-- **Wire `SandboxPath` into real tools.** The validation logic above
-  exists and is tested, but nothing calls it yet outside tests — Phase
-  3's next step (`read_file`/`list_files`) is where it becomes
-  reachable from a real tool call.
+- **Wire tool advertising into the real Mistral request.** `Core`'s
+  agent loop and `tools::dispatch` are both real and live, but nothing
+  in the actual HTTP request tells Mistral what tools exist yet — the
+  next step (`MistralClient::send` actually using
+  `tools::tool_definitions()`) is what makes this reachable from a real
+  API call rather than only from tests.
 - **No content-sensitivity filtering on file tools (flagged
   2026-07-30).** `SandboxPath` only enforces *where* a path may resolve
   to — it says nothing about *which* files within that boundary are

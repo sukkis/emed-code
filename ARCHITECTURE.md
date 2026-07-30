@@ -91,15 +91,31 @@ infer that for an arbitrary `dyn LlmClient`, so it's stated explicitly.
 ## Conversation history: `Message` enum, mutated only on the polling thread
 
 `Core` holds a `Vec<Message>` that grows for the whole session — every
-user message and assistant reply gets appended, and the full history is
-sent with every request (each provider maps it into its own wire
-format; see the `LlmClient` section above). `Message` is an enum
-(`User { content: String }`, `Assistant { content: String }`), not a
-flat struct with optional fields, matching every other enum decision in
-this codebase (`ChatError`, `CredentialSource`, `ProviderLabel`) — a
-tool-result-carrying variant will get added once tool-calling actually
-needs one, and Rust's exhaustive matching makes that a compiler-guided
-addition rather than a risky one.
+user message, assistant reply, tool-call request, and tool result gets
+appended, and the full history is sent with every request (each
+provider maps it into its own wire format; see the `LlmClient` section
+above). `Message` is an enum (`User`, `Assistant`, `ToolCalls { calls:
+Vec<ToolCall> }`, `ToolResult { tool_call_id: String, content: String
+}`), not a flat struct with optional fields, matching every other enum
+decision in this codebase (`ChatError`, `CredentialSource`,
+`ProviderLabel`) — a tool-result-carrying variant was always the plan
+here (see the note below on when it actually arrived) rather than a
+speculative addition.
+
+`ToolCalls` holds one entry *per individual tool call*, not one entry
+per LLM turn — Mistral can in principle request several tool calls in a
+single turn (one assistant message, multiple `tool_calls`), and the
+textbook-correct shape would be one `Message::ToolCalls` holding all of
+them. This is a deliberate simplification with a real, currently
+unverified assumption (does Mistral's API tolerate several separate
+single-call turns as well as one multi-call turn — order and
+`tool_call_id` correlation are preserved either way, which is likely
+what actually matters, but this isn't confirmed against a real
+response yet). Tried rather than researched to a standstill first; see
+`SECURITY.md`... actually this isn't a security concern, it's a
+protocol-fidelity one — tracked instead in the increment's own planning
+doc, with a concrete criterion for how it would get caught if wrong
+(a real multi-tool-call round-trip test, not just a single-call one).
 
 Deliberately unbounded and uncompacted for now: nothing trims or
 summarizes history as it grows, so a very long session sends a
@@ -113,9 +129,16 @@ on the spawned background thread. `submit_user_message` clones the
 current history into the closure that thread runs (so the network call
 sees an accurate snapshot), but `self.history` itself stays exclusively
 owned by `Core`; `poll_events()` is what appends the assistant's reply
+(or, since the agent loop landed, a tool call's request+result pair)
 back into it as `CoreEvent`s get drained. This avoids needing any
 shared-mutable-state primitive (a `Mutex` around history, say) — there's
-effectively a single writer, the thread that drives the UI loop.
+effectively a single writer, the thread that drives the UI loop. The
+agent loop's own *local* copy of history (used to keep talking to the
+provider across loop iterations within one `submit_user_message` call)
+and `Core`'s *persistent* copy (rebuilt incrementally from the
+`CoreEvent` stream) are deliberately two separate `Vec<Message>` — see
+"The agent loop" below for why, and why they're kept in sync by
+convention rather than by sharing one data structure.
 
 ## `SandboxPath`: containment enforced by the type system, not convention
 
@@ -157,8 +180,8 @@ a learning-focused project.
 
 `src/core/tools.rs` holds `read_file`/`list_files` and `dispatch(root:
 &Path, tool_call: &ToolCall) -> Result<String, ToolError>` — the one
-function the agent loop (once built) will call for every `ToolCall` it
-gets back from a provider. `dispatch` matches on `tool_call.name`
+function the agent loop calls for every `ToolCall` it gets back from a
+provider. `dispatch` matches on `tool_call.name`
 *first*, then parses that specific tool's own argument shape — not the
 other way around — so an unrecognized tool name never has to reason
 about argument parsing at all, and adding a third tool means one new
@@ -201,6 +224,46 @@ provider-facing concept of "did the model call a tool." Deserializing
 into `MistralResponseMessage` uses `#[serde(default)]` on `tool_calls`
 so a plain-text response — which omits that field entirely — still
 deserializes without needing an `Option`.
+
+## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
+
+Runs entirely on `submit_user_message`'s spawned background thread, in
+a plain `loop`: call `client.send(&history, &tool_defs)`; `Text` means
+done (send `CoreEvent::AssistantChunk`, return); `ToolCalls` means
+dispatch each one (`tools::dispatch`), append a `Message::ToolCalls` +
+`Message::ToolResult` pair to the loop's *local* history for each, send
+one `CoreEvent::ToolCall { id, name, arguments, result }` per call (once
+dispatch has already completed — not a separate proposed/finished pair,
+since local file tools finish near-instantly and there's no
+meaningful in-progress state worth a second event), then loop again
+with the updated history; any `ChatError` means done (send
+`CoreEvent::Error`, return).
+
+`MAX_TOOL_CALLS` (40) bounds the running count of *individual* tool
+calls across the whole loop, not rounds — a round-based cap wouldn't
+actually bound the risk it's meant to (a model batching many calls into
+one round would sail through a low round-count cap while still doing
+all that work) and would also cut off legitimate work (reading a new
+project's ~15-20 files, worst case one file per round, could exceed a
+cap like 10 rounds). Checked per-batch: if a round's calls would push
+the running total over the cap, the whole round is rejected with a
+`CoreEvent::Error`, not partially executed.
+
+`Core` gained a `root: PathBuf` field for this (`dispatch` needs a
+sandbox root and nothing previously provided one) — defaults to
+`std::env::current_dir()` in `with_client`, so `main.rs` needed no
+changes.
+
+The now-removed `to_core_event` free function used to do this Text/Err
+→ `CoreEvent` mapping (with a placeholder "tool calls not yet
+supported" arm for `ToolCalls`, since nothing produced that variant
+yet). Once the loop needed to handle `ToolCalls` with real dispatch
+logic — necessarily inline, since only the loop knows about the running
+tool-call count and can decide whether to continue — keeping a
+separate helper that only ever got called for its other two branches,
+with a now-factually-wrong third one, stopped earning its keep; the
+two one-line mappings it used to do are inlined directly into the
+loop's `match` arms instead.
 
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 

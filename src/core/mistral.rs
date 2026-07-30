@@ -6,10 +6,21 @@ use super::{ChatError, LlmClient, LlmResponse, Message, ToolCall, ToolDefinition
 const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
 pub(crate) const MISTRAL_MODEL: &str = "mistral-small-latest";
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+// A flat struct, not an enum, deliberately: Mistral's own wire format
+// really is one flat JSON object per message with mostly-optional
+// sibling fields (content vs. tool_calls vs. tool_call_id depending on
+// role) — this is the one place in the codebase where that shape is the
+// most direct, correct representation, unlike core::Message (our own
+// internal model), where an enum-of-kinds is the better fit.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct MistralMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<MistralToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 fn to_mistral_messages(messages: &[Message]) -> Vec<MistralMessage> {
@@ -18,11 +29,39 @@ fn to_mistral_messages(messages: &[Message]) -> Vec<MistralMessage> {
         .map(|message| match message {
             Message::User { content } => MistralMessage {
                 role: "user".to_string(),
-                content: content.clone(),
+                content: Some(content.clone()),
+                ..Default::default()
             },
             Message::Assistant { content } => MistralMessage {
                 role: "assistant".to_string(),
-                content: content.clone(),
+                content: Some(content.clone()),
+                ..Default::default()
+            },
+            Message::ToolCalls { calls } => MistralMessage {
+                role: "assistant".to_string(),
+                tool_calls: Some(
+                    calls
+                        .iter()
+                        .map(|call| MistralToolCall {
+                            id: call.id.clone(),
+                            kind: "function".to_string(),
+                            function: MistralFunctionCall {
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            },
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            Message::ToolResult {
+                tool_call_id,
+                content,
+            } => MistralMessage {
+                role: "tool".to_string(),
+                content: Some(content.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
+                ..Default::default()
             },
         })
         .collect()
@@ -63,16 +102,30 @@ fn to_mistral_tools(tools: &[ToolDefinition]) -> Vec<MistralTool> {
         .collect()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct MistralFunctionCall {
     name: String,
     arguments: String,
 }
 
-#[derive(Debug, Deserialize)]
+// Serialize AND Deserialize: this same shape is used both when parsing
+// a real tool-calling response (Deserialize) and when re-sending that
+// same tool call back as history on the next round (Serialize) — the
+// wire shape is identical either way. `kind` defaults to "function" on
+// deserialize (Mistral always sends it, but nothing reads it back out
+// of us, so the default is just a safety net, not load-bearing).
+// PartialEq is needed transitively: MistralMessage derives it, and now
+// carries an Option<Vec<MistralToolCall>> field.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct MistralToolCall {
     id: String,
+    #[serde(rename = "type", default = "mistral_tool_call_type")]
+    kind: String,
     function: MistralFunctionCall,
+}
+
+fn mistral_tool_call_type() -> String {
+    "function".to_string()
 }
 
 // Mistral sends back either plain text (content: Some(...), tool_calls
@@ -201,7 +254,8 @@ mod tests {
             model: "mistral-small-latest".to_string(),
             messages: vec![MistralMessage {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: Some("hello".to_string()),
+                ..Default::default()
             }],
             stream: false,
         };
@@ -346,13 +400,87 @@ mod tests {
             vec![
                 MistralMessage {
                     role: "user".to_string(),
-                    content: "hello".to_string()
+                    content: Some("hello".to_string()),
+                    ..Default::default()
                 },
                 MistralMessage {
                     role: "assistant".to_string(),
-                    content: "hi there".to_string()
+                    content: Some("hi there".to_string()),
+                    ..Default::default()
                 },
             ]
+        );
+    }
+
+    // The agent loop represents each tool call as its own history entry
+    // rather than batching a whole round's calls into one — a deliberate
+    // simplification with a real, unverified assumption about whether
+    // Mistral's API tolerates several separate single-call turns as well
+    // as one multi-call turn. This test pins down exactly what shape our
+    // own code produces for that case, so any future change to it is
+    // deliberate; it can't confirm Mistral's API actually accepts the
+    // shape — only a real network round-trip against multiple tool
+    // calls can do that.
+    #[test]
+    fn to_mistral_messages_maps_multiple_sequential_tool_call_rounds() {
+        let messages = vec![
+            Message::User {
+                content: "read two files".to_string(),
+            },
+            Message::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path": "a.txt"}"#.to_string(),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "contents of a".to_string(),
+            },
+            Message::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "call_2".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path": "b.txt"}"#.to_string(),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "call_2".to_string(),
+                content: "contents of b".to_string(),
+            },
+        ];
+
+        let mapped = to_mistral_messages(&messages);
+        let value = serde_json::to_value(&mapped).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                { "role": "user", "content": "read two files" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\": \"a.txt\"}" }
+                        }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "call_1", "content": "contents of a" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\": \"b.txt\"}" }
+                        }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "call_2", "content": "contents of b" }
+            ])
         );
     }
 

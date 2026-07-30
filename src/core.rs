@@ -15,29 +15,59 @@ pub use ollama::OllamaClient;
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
+use tools::{dispatch, tool_definitions};
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
+// Bounds worst-case cost of one user message: a running count of
+// individual tool calls across the whole agent loop, not rounds — a
+// round-based cap wouldn't actually bound the risk (a model batching
+// many calls into one round would sail through it) and would also cut
+// off legitimate work (e.g. reading a new project's ~15-20 files).
+const MAX_TOOL_CALLS: usize = 40;
+
 #[derive(Debug, PartialEq)]
 pub enum CoreEvent {
     AssistantChunk(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+        result: String,
+    },
     Error(String),
 }
 
-// One entry in the conversation history. Deliberately just User/
-// Assistant for now — a tool-result-carrying variant arrives once the
-// agent loop actually needs one. An enum, not a flat struct with
-// optional fields, so an invalid combination (e.g. a tool result with
-// no correlating id) isn't representable at all — matches every other
-// enum decision in this codebase (ChatError, CredentialSource,
-// ProviderLabel).
+// One entry in the conversation history. An enum, not a flat struct with
+// optional fields, so an invalid combination (e.g. a tool result with no
+// correlating id) isn't representable at all — matches every other enum
+// decision in this codebase (ChatError, CredentialSource, ProviderLabel).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    User { content: String },
-    Assistant { content: String },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+    },
+    // The assistant's turn requesting one or more tool invocations. One
+    // entry per individual call, not one entry per LLM turn (which could
+    // batch several) — a deliberate simplification with a real, unverified
+    // assumption about whether the provider tolerates several separate
+    // single-call turns as well as one multi-call turn; see
+    // ARCHITECTURE.md's "Conversation history" section.
+    ToolCalls {
+        calls: Vec<ToolCall>,
+    },
+    // One tool's result, correlated back to its request via tool_call_id.
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
 }
 
 // Describes one tool the model may call. `parameters` is a JSON schema
@@ -61,7 +91,7 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LlmResponse {
     Text(String),
     ToolCalls(Vec<ToolCall>),
@@ -70,7 +100,7 @@ pub enum LlmResponse {
 // Hand-written, not `thiserror` — per this project's Dependency
 // Discipline (parent CLAUDE.md), a handful of variants isn't worth a
 // dependency.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatError {
     Connection(String),
     MalformedResponse(String),
@@ -101,21 +131,69 @@ pub trait LlmClient {
     ) -> Result<LlmResponse, ChatError>;
 }
 
-// Tool-call dispatch isn't wired up yet — nothing produces
-// LlmResponse::ToolCalls this step, so that arm is an explicit
-// placeholder, not a real dispatch path.
-fn to_core_event(send_result: Result<LlmResponse, ChatError>) -> CoreEvent {
-    match send_result {
-        Ok(LlmResponse::Text(text)) => CoreEvent::AssistantChunk(text),
-        Ok(LlmResponse::ToolCalls(_)) => {
-            CoreEvent::Error("tool calls not yet supported".to_string())
+// The agent loop: send, and either get a final answer (done) or one or
+// more tool calls (dispatch each, append results, send again) — capped
+// at MAX_TOOL_CALLS total individual calls. Runs entirely on the
+// spawned background thread; only ever communicates back to Core via
+// tx, never touches Core's own history directly — see poll_events for
+// where Core's persistent history actually gets updated, which mirrors
+// (deliberately kept in sync with) the shape pushed onto `history` here.
+fn run_agent_loop(
+    client: &Arc<dyn LlmClient + Send + Sync>,
+    root: &Path,
+    mut history: Vec<Message>,
+    tx: &mpsc::Sender<CoreEvent>,
+) {
+    let tool_defs = tool_definitions();
+    let mut tool_call_count = 0usize;
+
+    loop {
+        match client.send(&history, &tool_defs) {
+            Ok(LlmResponse::Text(text)) => {
+                let _ = tx.send(CoreEvent::AssistantChunk(text));
+                return;
+            }
+            Ok(LlmResponse::ToolCalls(calls)) => {
+                if tool_call_count + calls.len() > MAX_TOOL_CALLS {
+                    let _ = tx.send(CoreEvent::Error(
+                        "agent loop exceeded the maximum number of tool calls".to_string(),
+                    ));
+                    return;
+                }
+                tool_call_count += calls.len();
+
+                for call in calls {
+                    history.push(Message::ToolCalls {
+                        calls: vec![call.clone()],
+                    });
+                    let result = match dispatch(root, &call) {
+                        Ok(output) => output,
+                        Err(e) => e.to_string(),
+                    };
+                    history.push(Message::ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content: result.clone(),
+                    });
+                    let _ = tx.send(CoreEvent::ToolCall {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                        result,
+                    });
+                }
+                // Loop again with the updated history.
+            }
+            Err(e) => {
+                let _ = tx.send(CoreEvent::Error(e.to_string()));
+                return;
+            }
         }
-        Err(e) => CoreEvent::Error(e.to_string()),
     }
 }
 
 pub struct Core {
     client: Arc<dyn LlmClient + Send + Sync>,
+    root: PathBuf,
     history: Vec<Message>,
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
@@ -134,8 +212,10 @@ impl Core {
 
     pub fn with_client(client: Arc<dyn LlmClient + Send + Sync>) -> Self {
         let (tx, rx) = mpsc::channel();
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Core {
             client,
+            root,
             history: Vec::new(),
             tx,
             rx,
@@ -148,19 +228,40 @@ impl Core {
         let tx = self.tx.clone();
         let client = Arc::clone(&self.client);
         let history = self.history.clone();
+        let root = self.root.clone();
         thread::spawn(move || {
-            let event = to_core_event(client.send(&history, &[]));
-            let _ = tx.send(event);
+            run_agent_loop(&client, &root, history, &tx);
         });
     }
 
     pub fn poll_events(&mut self) -> Vec<CoreEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
-            if let CoreEvent::AssistantChunk(text) = &event {
-                self.history.push(Message::Assistant {
-                    content: text.clone(),
-                });
+            match &event {
+                CoreEvent::AssistantChunk(text) => {
+                    self.history.push(Message::Assistant {
+                        content: text.clone(),
+                    });
+                }
+                CoreEvent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    result,
+                } => {
+                    self.history.push(Message::ToolCalls {
+                        calls: vec![ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        }],
+                    });
+                    self.history.push(Message::ToolResult {
+                        tool_call_id: id.clone(),
+                        content: result.clone(),
+                    });
+                }
+                CoreEvent::Error(_) => {}
             }
             events.push(event);
         }
@@ -171,42 +272,10 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
-
-    // to_core_event() is the pure, provider-agnostic decision logic that
-    // turns "did the client's send() succeed" into a CoreEvent. It
-    // doesn't parse anything itself — parsing is each LlmClient impl's
-    // job — so it only ever sees an LlmResponse or a ChatError.
-    #[test]
-    fn to_core_event_returns_assistant_chunk_for_a_text_response() {
-        let event = to_core_event(Ok(LlmResponse::Text("hi there".to_string())));
-
-        assert_eq!(event, CoreEvent::AssistantChunk("hi there".to_string()));
-    }
-
-    #[test]
-    fn to_core_event_returns_error_for_any_chat_error() {
-        let event = to_core_event(Err(ChatError::Connection("connection refused".to_string())));
-
-        assert!(matches!(event, CoreEvent::Error(_)));
-    }
-
-    // Tool-call dispatch isn't wired up yet — this just needs
-    // to_core_event to handle the variant exhaustively rather than not
-    // compile. A real tool call can't reach this yet (nothing produces
-    // LlmResponse::ToolCalls yet), so a clear "not yet supported" error
-    // is a fine placeholder.
-    #[test]
-    fn to_core_event_returns_an_error_for_tool_calls_not_yet_supported() {
-        let event = to_core_event(Ok(LlmResponse::ToolCalls(vec![ToolCall {
-            id: "call_1".to_string(),
-            name: "read_file".to_string(),
-            arguments: "{}".to_string(),
-        }])));
-
-        assert!(matches!(event, CoreEvent::Error(_)));
-    }
 
     // Records every call it receives so tests can assert on exactly what
     // history Core threaded through, without any real network I/O.
@@ -285,5 +354,197 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // Hand-rolled instead of a tempfile dev-dependency — same reasoning
+    // as sandbox_path.rs's/tools.rs's identical fixture, duplicated
+    // rather than shared per this codebase's existing convention.
+    struct TempDir(PathBuf);
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("emed-code-core-test-{}-{id}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Core's real constructors (new/with_client) always default root to
+    // the real current_dir() — tests need a specific tempdir instead, so
+    // this builds one directly via the struct literal (same module tree,
+    // so Core's private fields are reachable here).
+    fn core_with_root(client: Arc<dyn LlmClient + Send + Sync>, root: PathBuf) -> Core {
+        let (tx, rx) = mpsc::channel();
+        Core {
+            client,
+            root,
+            history: Vec::new(),
+            tx,
+            rx,
+        }
+    }
+
+    // Replays a fixed, finite sequence of scripted responses — once
+    // exhausted, keeps repeating the last one (so a client scripted with
+    // a single ToolCalls response can simulate "never stops calling
+    // tools" for the cap test below).
+    struct ScriptedClient {
+        responses: Vec<Result<LlmResponse, ChatError>>,
+        call_count: AtomicUsize,
+    }
+
+    impl ScriptedClient {
+        fn new(responses: Vec<Result<LlmResponse, ChatError>>) -> Self {
+            ScriptedClient {
+                responses,
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl LlmClient for ScriptedClient {
+        fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ChatError> {
+            let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let index = index.min(self.responses.len() - 1);
+            self.responses[index].clone()
+        }
+    }
+
+    // Unlike poll_until_nonempty, waits for at least `count` events
+    // across possibly multiple poll_events() calls — the agent loop can
+    // emit several CoreEvents from one submit_user_message call, and a
+    // single poll might race ahead of all of them landing.
+    fn poll_until_at_least(core: &mut Core, count: usize, timeout: Duration) -> Vec<CoreEvent> {
+        let deadline = Instant::now() + timeout;
+        let mut events = Vec::new();
+        while events.len() < count {
+            events.extend(core.poll_events());
+            if events.len() >= count {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {count} CoreEvents, only got {}",
+                    events.len()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        events
+    }
+
+    #[test]
+    fn agent_loop_dispatches_a_tool_call_then_returns_the_final_answer() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "hello").unwrap();
+
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": "notes.txt"}"#.to_string(),
+        };
+
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("done reading".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("read notes.txt".to_string());
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+
+        assert_eq!(
+            events[0],
+            CoreEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path": "notes.txt"}"#.to_string(),
+                result: "hello".to_string(),
+            }
+        );
+        assert_eq!(
+            events[1],
+            CoreEvent::AssistantChunk("done reading".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_loop_stops_at_the_tool_call_cap_with_a_clear_error() {
+        let root = TempDir::new();
+        let tool_call = ToolCall {
+            id: "call_x".to_string(),
+            name: "list_files".to_string(),
+            arguments: r#"{"path": "."}"#.to_string(),
+        };
+        // A single scripted response, always ToolCalls, never Text —
+        // proves the loop terminates via the cap instead of hanging.
+        let client = Arc::new(ScriptedClient::new(vec![Ok(LlmResponse::ToolCalls(vec![
+            tool_call,
+        ]))]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("loop forever".to_string());
+
+        let events = poll_until_at_least(&mut core, 41, Duration::from_secs(5));
+
+        let tool_call_events = events
+            .iter()
+            .filter(|event| matches!(event, CoreEvent::ToolCall { .. }))
+            .count();
+        assert_eq!(tool_call_events, 40);
+        assert!(matches!(events.last(), Some(CoreEvent::Error(_))));
+    }
+
+    // Direct coverage of the loop's plain-text path, replacing what
+    // to_core_event's own test used to check before that function was
+    // removed (its ToolCalls-is-unsupported branch became factually
+    // wrong once the loop actually dispatches tool calls).
+    #[test]
+    fn agent_loop_returns_assistant_chunk_for_a_plain_text_reply() {
+        let root = TempDir::new();
+        let client = Arc::new(ScriptedClient::new(vec![Ok(LlmResponse::Text(
+            "hi there".to_string(),
+        ))]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("hello".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        assert_eq!(events[0], CoreEvent::AssistantChunk("hi there".to_string()));
+    }
+
+    #[test]
+    fn agent_loop_returns_an_error_event_when_send_fails() {
+        let root = TempDir::new();
+        let client = Arc::new(ScriptedClient::new(vec![Err(ChatError::Connection(
+            "connection refused".to_string(),
+        ))]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("hello".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        assert!(matches!(events[0], CoreEvent::Error(_)));
     }
 }

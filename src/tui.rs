@@ -15,6 +15,11 @@ const PAGE_SCROLL_STEP: usize = 5;
 fn format_core_event(event: CoreEvent) -> String {
     match event {
         CoreEvent::AssistantChunk(text) => format!("emed-code: {text}"),
+        // Minimal stopgap to keep this exhaustive and the app usable —
+        // not this step's job to design properly (a real, visually
+        // distinguishable prefix + its own TestBackend test is a
+        // separate, later step).
+        CoreEvent::ToolCall { name, result, .. } => format!("[tool: {name}] {result}"),
         CoreEvent::Error(message) => format!("error: {message}"),
     }
 }

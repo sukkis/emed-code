@@ -11,6 +11,11 @@ struct OllamaMessage {
     content: String,
 }
 
+// Ollama never actually produces ToolCalls/ToolResult messages (it gets
+// no tool-calling this phase), but Message is shared across providers,
+// so Rust's exhaustive matching still requires handling them here. This
+// is a rough placeholder rendering as plain text, not a real design —
+// Ollama's own future tool-calling phase should design this properly.
 fn to_ollama_messages(messages: &[Message]) -> Vec<OllamaMessage> {
     messages
         .iter()
@@ -22,6 +27,21 @@ fn to_ollama_messages(messages: &[Message]) -> Vec<OllamaMessage> {
             Message::Assistant { content } => OllamaMessage {
                 role: "assistant".to_string(),
                 content: content.clone(),
+            },
+            Message::ToolCalls { calls } => {
+                let summary = calls
+                    .iter()
+                    .map(|call| format!("{}({})", call.name, call.arguments))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                OllamaMessage {
+                    role: "assistant".to_string(),
+                    content: format!("[called {summary}]"),
+                }
+            }
+            Message::ToolResult { content, .. } => OllamaMessage {
+                role: "user".to_string(),
+                content: format!("[tool result: {content}]"),
             },
         })
         .collect()
@@ -88,6 +108,7 @@ impl LlmClient for OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ToolCall;
 
     // Ollama's /api/chat request body: model name, chat history, and
     // stream: false so the response arrives as one JSON object rather
@@ -186,5 +207,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // Ollama can never actually produce ToolCalls/ToolResult messages
+    // (it doesn't get tool-calling this phase), but Rust's exhaustive
+    // matching still requires to_ollama_messages to handle them if
+    // they're ever in history (e.g. a session that starts on Mistral
+    // somehow reaching Ollama — not currently possible, but the type
+    // doesn't know that). This is a rough placeholder rendering as plain
+    // text, not a real design — Ollama's own future tool-calling phase
+    // should revisit this properly.
+    #[test]
+    fn to_ollama_messages_renders_tool_calls_and_results_as_placeholder_text() {
+        let messages = vec![
+            Message::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path": "a.txt"}"#.to_string(),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "contents".to_string(),
+            },
+        ];
+
+        let mapped = to_ollama_messages(&messages);
+
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].role, "assistant");
+        assert!(mapped[0].content.contains("read_file"));
+        assert_eq!(mapped[1].role, "user");
+        assert!(mapped[1].content.contains("contents"));
     }
 }
