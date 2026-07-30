@@ -41,12 +41,29 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   or `... cloud (mistral)`), not just in the startup-only credential log
   line, which scrolls out of view once the TUI's alternate screen takes
   over. A user can't lose track of whether a cloud provider is in use.
+- **`SandboxPath` (Phase 3).** `src/core/sandbox_path.rs`:
+  `SandboxPath::new(root, requested)` is the only way to construct one,
+  and it's the only type Phase 3's file tools will accept — a raw
+  `PathBuf`/`&str` can't be passed to a tool function once those land.
+  Containment is checked against `std::fs::canonicalize`d paths (both
+  `root` and the requested path), not lexical-only `.`/`..` normalization
+  — verified via a real symlink test: a symlink placed *inside* the
+  sandbox root pointing *outside* it is correctly rejected, which a
+  string-only check would have missed. This matters because tool output
+  (file contents) feeds back into the LLM conversation, making an
+  escaped read a real prompt-injection-adjacent exfiltration path, not a
+  theoretical one. Rejection errors (`SandboxError::Escapes`/`NotFound`)
+  are fixed, hand-written strings that never include the actual resolved
+  path, so a rejected symlink's real target isn't itself disclosed via
+  the error. **Not yet wired into a real tool** — `read_file`/
+  `list_files` (Phase 3's next step) are what will actually call this.
 
 ## Backlog (not yet implemented)
 
-(none currently — the items tracked here for Phase 2 are all resolved;
-see `ARCHITECTURE.md`'s "Startup wiring" and "provider label" sections
-for how.)
+- **Wire `SandboxPath` into real tools.** The validation logic above
+  exists and is tested, but nothing calls it yet outside tests — Phase
+  3's next step (`read_file`/`list_files`) is where it becomes
+  reachable from a real tool call.
 
 ## Out of scope / not applicable
 

@@ -5,6 +5,7 @@
 mod credentials;
 mod mistral;
 mod ollama;
+mod sandbox_path;
 
 pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
 pub use mistral::MistralClient;

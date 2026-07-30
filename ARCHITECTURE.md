@@ -6,8 +6,9 @@ lives locally under `docs/` (gitignored, not part of this record).
 
 ## `core` / `tui` / `cli` module split
 
-`core` (`src/core.rs` plus `src/core/{ollama,mistral,credentials}.rs`)
-holds conversation state and provider round-trips; it has zero
+`core` (`src/core.rs` plus
+`src/core/{ollama,mistral,credentials,sandbox_path}.rs`) holds
+conversation state and provider round-trips; it has zero
 `ratatui`/`crossterm` imports. It exposes exactly two entry points:
 `submit_user_message(&mut self, text: String)` and `poll_events(&mut
 self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all rendering/input
@@ -115,6 +116,42 @@ owned by `Core`; `poll_events()` is what appends the assistant's reply
 back into it as `CoreEvent`s get drained. This avoids needing any
 shared-mutable-state primitive (a `Mutex` around history, say) — there's
 effectively a single writer, the thread that drives the UI loop.
+
+## `SandboxPath`: containment enforced by the type system, not convention
+
+`SandboxPath::new(root: &Path, requested: &Path) -> Result<Self,
+SandboxError>` is the only way to construct one, and tool functions take
+`&SandboxPath`, never a raw `PathBuf`/`&str` — a call site can't forget
+to check containment, because there's no path type it could pass
+instead that would compile. This matters more here than in a typical
+read-only-file scenario: tool output (file contents) feeds back into the
+LLM conversation, so an escaped read is a real prompt-injection-adjacent
+exfiltration path, not a hypothetical one.
+
+Containment is checked against `std::fs::canonicalize`d paths — both
+`root` and the joined candidate — not lexical-only `.`/`..`
+normalization. This is the part that actually matters: a symlink placed
+*inside* the sandbox root pointing *outside* it looks contained as a
+literal string (`root/link`), and only resolving it (which
+`canonicalize` does, as a side effect of also resolving `.`/`..`) reveals
+where it really points. `SandboxPath::new` canonicalizes `root` itself on
+every call rather than trusting a caller to have done it once — the cost
+is one extra filesystem call, and it removes a caller-side contract that
+would otherwise be easy to get subtly wrong (e.g. a root path with an
+unresolved symlink component, which would break the `starts_with` prefix
+check in a way that's hard to notice).
+
+`SandboxError` (`NotFound`, `Escapes`) has hand-written `Display` text —
+fixed per variant, never interpolating the actual resolved path. A
+rejected symlink's error must not itself disclose where the symlink
+really pointed; that would defeat the point of rejecting it.
+
+Tests use a hand-rolled `Drop`-based `TempDir` guard (creates a real
+temp directory, removes it when dropped, even if a test panics
+partway through) rather than adding a `tempfile` dev-dependency — same
+reasoning as `ChatError` over `thiserror`: a small enough amount of code
+that writing it directly is more instructive than depending on it, for
+a learning-focused project.
 
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 
