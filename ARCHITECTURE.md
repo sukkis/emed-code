@@ -106,16 +106,15 @@ speculative addition.
 per LLM turn — Mistral can in principle request several tool calls in a
 single turn (one assistant message, multiple `tool_calls`), and the
 textbook-correct shape would be one `Message::ToolCalls` holding all of
-them. This is a deliberate simplification with a real, currently
-unverified assumption (does Mistral's API tolerate several separate
-single-call turns as well as one multi-call turn — order and
-`tool_call_id` correlation are preserved either way, which is likely
-what actually matters, but this isn't confirmed against a real
-response yet). Tried rather than researched to a standstill first; see
-`SECURITY.md`... actually this isn't a security concern, it's a
-protocol-fidelity one — tracked instead in the increment's own planning
-doc, with a concrete criterion for how it would get caught if wrong
-(a real multi-tool-call round-trip test, not just a single-call one).
+them. This was a deliberate simplification, tried rather than researched
+to a standstill first, with a real assumption that needed checking: does
+Mistral's API tolerate several separate single-call turns as well as one
+multi-call turn? **Confirmed working**: a real end-to-end test
+(`tests/real_mistral_smoke_test.rs`) that requires at least two tool
+calls to complete (list a directory, then read a file in it) passes
+against the real API — order and `tool_call_id` correlation being
+preserved is what actually mattered, not whether the calls are grouped
+into one turn or several.
 
 Deliberately unbounded and uncompacted for now: nothing trims or
 summarizes history as it grows, so a very long session sends a
@@ -212,18 +211,40 @@ provider maps `ToolDefinition` into its own wire-format tool-schema type
 Mistral's function-calling docs: `{"type": "function", "function":
 {name, description, parameters}}`) via a `to_mistral_tools` function,
 mirroring how `Message` gets mapped into each provider's own message
-type.
+type. `MistralRequest.tools: Vec<MistralTool>` uses `#[serde(
+skip_serializing_if = "Vec::is_empty")]` so a request with nothing to
+advertise omits the field entirely rather than sending `"tools": []`
+(harmless either way in practice, since `Core` always has at least the
+two built-in tools to advertise today, but avoids relying on that).
 
-On the response side, `extract_mistral_reply` now returns
+On the response side, `extract_mistral_reply` returns
 `Result<LlmResponse, ChatError>` directly (not a bare `String`) — Mistral
-sends back either plain text (`content: Some(...)`, no `tool_calls`) or
-a tool-calling turn (`content: null`, `tool_calls` populated), never
-both meaningfully at once, so the function branches on
-`message.tool_calls.is_empty()` rather than needing a separate
-provider-facing concept of "did the model call a tool." Deserializing
-into `MistralResponseMessage` uses `#[serde(default)]` on `tool_calls`
-so a plain-text response — which omits that field entirely — still
-deserializes without needing an `Option`.
+sends back either plain text or a tool-calling turn, so the function
+branches on whether any tool calls came back, rather than needing a
+separate provider-facing concept of "did the model call a tool."
+
+**A real bug, caught by the local-gated smoke test, not by unit
+tests**: `MistralResponseMessage.tool_calls` was first typed as a bare
+`Vec<MistralToolCall>` with `#[serde(default)]`, on the assumption that
+a plain-text reply simply omits the `tool_calls` key. `#[serde(default)]`
+only substitutes a default when a field is *missing* — it does not run
+when the field is present with an explicit JSON `null`. Mistral's real
+API does send `"tool_calls": null` explicitly for at least some
+plain-text replies once a request advertises tools (inconsistently —
+a later request in the same test session omitted the key instead,
+suggesting this varies), which serde then tried to deserialize directly
+into a `Vec`, failing with "invalid type: null, expected a sequence."
+The fixture-based unit tests never caught this because they were
+written before any real advertised-tools response existed to model the
+fixture on. Fixed by typing the field `Option<Vec<MistralToolCall>>`
+instead: `Option<T>` deserializes a JSON `null` as `None` natively (no
+special attribute needed for that case), and `#[serde(default)]` still
+covers a genuinely missing field the same way. `extract_mistral_reply`
+then does `.unwrap_or_default()` to treat both as "no tool calls."
+Codified as its own regression test
+(`extract_mistral_reply_treats_an_explicit_null_tool_calls_as_absent`)
+so this is caught by a fast, deterministic test from now on, not only
+by the slow, real-network one.
 
 ## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
 

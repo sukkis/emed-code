@@ -72,6 +72,8 @@ struct MistralRequest {
     model: String,
     messages: Vec<MistralMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<MistralTool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,15 +131,19 @@ fn mistral_tool_call_type() -> String {
 }
 
 // Mistral sends back either plain text (content: Some(...), tool_calls
-// empty/absent) or a tool-calling turn (content: null, tool_calls
-// populated) — never both meaningfully at once. #[serde(default)] on
-// tool_calls keeps a plain-text response, which omits the field
-// entirely, deserializing fine.
+// absent or explicitly null) or a tool-calling turn (content: null,
+// tool_calls populated) — never both meaningfully at once. tool_calls is
+// Option, not a bare Vec with #[serde(default)]: #[serde(default) only
+// covers a *missing* field, but Mistral's real API sends "tool_calls":
+// null explicitly for some plain-text responses rather than omitting
+// the key — Option<Vec<_>> deserializes null as None natively, covering
+// both cases. See extract_mistral_reply, which treats both as "no tool
+// calls" via unwrap_or_default().
 #[derive(Debug, Deserialize)]
 struct MistralResponseMessage {
     content: Option<String>,
     #[serde(default)]
-    tool_calls: Vec<MistralToolCall>,
+    tool_calls: Option<Vec<MistralToolCall>>,
 }
 
 // One candidate completion. Mistral's API can in principle return more
@@ -169,16 +175,16 @@ fn extract_mistral_reply(json: &str) -> Result<LlmResponse, ChatError> {
                 .next()
                 .ok_or_else(|| ChatError::MalformedResponse("no choices in response".to_string()))?
                 .message;
+            let tool_calls = message.tool_calls.unwrap_or_default();
 
-            if message.tool_calls.is_empty() {
+            if tool_calls.is_empty() {
                 message.content.map(LlmResponse::Text).ok_or_else(|| {
                     ChatError::MalformedResponse(
                         "response has neither content nor tool_calls".to_string(),
                     )
                 })
             } else {
-                let tool_calls = message
-                    .tool_calls
+                let tool_calls = tool_calls
                     .into_iter()
                     .map(|call| ToolCall {
                         id: call.id,
@@ -200,11 +206,13 @@ fn fetch_mistral_reply(
     api_key: &str,
     model: &str,
     messages: Vec<MistralMessage>,
+    tools: Vec<MistralTool>,
 ) -> Result<String, ChatError> {
     let request = MistralRequest {
         model: model.to_string(),
         messages,
         stream: false,
+        tools,
     };
 
     let mut response = ureq::post(MISTRAL_URL)
@@ -233,10 +241,12 @@ impl LlmClient for MistralClient {
     fn send(
         &self,
         messages: &[Message],
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ChatError> {
         let mistral_messages = to_mistral_messages(messages);
-        let body = fetch_mistral_reply(&self.api_key, &self.model, mistral_messages)?;
+        let mistral_tools = to_mistral_tools(tools);
+        let body =
+            fetch_mistral_reply(&self.api_key, &self.model, mistral_messages, mistral_tools)?;
         extract_mistral_reply(&body)
     }
 }
@@ -247,7 +257,10 @@ mod tests {
 
     // Mistral's /v1/chat/completions request body: OpenAI-style shape,
     // reply nested under choices[0].message rather than a top-level
-    // message field like Ollama's.
+    // message field like Ollama's. No "tools" key at all when there are
+    // none to advertise — proves the field is actually omitted, not
+    // serialized as an empty array (which some APIs treat differently
+    // from an absent field).
     #[test]
     fn mistral_request_serializes_to_the_expected_shape() {
         let request = MistralRequest {
@@ -258,6 +271,7 @@ mod tests {
                 ..Default::default()
             }],
             stream: false,
+            tools: vec![],
         };
 
         let value = serde_json::to_value(&request).unwrap();
@@ -271,6 +285,36 @@ mod tests {
                 ],
                 "stream": false
             })
+        );
+    }
+
+    #[test]
+    fn mistral_request_includes_tools_when_present() {
+        let request = MistralRequest {
+            model: "mistral-small-latest".to_string(),
+            messages: vec![],
+            stream: false,
+            tools: to_mistral_tools(&[ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file's contents.".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            value["tools"],
+            serde_json::json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file's contents.",
+                        "parameters": {"type": "object"}
+                    }
+                }
+            ])
         );
     }
 
@@ -342,6 +386,30 @@ mod tests {
                 arguments: "{\"path\": \"notes.txt\"}".to_string(),
             }])
         );
+    }
+
+    // Real-world bug, caught via the local-gated smoke test against the
+    // actual API: once a request advertises tools, Mistral sends back
+    // "tool_calls": null explicitly for a plain-text reply, rather than
+    // omitting the key — #[serde(default)] only covers a *missing*
+    // field, not one present with an explicit null value.
+    #[test]
+    fn extract_mistral_reply_treats_an_explicit_null_tool_calls_as_absent() {
+        let json = r#"{
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hi there",
+                        "tool_calls": null
+                    }
+                }
+            ]
+        }"#;
+
+        let reply = extract_mistral_reply(json).unwrap();
+
+        assert_eq!(reply, LlmResponse::Text("hi there".to_string()));
     }
 
     #[test]
