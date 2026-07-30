@@ -1,7 +1,6 @@
-// Opt-in smoke test against the REAL Mistral API, using whatever model
-// MistralClient is currently hardcoded to (see MISTRAL_MODEL in
-// src/core.rs). Never runs in CI or a plain `cargo test` — only via
-// `cargo test --features local` (see the Justfile's `test` recipe).
+// Opt-in smoke test against the REAL Mistral API. Never runs in CI or a
+// plain `cargo test` — only via `cargo test --features local` (see the
+// Justfile's `test` recipe).
 //
 // Requires: a Mistral API key available via getfrompass
 // (emed-code/mistral/api_key) or the MISTRAL_API_KEY env var.
@@ -32,7 +31,10 @@ fn submit_user_message_gets_a_real_reply_from_mistral() {
     let (api_key, _source) = lookup_mistral_api_key().expect(
         "no Mistral API key found via getfrompass (emed-code/mistral/api_key) or MISTRAL_API_KEY",
     );
-    let mut core = Core::with_client(Arc::new(MistralClient::new(api_key)));
+    let mut core = Core::with_client(Arc::new(MistralClient::new(
+        api_key,
+        "mistral-small-latest".to_string(),
+    )));
 
     core.submit_user_message("Say hello in exactly one short sentence.".to_string());
 

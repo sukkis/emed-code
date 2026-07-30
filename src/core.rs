@@ -47,7 +47,7 @@ pub trait LlmClient {
 }
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
-const MODEL: &str = "mistral-nemo";
+pub(crate) const OLLAMA_MODEL: &str = "mistral-nemo";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OllamaMessage {
@@ -80,9 +80,9 @@ fn to_core_event(send_result: Result<String, ChatError>) -> CoreEvent {
     }
 }
 
-fn fetch_ollama_reply(text: &str) -> Result<String, ChatError> {
+fn fetch_ollama_reply(model: &str, text: &str) -> Result<String, ChatError> {
     let request = OllamaRequest {
-        model: MODEL.to_string(),
+        model: model.to_string(),
         messages: vec![OllamaMessage {
             role: "user".to_string(),
             content: text.to_string(),
@@ -100,11 +100,19 @@ fn fetch_ollama_reply(text: &str) -> Result<String, ChatError> {
         .map_err(|e| ChatError::Connection(e.to_string()))
 }
 
-pub struct OllamaClient;
+pub struct OllamaClient {
+    model: String,
+}
+
+impl OllamaClient {
+    pub fn new(model: String) -> Self {
+        OllamaClient { model }
+    }
+}
 
 impl LlmClient for OllamaClient {
     fn send(&self, message: &str) -> Result<String, ChatError> {
-        let body = fetch_ollama_reply(message)?;
+        let body = fetch_ollama_reply(&self.model, message)?;
         extract_reply(&body)
     }
 }
@@ -158,11 +166,11 @@ fn extract_mistral_reply(json: &str) -> Result<String, ChatError> {
 }
 
 const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
-const MISTRAL_MODEL: &str = "mistral-small-latest";
+pub(crate) const MISTRAL_MODEL: &str = "mistral-small-latest";
 
-fn fetch_mistral_reply(api_key: &str, text: &str) -> Result<String, ChatError> {
+fn fetch_mistral_reply(api_key: &str, model: &str, text: &str) -> Result<String, ChatError> {
     let request = MistralRequest {
-        model: MISTRAL_MODEL.to_string(),
+        model: model.to_string(),
         messages: vec![MistralMessage {
             role: "user".to_string(),
             content: text.to_string(),
@@ -183,17 +191,18 @@ fn fetch_mistral_reply(api_key: &str, text: &str) -> Result<String, ChatError> {
 
 pub struct MistralClient {
     api_key: Zeroizing<String>,
+    model: String,
 }
 
 impl MistralClient {
-    pub fn new(api_key: Zeroizing<String>) -> Self {
-        MistralClient { api_key }
+    pub fn new(api_key: Zeroizing<String>, model: String) -> Self {
+        MistralClient { api_key, model }
     }
 }
 
 impl LlmClient for MistralClient {
     fn send(&self, message: &str) -> Result<String, ChatError> {
-        let body = fetch_mistral_reply(&self.api_key, message)?;
+        let body = fetch_mistral_reply(&self.api_key, &self.model, message)?;
         extract_mistral_reply(&body)
     }
 }
@@ -253,7 +262,7 @@ impl Default for Core {
 
 impl Core {
     pub fn new() -> Self {
-        Self::with_client(Arc::new(OllamaClient))
+        Self::with_client(Arc::new(OllamaClient::new(OLLAMA_MODEL.to_string())))
     }
 
     pub fn with_client(client: Arc<dyn LlmClient + Send + Sync>) -> Self {

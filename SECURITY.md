@@ -26,25 +26,24 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   even a malformed key that fails header-value construction surfaces
   only a static `"failed to parse header value"` message (confirmed
   against the `http` crate's `InvalidHeaderValue` `Display` impl), not
-  the attempted value. **Reachable via the library API and
-  `tests/real_mistral_smoke_test.rs`** (`Core::with_client` +
-  `MistralClient::new`), but not yet selectable from the `cargo run`
-  binary itself — that still needs the `--provider`/`--model` CLI
-  wiring described in `README.md`'s Phase 2 roadmap entry.
+  the attempted value. **Now selectable from `cargo run`** via
+  `--provider mistral` (see `README.md`); on startup, a missing key
+  produces a clear error before the TUI opens, rather than the app
+  starting with no working provider (`main.rs` returns an `io::Error`
+  from `lookup_mistral_api_key`'s `None` case before any terminal setup
+  happens).
+- **Local-first default.** A new install (`cargo run`, no flags) defaults
+  to local Ollama with `mistral-nemo` — enforced explicitly by
+  `Cli`'s `default_value_t = Provider::Ollama`, not an accident of what's
+  built so far, now that Mistral is also a real, selectable choice.
 
 ## Backlog (not yet implemented)
 
-- **Provider transparency.** Whichever provider is active (local Ollama
-  vs. Mistral, once added) must always be visible to the user in the
-  TUI, not just configurable at startup. Not yet implemented — no
-  provider selection exists yet for there to be transparent about; needs
-  the `--provider` CLI flag to land first.
-- **Local-first default.** A new install must default to local Ollama
-  with a "friendly" default model (`mistral-nemo`), never to a remote
-  provider. True today only because Ollama is the sole provider; once
-  `--provider` CLI selection adds provider choice, this needs to be an
-  explicit, preserved default rather than an accident of what's built so
-  far.
+- **Provider transparency.** Whichever provider is active must always
+  be visible to the user in the running TUI itself, not just at startup
+  (the credential-source log line above is startup-only and scrolls out
+  of view once the TUI's alternate screen takes over). Not yet
+  implemented.
 
 ## Out of scope / not applicable
 

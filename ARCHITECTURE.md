@@ -4,7 +4,7 @@ Maintainer-facing design decisions and the reasoning behind them. Status
 and open gaps live in `SECURITY.md`; increment-by-increment planning
 lives locally under `docs/` (gitignored, not part of this record).
 
-## `core` / `tui` module split
+## `core` / `tui` / `cli` module split
 
 `core` (`src/core.rs`) holds conversation state and provider round-trips;
 it has zero `ratatui`/`crossterm` imports. It exposes exactly two entry
@@ -14,6 +14,15 @@ rendering/input state — `InputBox` (typed text), `App` (owns `InputBox`
 plus the message log and the one `Core` instance) — and talks to `core`
 only through that pair of calls. Keeping the boundary this narrow is what
 lets `core` be tested with zero terminal/rendering setup at all.
+
+`cli` (`src/cli.rs`) is a third, smaller module for command-line flag
+parsing — it's neither conversation state nor rendering/input state, so
+it doesn't belong in either of the other two. It exposes `Cli`
+(`clap::Parser`) and `Provider` (`clap::ValueEnum`); `main.rs` is the
+only thing that constructs a `Cli` and acts on it, matching the existing
+pattern of keeping pure, testable logic in a lib module and `main.rs`
+itself thin (see "Quit-key detection" below for the precedent this
+follows).
 
 ## Concurrency: thread + `mpsc`, no async runtime
 
@@ -83,18 +92,37 @@ with genuinely malformed responses.
 
 ## Credentials: `MistralClient` takes an already-resolved key
 
-`MistralClient::new(api_key: Zeroizing<String>)` takes the key directly
-rather than performing the `getfrompass`/env-var lookup itself.
-Resolving *which* source supplies the key (`resolve_mistral_api_key`/
-`lookup_mistral_api_key`) and deciding what happens if neither source has
-one are startup-wiring concerns — that's the CLI/provider-selection
-code's job, not `MistralClient`'s. This keeps `MistralClient` scoped to
-one responsibility: given a key, do the HTTP round-trip and map errors
-correctly. `lookup_mistral_api_key` tries `getfrompass` first (key
+`MistralClient::new(api_key: Zeroizing<String>, model: String)` takes
+the key directly rather than performing the `getfrompass`/env-var lookup
+itself. Resolving *which* source supplies the key
+(`resolve_mistral_api_key`/`lookup_mistral_api_key`) and deciding what
+happens if neither source has one are startup-wiring concerns — that's
+`main.rs`'s job (see "Startup wiring" below), not `MistralClient`'s. This
+keeps `MistralClient` scoped to one responsibility: given a key and a
+model, do the HTTP round-trip and map errors correctly.
+`lookup_mistral_api_key` tries `getfrompass` first (key
 `emed-code/mistral/api_key`), falling back to the `MISTRAL_API_KEY` env
 var only when `getfrompass` yields no value — see `SECURITY.md` for the
 credential-handling specifics (never logging the value, only ever
 calling the non-panicking `try_get_from_pass`).
+
+## Startup wiring: `main.rs` picks the `LlmClient`, `Core` stays agnostic
+
+`main.rs` parses `Cli`, resolves the model (`Cli::resolved_model`, which
+falls back to `OLLAMA_MODEL`/`MISTRAL_MODEL` — the same
+`pub(crate)` constants `cli.rs`'s defaulting logic reads directly, so the
+default model string exists in exactly one place, not duplicated between
+`core.rs` and `cli.rs`), then constructs whichever client the
+`--provider` flag selected before entering `ratatui::run`. For Mistral,
+this is also where `lookup_mistral_api_key` actually gets called and its
+result acted on: on success, `credential_log_message` is printed (to the
+plain terminal, before the alternate screen takes over — same reasoning
+as any other pre-TUI startup diagnostic); on failure, `main` returns an
+`io::Error` before any TUI setup happens, rather than the app opening
+with no working provider. `App::with_core(core: Core)` (alongside the
+existing zero-arg `App::new`) is what lets `main.rs` hand in a
+specifically-constructed `Core` instead of always getting the
+Ollama-default one.
 
 ## Testing strategy: pure decision logic vs. a thin I/O shell
 

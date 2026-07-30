@@ -208,10 +208,14 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_core(Core::new())
+    }
+
+    pub fn with_core(core: Core) -> Self {
         Self {
             input: InputBox::new(),
             log: Vec::new(),
-            core: Core::new(),
+            core,
             scroll_offset: 0,
             max_scroll: 0,
         }
