@@ -17,7 +17,7 @@ fn main() -> std::io::Result<()> {
             }
 
             app.poll_core_events();
-            terminal.draw(|frame| draw(frame, &app))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
         }
     })
 }

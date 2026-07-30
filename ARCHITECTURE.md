@@ -160,17 +160,34 @@ counted and rendered lines can't disagree — this was the whole point of
 doing the wrapping ourselves instead of splitting the responsibility
 between our own line-counting and ratatui's separate `Paragraph::wrap`.
 
-Known gap: `scroll_up` (`offset + step`, unconditional) relies entirely
-on `chat_scroll_skip`'s render-time saturation to keep the *rendered*
-result correct — but the internal `scroll_offset` counter itself can
-overshoot the true top with no ceiling. `scroll_down` afterward has to
-"pay off" that overshoot step by step before the visible view starts
-moving again, which is technically correct but feels unresponsive.
-Fixing this needs `App` to know the true ceiling (total wrapped lines
-minus visible height), which isn't available at key-press time — it
-requires feeding the last-rendered width/height back from `draw`,
-meaning `draw` taking `&mut App` rather than `&App`. Deferred to its own
-step rather than folded in here.
+`scroll_up` now clamps against `App::max_scroll`, the true ceiling
+(total wrapped lines minus visible height) as of the last render.
+`draw` takes `&mut App` rather than `&App` specifically so it can feed
+this back via `App::set_max_scroll` after computing `wrapped_lines`
+each frame — the ceiling can't be known at key-press time otherwise,
+since that depends on render width. It's at most one frame stale (the
+gap between a resize and the next draw), which is harmless since the
+next `draw` immediately recomputes it. Without this clamp,
+`scroll_offset` could overshoot the true top with no ceiling, and
+`scroll_down` would have to silently "pay off" that overshoot step by
+step before the visible view started moving again — technically
+correct but felt unresponsive.
+
+Scrolling to the log's bottom (`scroll_offset == 0`) doubles as "the user
+is following along" — `App::apply_core_events` relies on this and
+deliberately leaves `scroll_offset` untouched when new content (e.g.
+more of a streamed reply) arrives. Staying at `0` already tracks the
+latest content automatically, since `chat_scroll_skip` recomputes the
+skip from the current (growing) line count every render; forcing it
+back to `0` on every event was only needed to *correct* a
+non-`following` offset, and doing so unconditionally is what yanked a
+manually-scrolled-up user back to the bottom mid-stream. This is a
+distance-from-bottom representation, not an absolute anchor, so a
+user scrolled up while content is still streaming will drift forward
+slightly as new lines land below — not a full freeze, which was an
+explicit, accepted trade-off (avoids needing an absolute-position
+representation, which isn't knowable at key-press time for the same
+reason `max_scroll` above isn't).
 
 ## Error handling: plain strings for now, no bespoke error type yet
 
