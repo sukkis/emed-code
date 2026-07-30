@@ -4,16 +4,39 @@ Maintainer-facing design decisions and the reasoning behind them. Status
 and open gaps live in `SECURITY.md`; increment-by-increment planning
 lives locally under `docs/` (gitignored, not part of this record).
 
-## `core` / `tui` module split
+## `core` / `tui` / `cli` module split
 
-`core` (`src/core.rs`) holds conversation state and provider round-trips;
-it has zero `ratatui`/`crossterm` imports. It exposes exactly two entry
-points: `submit_user_message(&mut self, text: String)` and
-`poll_events(&mut self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all
-rendering/input state — `InputBox` (typed text), `App` (owns `InputBox`
-plus the message log and the one `Core` instance) — and talks to `core`
-only through that pair of calls. Keeping the boundary this narrow is what
-lets `core` be tested with zero terminal/rendering setup at all.
+`core` (`src/core.rs` plus `src/core/{ollama,mistral,credentials}.rs`)
+holds conversation state and provider round-trips; it has zero
+`ratatui`/`crossterm` imports. It exposes exactly two entry points:
+`submit_user_message(&mut self, text: String)` and `poll_events(&mut
+self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all rendering/input
+state — `InputBox` (typed text), `App` (owns `InputBox` plus the message
+log and the one `Core` instance) — and talks to `core` only through that
+pair of calls. Keeping the boundary this narrow is what lets `core` be
+tested with zero terminal/rendering setup at all.
+
+Internally, `core.rs` itself only holds what's genuinely shared across
+providers — `Core`, `CoreEvent`, `ChatError`, the `LlmClient` trait, and
+`to_core_event` — and re-exports each submodule's public items (`pub
+use ollama::OllamaClient`, etc.) so nothing outside `core` needs to know
+about this internal layout; `cli.rs`'s `crate::core::OLLAMA_MODEL`/
+`crate::core::MISTRAL_MODEL` and `main.rs`'s `emed_code::core::{...}`
+imports are unaffected by it. Split out once `core.rs` reached ~525
+lines (two providers' request/response types, fetch/extract functions,
+clients, and credential resolution all in one file) — a pure move, no
+behavior change, done ahead of Phase 3 adding tool-calling/`SandboxPath`
+to `core` too, which would have made the file considerably harder to
+navigate by the time that landed.
+
+`cli` (`src/cli.rs`) is a third, smaller module for command-line flag
+parsing — it's neither conversation state nor rendering/input state, so
+it doesn't belong in either of the other two. It exposes `Cli`
+(`clap::Parser`) and `Provider` (`clap::ValueEnum`); `main.rs` is the
+only thing that constructs a `Cli` and acts on it, matching the existing
+pattern of keeping pure, testable logic in a lib module and `main.rs`
+itself thin (see "Quit-key detection" below for the precedent this
+follows).
 
 ## Concurrency: thread + `mpsc`, no async runtime
 
@@ -25,18 +48,145 @@ to call once per UI redraw without ever stalling on network I/O. No
 style. Revisit only if real concurrent-provider or cancellation needs
 outgrow thread-per-request.
 
+## `LlmClient` trait: `Core` talks to providers only through this
+
+`Core` never calls a provider's HTTP shape directly. It holds an
+`Arc<dyn LlmClient + Send + Sync>` and calls `client.send(&self, message:
+&str) -> Result<String, ChatError>` — a plain sync method, no
+`async-trait`, matching the rest of the project's sync-loop-plus-threads
+concurrency model. `OllamaClient` is the first implementation (a
+`MistralClient` is next); adding a provider means writing a new
+`LlmClient` impl, not touching `Core`.
+
+`Arc`, not `Box`: dynamic dispatch (a trait object, not a generic
+`Core<C: LlmClient>`) was chosen because the concrete client isn't known
+until a `--provider` CLI flag is parsed at startup — there's no
+generics-only capability the trait's plain sync method needs that would
+justify monomorphization instead. `Arc` specifically (rather than `Box`)
+is required by the concurrency model above: `submit_user_message` spawns
+a new thread per call, and that thread's `move` closure needs its own
+usable handle to the client while `Core` keeps using its own handle for
+every later call — `Box`'s exclusive ownership can only ever have one
+owner, so the client would have to be moved permanently out of `Core`
+into the first thread that used it. `Arc`'s reference-counted *shared*
+ownership lets `Core` keep a handle while `Arc::clone` (an O(1) refcount
+bump, not a copy of the client itself) hands the spawned thread an
+independent one pointing at the same value. The `+ Send + Sync` bound on
+the trait object is required because `Arc<T>` is only itself safe to
+move/share across threads when `T: Send + Sync`; the compiler can't
+infer that for an arbitrary `dyn LlmClient`, so it's stated explicitly.
+
+## Error handling: a hand-written `ChatError` enum, no `thiserror`
+
+Provider errors are `ChatError` (`Connection`, `MalformedResponse`,
+`Auth`), with hand-written `Display`/`std::error::Error` impls rather
+than `thiserror`-derived ones — per this project's Dependency Discipline
+(parent `CLAUDE.md`), a handful of variants is a small, genuinely
+instructive amount of code for a learning-focused project, not
+boilerplate worth a dependency. `Auth` exists for Mistral's API-key
+rejection case, which
+`OllamaClient` has no way to hit (no credentials involved) but the enum
+is shared across every `LlmClient` impl.
+
+`extract_mistral_reply` is where `Auth` actually gets populated: Mistral
+can send back one of two shapes on any given request — a success
+envelope (`{"choices": [...]}`) or an error envelope (`{"message": ...,
+"request_id": ...}`, e.g. on a 401), and there's no HTTP status code
+available at this pure-parsing layer to tell them apart up front — that
+information lives in the HTTP response `fetch_mistral_reply` receives,
+one layer up, but the body text alone is all `extract_mistral_reply`
+gets to work with. So it tries the success shape first; if that fails
+to deserialize, it tries the error shape; if that also fails, it
+surfaces the *original* success-shape parse error as
+`ChatError::MalformedResponse` rather than the second attempt's (a
+generic "wasn't valid JSON at all" is a more useful message than "also
+didn't look like an error envelope"). This means a real Mistral auth
+failure comes back as `ChatError::Auth("Unauthorized")`, not lumped in
+with genuinely malformed responses.
+
+**Known limitation, deliberately deferred**: `ChatError::Connection`
+flattens whatever `ureq` produced (connection refused, timeout, DNS
+failure, TLS error, ...) into one `String` via `.to_string()`. That's
+fine today — nothing currently needs to tell those cases apart. It stops
+being fine the day retry-vs-fail-fast logic is written (expected in
+Phase 3's agent loop, once Ollama's tool-calling reliability needs more
+than plain retry-with-backoff): a string can't be pattern-matched
+on to decide "retry this" vs. "give up," so `Connection` would need to
+become its own small enum (e.g. `Timeout`, `Refused`, `DnsFailure`,
+`Other(String)`) capturing `ureq::Error`'s actual variants instead of
+collapsing them. Revisit at that point, not before — this is exactly the
+"don't design for hypothetical future requirements" call, made
+explicitly rather than silently.
+
+## Credentials: `MistralClient` takes an already-resolved key
+
+`MistralClient::new(api_key: Zeroizing<String>, model: String)` takes
+the key directly rather than performing the `getfrompass`/env-var lookup
+itself. Resolving *which* source supplies the key
+(`resolve_mistral_api_key`/`lookup_mistral_api_key`) and deciding what
+happens if neither source has one are startup-wiring concerns — that's
+`main.rs`'s job (see "Startup wiring" below), not `MistralClient`'s. This
+keeps `MistralClient` scoped to one responsibility: given a key and a
+model, do the HTTP round-trip and map errors correctly.
+`lookup_mistral_api_key` tries `getfrompass` first (key
+`emed-code/mistral/api_key`), falling back to the `MISTRAL_API_KEY` env
+var only when `getfrompass` yields no value — see `SECURITY.md` for the
+credential-handling specifics (never logging the value, only ever
+calling the non-panicking `try_get_from_pass`).
+
+## Startup wiring: `main.rs` picks the `LlmClient`, `Core` stays agnostic
+
+`main.rs` parses `Cli`, resolves the model (`Cli::resolved_model`, which
+falls back to `OLLAMA_MODEL`/`MISTRAL_MODEL` — the same
+`pub(crate)` constants `cli.rs`'s defaulting logic reads directly, so the
+default model string exists in exactly one place, not duplicated between
+`core.rs` and `cli.rs`), then constructs whichever client the
+`--provider` flag selected before entering `ratatui::run`. For Mistral,
+this is also where `lookup_mistral_api_key` actually gets called and its
+result acted on: on success, `credential_log_message` is printed (to the
+plain terminal, before the alternate screen takes over — same reasoning
+as any other pre-TUI startup diagnostic); on failure, `main` returns an
+`io::Error` before any TUI setup happens, rather than the app opening
+with no working provider. `App::with_core(core: Core, provider_label:
+ProviderLabel)` (alongside the existing zero-arg `App::new`) is what
+lets `main.rs` hand in a specifically-constructed `Core` and the label
+describing it.
+
+## Provider label: a static, startup-time indicator in the chat title
+
+`tui::ProviderLabel` (`Ollama`/`Mistral`) is `tui`'s own enum, not a
+reuse of `cli::Provider` — `tui` has no reason to depend on `cli` for
+what is, from its perspective, just display text (`"local (ollama)"` /
+`"cloud (mistral)"`, rendered as `Block::bordered().title(format!("emed-code
+— AI: {}", ...))` in `draw`). `main.rs` maps `cli::Provider` to
+`ProviderLabel` when constructing `App`, since it's the one place that
+already knows both. This is deliberately a one-time, startup-set value —
+`App` stores it once in `with_core` and `draw` just reads it every
+frame; there's no live-switching mechanism, matching the CLI selection
+it reflects being parsed once at process start.
+
 ## Testing strategy: pure decision logic vs. a thin I/O shell
 
 Provider integration code is split so the actual network call is as
 small and dumb as possible, with everything else a plain function over
 data:
 
-- `fetch_ollama_reply` — the only part that touches `ureq`. Collapses
-  every failure mode (connection refused, timeout, non-2xx status) into
-  a plain `Result<String, String>`.
-- `to_core_event` — pure: takes that `Result<String, String>`, returns a
-  `CoreEvent`. Tested with plain fixture strings/`Err` values, no network
-  involved.
+- `fetch_ollama_reply`/`fetch_mistral_reply` — the only parts that touch
+  `ureq`. Collapse every failure mode (connection refused, timeout,
+  non-2xx status) into `Result<String, ChatError>` (specifically
+  `ChatError::Connection`). Neither has a unit test of its own; each has
+  a `local`-feature-gated smoke test instead (see "The `local` Cargo
+  feature" below).
+- `extract_reply`/`extract_mistral_reply` — pure: parse a response body
+  into the reply text or a `ChatError`. Tested with fixture JSON
+  strings, no network involved. `OllamaClient::send`/`MistralClient::send`
+  are each just their provider's fetch-then-extract call chained.
+- `to_core_event` — pure and now provider-agnostic: takes the
+  `Result<String, ChatError>` a `LlmClient::send` call already produced
+  (fetch *and* parse are done by then) and wraps it into a `CoreEvent`.
+  It doesn't parse anything itself, unlike before this trait existed —
+  parsing is each provider's own job, since that's the part that differs
+  between them.
 
 This means the interesting behavior (what happens on a malformed
 response vs. a failed request) is covered by fast, deterministic unit
@@ -69,9 +219,11 @@ why `main.rs` has stayed free of its own crossterm imports beyond
 
 ## The `local` Cargo feature: gating tests that need a real external service
 
-Some behavior can only be verified against a real local service (here:
-Ollama). Those tests are never part of a plain `cargo test` or CI run —
-they live in their own file under `tests/`, gated with
+Some behavior can only be verified against a real external service —
+Ollama locally, or the real Mistral API (`tests/real_ollama_smoke_test.rs`,
+`tests/real_mistral_smoke_test.rs`). Those tests are never part of a
+plain `cargo test` or CI run — they live in their own file under
+`tests/`, gated with
 `#![cfg(feature = "local")]` at the top of the file, and only run via
 `cargo test --features local` (or `just test`). This mirrors the same
 convention already used in `emed` and `personal-cloud-mcp`, so it isn't
@@ -188,13 +340,3 @@ slightly as new lines land below — not a full freeze, which was an
 explicit, accepted trade-off (avoids needing an absolute-position
 representation, which isn't knowable at key-press time for the same
 reason `max_scroll` above isn't).
-
-## Error handling: plain strings for now, no bespoke error type yet
-
-Provider errors currently collapse to `String` (via `.to_string()` on
-whatever `ureq`/`serde_json` produced) rather than a dedicated error
-enum. There's no retry-vs-fail-fast or timeout-vs-auth-failure logic yet
-that would need to distinguish failure kinds, so there's nothing for a
-bespoke type to buy right now. A hand-written `ChatError` (no
-`thiserror` — see Dependency Discipline) is expected once multi-provider
-retry/fallback logic needs to tell those cases apart.
