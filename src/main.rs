@@ -3,7 +3,7 @@ use emed_code::cli::{Cli, Provider};
 use emed_code::core::{
     Core, MistralClient, OllamaClient, credential_log_message, lookup_mistral_api_key,
 };
-use emed_code::tui::{App, draw, is_quit_key};
+use emed_code::tui::{App, ProviderLabel, draw, is_quit_key};
 use ratatui::crossterm::event::{self, Event};
 use std::io;
 use std::sync::Arc;
@@ -12,6 +12,11 @@ use std::time::Duration;
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let model = cli.resolved_model();
+
+    let provider_label = match cli.provider {
+        Provider::Ollama => ProviderLabel::Ollama,
+        Provider::Mistral => ProviderLabel::Mistral,
+    };
 
     let core = match cli.provider {
         Provider::Ollama => Core::with_client(Arc::new(OllamaClient::new(model))),
@@ -28,7 +33,7 @@ fn main() -> io::Result<()> {
     };
 
     ratatui::run(|terminal| {
-        let mut app = App::with_core(core);
+        let mut app = App::with_core(core, provider_label);
 
         loop {
             if event::poll(Duration::from_millis(100))?

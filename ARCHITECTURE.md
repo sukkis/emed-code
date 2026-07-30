@@ -119,10 +119,23 @@ result acted on: on success, `credential_log_message` is printed (to the
 plain terminal, before the alternate screen takes over — same reasoning
 as any other pre-TUI startup diagnostic); on failure, `main` returns an
 `io::Error` before any TUI setup happens, rather than the app opening
-with no working provider. `App::with_core(core: Core)` (alongside the
-existing zero-arg `App::new`) is what lets `main.rs` hand in a
-specifically-constructed `Core` instead of always getting the
-Ollama-default one.
+with no working provider. `App::with_core(core: Core, provider_label:
+ProviderLabel)` (alongside the existing zero-arg `App::new`) is what
+lets `main.rs` hand in a specifically-constructed `Core` and the label
+describing it.
+
+## Provider label: a static, startup-time indicator in the chat title
+
+`tui::ProviderLabel` (`Ollama`/`Mistral`) is `tui`'s own enum, not a
+reuse of `cli::Provider` — `tui` has no reason to depend on `cli` for
+what is, from its perspective, just display text (`"local (ollama)"` /
+`"cloud (mistral)"`, rendered as `Block::bordered().title(format!("emed-code
+— AI: {}", ...))` in `draw`). `main.rs` maps `cli::Provider` to
+`ProviderLabel` when constructing `App`, since it's the one place that
+already knows both. This is deliberately a one-time, startup-set value —
+`App` stores it once in `with_core` and `draw` just reads it every
+frame; there's no live-switching mechanism, matching the CLI selection
+it reflects being parsed once at process start.
 
 ## Testing strategy: pure decision logic vs. a thin I/O shell
 

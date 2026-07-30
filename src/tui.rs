@@ -129,7 +129,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
 
-    let chat_block = Block::bordered().title("emed-code");
+    let chat_title = format!("emed-code — AI: {}", app.provider_label().as_str());
+    let chat_block = Block::bordered().title(chat_title);
     let chat_inner = chat_block.inner(chat_area);
 
     let wrapped_lines: Vec<String> = app
@@ -190,10 +191,31 @@ impl InputBox {
     }
 }
 
+// Static, startup-time label for which provider is active — not a live
+// switch (provider selection stays a one-time CLI choice). Its own enum
+// rather than reusing cli::Provider directly, so tui doesn't take on a
+// dependency on the cli module for what is, from tui's perspective,
+// just display text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProviderLabel {
+    Ollama,
+    Mistral,
+}
+
+impl ProviderLabel {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProviderLabel::Ollama => "local (ollama)",
+            ProviderLabel::Mistral => "cloud (mistral)",
+        }
+    }
+}
+
 pub struct App {
     input: InputBox,
     log: Vec<String>,
     core: Core,
+    provider_label: ProviderLabel,
     scroll_offset: usize,
     // True ceiling for scroll_offset, as of the last draw call. Stale by
     // at most one frame — see scroll_up's doc comment.
@@ -208,14 +230,15 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        Self::with_core(Core::new())
+        Self::with_core(Core::new(), ProviderLabel::Ollama)
     }
 
-    pub fn with_core(core: Core) -> Self {
+    pub fn with_core(core: Core, provider_label: ProviderLabel) -> Self {
         Self {
             input: InputBox::new(),
             log: Vec::new(),
             core,
+            provider_label,
             scroll_offset: 0,
             max_scroll: 0,
         }
@@ -275,6 +298,10 @@ impl App {
         &self.log
     }
 
+    pub fn provider_label(&self) -> ProviderLabel {
+        self.provider_label
+    }
+
     pub fn input_buffer(&self) -> &str {
         self.input.buffer()
     }
@@ -321,6 +348,54 @@ mod tests {
         assert!(
             content.contains("input"),
             "expected the input area's title to render: {content:?}"
+        );
+    }
+
+    // Same TestBackend approach as draws_titled_log_and_input_areas
+    // above — checks the label text renders, not exact spacing. Two
+    // providers, two tests, so the label is proven enum-driven rather
+    // than one hardcoded string that happens to say "ollama".
+    #[test]
+    fn draws_ollama_as_the_local_provider_in_the_chat_title() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::with_core(Core::new(), ProviderLabel::Ollama);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            content.contains("local (ollama)"),
+            "expected the active provider label to render: {content:?}"
+        );
+    }
+
+    #[test]
+    fn draws_mistral_as_the_cloud_provider_in_the_chat_title() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::with_core(Core::new(), ProviderLabel::Mistral);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            content.contains("cloud (mistral)"),
+            "expected the active provider label to render: {content:?}"
         );
     }
 

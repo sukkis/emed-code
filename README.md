@@ -23,6 +23,10 @@ A startup line reports which source supplied the key (never the value
 itself); if neither has one, the app exits with a clear error before
 opening the TUI.
 
+The chat log's title bar shows which provider is active for the whole
+session (`emed-code — AI: local (ollama)` or `... cloud (mistral)`), so
+it's never ambiguous whether a cloud provider is in use.
+
 Type a message and press Enter to send it. The reply appears in the
 chat log above once the provider responds (no streaming yet — one
 request is sent and it waits for the complete reply). `Up`/`Down`/
@@ -48,8 +52,10 @@ depend on anything outside the checkout.
 - **Phase 1 — Chat TUI + Ollama** (done): ratatui chat interface,
   scrollable log, input box, talking to a local Ollama model. No tools
   yet.
-- **Phase 2 — Provider abstraction + Mistral**: `LlmClient` trait,
-  `clap`-based provider/model selection, Mistral support.
+- **Phase 2 — Provider abstraction + Mistral** (done): `LlmClient`
+  trait, `OllamaClient`/`MistralClient`, `clap`-based provider/model
+  selection, `getfrompass`+env-var Mistral credentials, active-provider
+  indicator in the chat title.
 - **Phase 3 — Agent loop + file tools**: tool-calling, sandboxed
   `read_file`/`write_file`.
 - **Phase 4 — Diff preview + confirmation**: show a diff before any

@@ -36,14 +36,17 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   to local Ollama with `mistral-nemo` — enforced explicitly by
   `Cli`'s `default_value_t = Provider::Ollama`, not an accident of what's
   built so far, now that Mistral is also a real, selectable choice.
+- **Provider transparency.** The active provider is shown in the chat
+  block's title for the entire session (`emed-code — AI: local (ollama)`
+  or `... cloud (mistral)`), not just in the startup-only credential log
+  line, which scrolls out of view once the TUI's alternate screen takes
+  over. A user can't lose track of whether a cloud provider is in use.
 
 ## Backlog (not yet implemented)
 
-- **Provider transparency.** Whichever provider is active must always
-  be visible to the user in the running TUI itself, not just at startup
-  (the credential-source log line above is startup-only and scrolls out
-  of view once the TUI's alternate screen takes over). Not yet
-  implemented.
+(none currently — the items tracked here for Phase 2 are all resolved;
+see `ARCHITECTURE.md`'s "Startup wiring" and "provider label" sections
+for how.)
 
 ## Out of scope / not applicable
 
