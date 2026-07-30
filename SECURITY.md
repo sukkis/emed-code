@@ -69,6 +69,12 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   tested** — a scripted client that never stops requesting tool calls
   is proven to terminate with a clear error after exactly 40 individual
   calls, not hang or loop unboundedly.
+- **Tool-call transparency in the running TUI.** Every tool invocation
+  (name, arguments, and result) renders in the chat log with its own
+  `"tool: "` prefix, distinct from `"emed-code: "` (assistant replies)
+  and `"error: "` — extends the same transparency reasoning behind the
+  provider indicator above to tool activity specifically: a user can
+  see exactly what the agent read, not just that something happened.
 
 ## Backlog (not yet implemented)
 

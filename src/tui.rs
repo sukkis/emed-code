@@ -15,11 +15,16 @@ const PAGE_SCROLL_STEP: usize = 5;
 fn format_core_event(event: CoreEvent) -> String {
     match event {
         CoreEvent::AssistantChunk(text) => format!("emed-code: {text}"),
-        // Minimal stopgap to keep this exhaustive and the app usable —
-        // not this step's job to design properly (a real, visually
-        // distinguishable prefix + its own TestBackend test is a
-        // separate, later step).
-        CoreEvent::ToolCall { name, result, .. } => format!("[tool: {name}] {result}"),
+        // "tool: " is a distinct prefix from both "emed-code: " and
+        // "error: " — shows the full call (name + arguments) and its
+        // result, so the user sees exactly what ran, not just that
+        // something did.
+        CoreEvent::ToolCall {
+            name,
+            arguments,
+            result,
+            ..
+        } => format!("tool: {name}({arguments}) -> {result}"),
         CoreEvent::Error(message) => format!("error: {message}"),
     }
 }
@@ -661,6 +666,54 @@ mod tests {
         assert_eq!(
             format_core_event(CoreEvent::Error("connection refused".to_string())),
             "error: connection refused"
+        );
+    }
+
+    // "tool: " is a distinct prefix from both "emed-code: " (assistant
+    // replies) and "error: " — the point of this step, so a user can
+    // tell tool activity apart from either at a glance.
+    #[test]
+    fn formats_a_tool_call_with_a_prefix() {
+        assert_eq!(
+            format_core_event(CoreEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path": "notes.txt"}"#.to_string(),
+                result: "hello".to_string(),
+            }),
+            r#"tool: read_file({"path": "notes.txt"}) -> hello"#
+        );
+    }
+
+    // TestBackend-level check, same style as the provider-label tests —
+    // proves a ToolCall event actually reaches the rendered chat log via
+    // App::apply_core_events, not just that format_core_event itself
+    // produces the right string in isolation.
+    #[test]
+    fn draws_a_tool_call_in_the_chat_log() {
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": "notes.txt"}"#.to_string(),
+            result: "hello".to_string(),
+        }]);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            content.contains("tool: read_file"),
+            "expected the tool-call prefix to render: {content:?}"
         );
     }
 

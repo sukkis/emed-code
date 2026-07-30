@@ -10,6 +10,9 @@ progress — see Roadmap below for current status.
   cloud API — your choice, one flag apart
 - Remembers the whole conversation for the session, so follow-up
   questions work
+- With `--provider mistral`, can read and list files in the current
+  project to answer questions — sandboxed to the directory you launched
+  it from, and every tool call is shown in the chat log, not hidden
 - Always shows which provider is active right in the chat title — no
   surprise cloud calls
 - Scrollable chat log, built for living inside tmux
@@ -29,6 +32,10 @@ cargo run -- --provider mistral --model codestral-latest
 
 Mistral needs an API key — either a `getfrompass` entry
 (`emed-code/mistral/api_key`) or the `MISTRAL_API_KEY` env var works.
+With Mistral, you can ask it things like "what files are in this
+project?" or "read Cargo.toml and tell me the package name" — it reads
+and lists files under wherever you ran `cargo run` from, and nowhere
+else. Ollama doesn't get file tools yet (its own later phase).
 
 Run `cargo run -- --help` for the full flag reference.
 
