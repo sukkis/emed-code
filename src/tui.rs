@@ -20,12 +20,13 @@ fn format_core_event(event: CoreEvent) -> String {
 }
 
 // offset is "how many lines scrolled up from the bottom" (0 = latest).
-// Unclamped here — the real ceiling (can't scroll past the top) depends
-// on the wrapped *line* count, which needs the render width, not
-// available at key-press time. That clamp happens in chat_scroll_skip
-// instead, at render time.
-fn scroll_up(offset: usize, step: usize) -> usize {
-    offset + step
+// Clamped to max, the true ceiling as of the last render (total wrapped
+// lines minus visible height) — App keeps this up to date via draw, so
+// it's always at most one frame stale. Without this clamp, offset could
+// overshoot the real top, and scroll_down would have to silently "pay
+// off" that overshoot before the view visibly moved again.
+fn scroll_up(offset: usize, step: usize, max: usize) -> usize {
+    (offset + step).min(max)
 }
 
 fn scroll_down(offset: usize, step: usize) -> usize {
@@ -124,7 +125,7 @@ pub fn is_quit_key(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
 
@@ -136,11 +137,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .flat_map(|entry| wrap_text(entry, chat_inner.width as usize))
         .collect();
-    let skip = chat_scroll_skip(
-        wrapped_lines.len(),
-        chat_inner.height as usize,
-        app.scroll_offset(),
-    );
+    let visible_height = chat_inner.height as usize;
+    app.set_max_scroll(wrapped_lines.len().saturating_sub(visible_height));
+    let skip = chat_scroll_skip(wrapped_lines.len(), visible_height, app.scroll_offset());
 
     let chat_text = wrapped_lines.join("\n");
     let chat = Paragraph::new(chat_text)
@@ -196,6 +195,9 @@ pub struct App {
     log: Vec<String>,
     core: Core,
     scroll_offset: usize,
+    // True ceiling for scroll_offset, as of the last draw call. Stale by
+    // at most one frame — see scroll_up's doc comment.
+    max_scroll: usize,
 }
 
 impl Default for App {
@@ -211,6 +213,7 @@ impl App {
             log: Vec::new(),
             core: Core::new(),
             scroll_offset: 0,
+            max_scroll: 0,
         }
     }
 
@@ -221,9 +224,14 @@ impl App {
 
         match key.code {
             KeyCode::Enter => self.submit(),
-            KeyCode::Up => self.scroll_offset = scroll_up(self.scroll_offset, SCROLL_STEP),
+            KeyCode::Up => {
+                self.scroll_offset = scroll_up(self.scroll_offset, SCROLL_STEP, self.max_scroll)
+            }
             KeyCode::Down => self.scroll_offset = scroll_down(self.scroll_offset, SCROLL_STEP),
-            KeyCode::PageUp => self.scroll_offset = scroll_up(self.scroll_offset, PAGE_SCROLL_STEP),
+            KeyCode::PageUp => {
+                self.scroll_offset =
+                    scroll_up(self.scroll_offset, PAGE_SCROLL_STEP, self.max_scroll)
+            }
             KeyCode::PageDown => {
                 self.scroll_offset = scroll_down(self.scroll_offset, PAGE_SCROLL_STEP)
             }
@@ -244,14 +252,19 @@ impl App {
 
     pub fn poll_core_events(&mut self) {
         let events = self.core.poll_events();
-        if events.is_empty() {
-            return;
-        }
+        self.apply_core_events(events);
+    }
 
+    // Deliberately does not touch scroll_offset: if the user has
+    // scrolled up to read something, new content arriving (e.g. more of
+    // a streamed reply) shouldn't yank them back to the bottom. Staying
+    // at 0 (the default) already means "following" — chat_scroll_skip
+    // shows the latest content automatically as total_lines grows, with
+    // no reset needed.
+    fn apply_core_events(&mut self, events: Vec<CoreEvent>) {
         for event in events {
             self.log.push(format_core_event(event));
         }
-        self.scroll_offset = 0;
     }
 
     pub fn log(&self) -> &[String] {
@@ -264,6 +277,10 @@ impl App {
 
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
+    }
+
+    pub fn set_max_scroll(&mut self, max_scroll: usize) {
+        self.max_scroll = max_scroll;
     }
 }
 
@@ -282,8 +299,8 @@ mod tests {
         let backend = TestBackend::new(20, 6);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let app = App::new();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let mut app = App::new();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let content: String = terminal
             .backend()
@@ -323,7 +340,7 @@ mod tests {
         }
         app.handle_key(press(KeyCode::Enter));
 
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let content: String = terminal
             .backend()
@@ -352,7 +369,7 @@ mod tests {
         app.handle_key(press(KeyCode::Enter));
     }
 
-    fn rendered_content(app: &App) -> String {
+    fn rendered_content(app: &mut App) -> String {
         let backend = TestBackend::new(10, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
@@ -371,7 +388,7 @@ mod tests {
         let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
         type_and_submit(&mut app, &words.join(" "));
 
-        let content = rendered_content(&app);
+        let content = rendered_content(&mut app);
 
         assert!(
             content.contains("w40"),
@@ -388,12 +405,16 @@ mod tests {
         let mut app = App::new();
         let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
         type_and_submit(&mut app, &words.join(" "));
+        // scroll_up now clamps to App's last-known ceiling, which is only
+        // set by draw — so a render has to happen at least once before
+        // scrolling for the ceiling to be anything other than 0.
+        rendered_content(&mut app);
 
         for _ in 0..30 {
             app.handle_key(press(KeyCode::Up));
         }
 
-        let content = rendered_content(&app);
+        let content = rendered_content(&mut app);
 
         assert!(
             content.contains("w1 "),
@@ -407,9 +428,9 @@ mod tests {
     fn cursor_is_at_the_start_of_the_input_box_when_empty() {
         let backend = TestBackend::new(20, 6);
         let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::new();
+        let mut app = App::new();
 
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         terminal.backend_mut().assert_cursor_position((1, 4));
     }
@@ -422,7 +443,7 @@ mod tests {
         app.handle_key(press(KeyCode::Char('h')));
         app.handle_key(press(KeyCode::Char('i')));
 
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         terminal.backend_mut().assert_cursor_position((3, 4));
     }
@@ -559,15 +580,15 @@ mod tests {
         );
     }
 
-    // scroll_up no longer clamps against log length — that was always
-    // the wrong ceiling (it should be wrapped *line* count, not entry
-    // count, and the render width needed to know that isn't available
-    // at key-press time anyway). The real clamp now lives entirely in
-    // chat_scroll_skip, which runs at render time where the width is
-    // actually known.
     #[test]
     fn scroll_up_increases_offset_by_step() {
-        assert_eq!(scroll_up(0, 1), 1);
+        assert_eq!(scroll_up(0, 1, 10), 1);
+    }
+
+    #[test]
+    fn scroll_up_does_not_exceed_the_given_ceiling() {
+        assert_eq!(scroll_up(4, 1, 5), 5);
+        assert_eq!(scroll_up(5, 1, 5), 5);
     }
 
     #[test]
@@ -608,12 +629,12 @@ mod tests {
     #[test]
     fn up_key_scrolls_up_and_down_key_scrolls_back() {
         let mut app = App::new();
-        for text in ["a", "b", "c"] {
-            for c in text.chars() {
-                app.handle_key(press(KeyCode::Char(c)));
-            }
-            app.handle_key(press(KeyCode::Enter));
-        }
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+        // scroll_up clamps to App's last-known ceiling, set only by
+        // draw — content long enough to actually need scrolling, and a
+        // render establishing that ceiling, are both required here.
+        rendered_content(&mut app);
         assert_eq!(app.scroll_offset(), 0);
 
         app.handle_key(press(KeyCode::Up));
@@ -626,16 +647,65 @@ mod tests {
     #[test]
     fn page_up_scrolls_by_more_than_one_line() {
         let mut app = App::new();
-        for text in ["a", "b", "c", "d", "e", "f", "g", "h"] {
-            for c in text.chars() {
-                app.handle_key(press(KeyCode::Char(c)));
-            }
-            app.handle_key(press(KeyCode::Enter));
-        }
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+        rendered_content(&mut app);
 
         app.handle_key(press(KeyCode::PageUp));
 
         assert!(app.scroll_offset() > 1);
+    }
+
+    // Regression test for the bug where new content arriving (e.g. a
+    // streamed reply still coming in) forcibly reset scroll_offset to 0,
+    // yanking the view back to the bottom even if the user had
+    // deliberately scrolled up to read something. apply_core_events is
+    // called directly (bypassing Core/the network entirely) since
+    // that's the only way to feed it fake events without a live Ollama
+    // server.
+    #[test]
+    fn new_core_events_do_not_reset_a_manual_scroll_position() {
+        let mut app = App::new();
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+        rendered_content(&mut app);
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.scroll_offset(), 1);
+
+        app.apply_core_events(vec![CoreEvent::AssistantChunk("reply".to_string())]);
+
+        assert_eq!(
+            app.scroll_offset(),
+            1,
+            "expected a manually-scrolled position to survive new content arriving"
+        );
+    }
+
+    // Regression test for the overshoot bug documented in
+    // ARCHITECTURE.md: without a ceiling, scrolling well past the true
+    // top would "bank" overshoot that Down then has to silently pay off
+    // before the view visibly moves. 500 Up presses is far more than
+    // this content has wrapped lines for, so it would overshoot badly
+    // if scroll_up were still unbounded.
+    #[test]
+    fn scrolling_past_the_top_does_not_leave_scrolling_down_unresponsive() {
+        let mut app = App::new();
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+        rendered_content(&mut app);
+
+        for _ in 0..500 {
+            app.handle_key(press(KeyCode::Up));
+        }
+        let content_at_top = rendered_content(&mut app);
+
+        app.handle_key(press(KeyCode::Down));
+        let content_after_one_down = rendered_content(&mut app);
+
+        assert_ne!(
+            content_at_top, content_after_one_down,
+            "expected a single Down press to move the view immediately, even after scrolling far past the top"
+        );
     }
 
     #[test]

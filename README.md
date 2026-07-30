@@ -6,15 +6,18 @@ for current status.
 
 ## Running it
 
+Requires a local Ollama instance running with the `mistral-nemo` model
+pulled (`ollama list` to check; `core.rs`'s `MODEL` constant is where
+that's set — no provider/model selection yet, see Roadmap).
+
 ```
 cargo run
 ```
 
-Currently shows a static two-region screen (chat log / input box) and
-quits on any keypress. The input box doesn't accept typing yet, and
-nothing is wired to an LLM from the UI yet — that's upcoming roadmap
-work (see below). `core`'s Ollama integration exists and is covered by
-tests, just not yet connected to what you see on screen.
+Type a message and press Enter to send it. The reply appears in the
+chat log above once Ollama responds (no streaming yet — Phase 1 sends
+one request and waits for the complete reply). `Up`/`Down`/`PageUp`/
+`PageDown` scroll the log; `Ctrl-C` or `Ctrl-Q` quits.
 
 ### Running the full local test suite
 
@@ -22,16 +25,18 @@ tests, just not yet connected to what you see on screen.
 just test
 ```
 
-runs everything, including a test that talks to a real local Ollama
+runs everything, including tests that talk to a real local Ollama
 instance (model: `mistral-nemo`, see `ollama list` to check it's
-pulled). `just ci` (or plain `cargo test`) skips that and runs only
-what doesn't depend on anything outside the checkout.
+pulled) — a request/response smoke test plus a short mini-session
+(send a message, scroll, send a follow-up). `just ci` (or plain `cargo
+test`) skips those and runs only what doesn't depend on anything
+outside the checkout.
 
 ## Roadmap
 
-- **Phase 1 — Chat TUI + Ollama** (in progress): ratatui chat
-  interface, scrollable log, input box, talking to a local Ollama
-  model. No tools yet.
+- **Phase 1 — Chat TUI + Ollama** (done): ratatui chat interface,
+  scrollable log, input box, talking to a local Ollama model. No tools
+  yet.
 - **Phase 2 — Provider abstraction + Mistral**: `LlmClient` trait,
   `clap`-based provider/model selection, Mistral support.
 - **Phase 3 — Agent loop + file tools**: tool-calling, sandboxed
