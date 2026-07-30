@@ -6,6 +6,7 @@ mod credentials;
 mod mistral;
 mod ollama;
 mod sandbox_path;
+mod tools;
 
 pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
 pub use mistral::MistralClient;
@@ -13,6 +14,7 @@ pub use ollama::OllamaClient;
 
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
+pub(crate) use sandbox_path::{SandboxError, SandboxPath};
 
 use std::fmt;
 use std::sync::Arc;

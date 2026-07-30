@@ -64,9 +64,32 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   exists and is tested, but nothing calls it yet outside tests — Phase
   3's next step (`read_file`/`list_files`) is where it becomes
   reachable from a real tool call.
+- **No content-sensitivity filtering on file tools (flagged
+  2026-07-30).** `SandboxPath` only enforces *where* a path may resolve
+  to — it says nothing about *which* files within that boundary are
+  appropriate for an LLM-directed tool call to read. A `.env`, `.git/config`
+  (can hold remote credentials), or similar sensitive-by-convention file
+  sitting legitimately inside the sandboxed directory currently passes
+  `read_file`'s containment check exactly like any other project file,
+  and its plaintext would then be sent to the LLM provider on every
+  subsequent turn, since `Core` sends the full conversation history with
+  every request (see `ARCHITECTURE.md`'s "Conversation history"
+  section). This is a
+  distinct, tool-specific instance of the parent `CLAUDE.md`'s "No
+  secrets from plaintext" rule — that rule constrains what *I* read on
+  the user's behalf; this is about what `read_file` lets *the LLM*
+  read, unconditionally. Proposed direction (not designed, not
+  scheduled): a guardrail-strictness setting (e.g. `file_access:
+  strict` blocking known-sensitive filename patterns) — deliberately
+  deferred until there's a settings system to hang it on, rather than
+  hardcoding a blocklist now with no way to configure it.
 
 ## Out of scope / not applicable
 
-- No plaintext secrets files, `.env` parsing, or config-file credential
-  storage exist in this project, and none are planned — see parent
-  `CLAUDE.md`'s "No secrets from plaintext" rule.
+- **emed-code's own credentials**: no plaintext secrets files, `.env`
+  parsing, or config-file credential storage exist for emed-code's
+  *own* runtime needs (i.e. how it authenticates to Mistral), and none
+  are planned — see parent `CLAUDE.md`'s "No secrets from plaintext"
+  rule. This is unrelated to — and doesn't cover — what a file-reading
+  tool might expose from a *user's* project; see the content-
+  sensitivity-filtering backlog item above for that.

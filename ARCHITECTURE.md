@@ -7,7 +7,7 @@ lives locally under `docs/` (gitignored, not part of this record).
 ## `core` / `tui` / `cli` module split
 
 `core` (`src/core.rs` plus
-`src/core/{ollama,mistral,credentials,sandbox_path}.rs`) holds
+`src/core/{ollama,mistral,credentials,sandbox_path,tools}.rs`) holds
 conversation state and provider round-trips; it has zero
 `ratatui`/`crossterm` imports. It exposes exactly two entry points:
 `submit_user_message(&mut self, text: String)` and `poll_events(&mut
@@ -152,6 +152,33 @@ partway through) rather than adding a `tempfile` dev-dependency — same
 reasoning as `ChatError` over `thiserror`: a small enough amount of code
 that writing it directly is more instructive than depending on it, for
 a learning-focused project.
+
+## Tool execution: `dispatch()` is the only thing the agent loop calls
+
+`src/core/tools.rs` holds `read_file`/`list_files` and `dispatch(root:
+&Path, tool_call: &ToolCall) -> Result<String, ToolError>` — the one
+function the agent loop (once built) will call for every `ToolCall` it
+gets back from a provider. `dispatch` matches on `tool_call.name`
+*first*, then parses that specific tool's own argument shape — not the
+other way around — so an unrecognized tool name never has to reason
+about argument parsing at all, and adding a third tool means one new
+match arm plus one new function here, nothing in the agent loop itself
+changes. This is deliberately the "clearly-bounded module" a future
+orchestrator-backed tool source (see the Nextcloud-MCP discussion that
+shaped this phase's scope) would swap in behind, without touching
+`Core`.
+
+Both tools go through `SandboxPath::new` before touching the filesystem
+at all — there's no code path in either function that calls
+`std::fs::read_to_string`/`std::fs::read_dir` on an unvalidated path.
+Errors are `ToolError`, not raw `std::io::Error`: `InvalidPath` wraps
+the underlying `SandboxError` (whose `Display` is already proven to
+never leak a resolved path — see `SandboxPath`'s section above),
+`IoFailure` covers a validated path that still fails to read (e.g.
+permission denied, deleted mid-flight), and `MalformedArguments`/
+`UnknownTool` cover dispatch-level failures. None of these variants
+carry a raw `std::io::Error` or any other type whose `Display` isn't
+under this project's own control.
 
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 
