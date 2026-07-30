@@ -10,11 +10,18 @@ pub enum Provider {
     Mistral,
 }
 
+/// emed-code — a terminal AI coding assistant.
+///
+/// Mistral needs an API key: a `getfrompass` entry
+/// (`emed-code/mistral/api_key`) or the `MISTRAL_API_KEY` env var.
 #[derive(Debug, Parser)]
 pub struct Cli {
+    /// LLM provider to talk to (defaults to local Ollama)
     #[arg(long, value_enum, default_value_t = Provider::Ollama)]
     pub provider: Provider,
 
+    /// Model name, e.g. "codestral-latest" for Mistral (defaults to a
+    /// sensible model per provider)
     #[arg(long)]
     pub model: Option<String>,
 }

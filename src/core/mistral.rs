@@ -1,15 +1,31 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::{ChatError, LlmClient};
+use super::{ChatError, LlmClient, LlmResponse, Message, ToolDefinition};
 
 const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
 pub(crate) const MISTRAL_MODEL: &str = "mistral-small-latest";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct MistralMessage {
     role: String,
     content: String,
+}
+
+fn to_mistral_messages(messages: &[Message]) -> Vec<MistralMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::User { content } => MistralMessage {
+                role: "user".to_string(),
+                content: content.clone(),
+            },
+            Message::Assistant { content } => MistralMessage {
+                role: "assistant".to_string(),
+                content: content.clone(),
+            },
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -54,13 +70,14 @@ fn extract_mistral_reply(json: &str) -> Result<String, ChatError> {
     }
 }
 
-fn fetch_mistral_reply(api_key: &str, model: &str, text: &str) -> Result<String, ChatError> {
+fn fetch_mistral_reply(
+    api_key: &str,
+    model: &str,
+    messages: Vec<MistralMessage>,
+) -> Result<String, ChatError> {
     let request = MistralRequest {
         model: model.to_string(),
-        messages: vec![MistralMessage {
-            role: "user".to_string(),
-            content: text.to_string(),
-        }],
+        messages,
         stream: false,
     };
 
@@ -87,9 +104,15 @@ impl MistralClient {
 }
 
 impl LlmClient for MistralClient {
-    fn send(&self, message: &str) -> Result<String, ChatError> {
-        let body = fetch_mistral_reply(&self.api_key, &self.model, message)?;
-        extract_mistral_reply(&body)
+    fn send(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ChatError> {
+        let mistral_messages = to_mistral_messages(messages);
+        let body = fetch_mistral_reply(&self.api_key, &self.model, mistral_messages)?;
+        let text = extract_mistral_reply(&body)?;
+        Ok(LlmResponse::Text(text))
     }
 }
 
@@ -188,5 +211,36 @@ mod tests {
     fn mistral_client_implements_llm_client() {
         fn assert_is_llm_client<C: LlmClient>() {}
         assert_is_llm_client::<MistralClient>();
+    }
+
+    // Same reasoning as to_ollama_messages_maps_user_and_assistant_roles
+    // in the ollama module: Core threading real history through send()
+    // is pointless if the concrete client discards all but the last turn.
+    #[test]
+    fn to_mistral_messages_maps_user_and_assistant_roles() {
+        let messages = vec![
+            Message::User {
+                content: "hello".to_string(),
+            },
+            Message::Assistant {
+                content: "hi there".to_string(),
+            },
+        ];
+
+        let mapped = to_mistral_messages(&messages);
+
+        assert_eq!(
+            mapped,
+            vec![
+                MistralMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string()
+                },
+                MistralMessage {
+                    role: "assistant".to_string(),
+                    content: "hi there".to_string()
+                },
+            ]
+        );
     }
 }

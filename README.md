@@ -1,36 +1,39 @@
 # emed-code
 
-A minimal terminal AI coding assistant, aiming for Claude-Code-like
-usability, operable inside tmux. Work in progress — see Roadmap below
-for current status.
+A minimal terminal AI coding assistant, aiming for a fast, keyboard-
+driven, chat-based coding workflow, operable inside tmux. Work in
+progress — see Roadmap below for current status.
+
+## Features
+
+- Chat with a local [Ollama](https://ollama.com) model or Mistral's
+  cloud API — your choice, one flag apart
+- Remembers the whole conversation for the session, so follow-up
+  questions work
+- Always shows which provider is active right in the chat title — no
+  surprise cloud calls
+- Scrollable chat log, built for living inside tmux
+- Credentials via `getfrompass` or a plain env var, whichever you have
 
 ## Running it
 
 ```
-cargo run -- [--provider ollama|mistral] [--model <name>]
+cargo run
 ```
 
-Both flags are optional. With neither, it talks to a local Ollama
-instance (requires Ollama running with the `mistral-nemo` model pulled
-— `ollama list` to check) — local-first is the default regardless of
-build order. `--model` overrides the provider's own default
-(`mistral-nemo` for Ollama, `mistral-small-latest` for Mistral).
+talks to a local Ollama instance. Want Mistral instead?
 
-`--provider mistral` requires an API key, available via `getfrompass`
-(key `emed-code/mistral/api_key`) or the `MISTRAL_API_KEY` env var —
-`getfrompass` is checked first and preferred whenever both are present.
-A startup line reports which source supplied the key (never the value
-itself); if neither has one, the app exits with a clear error before
-opening the TUI.
+```
+cargo run -- --provider mistral --model codestral-latest
+```
 
-The chat log's title bar shows which provider is active for the whole
-session (`emed-code — AI: local (ollama)` or `... cloud (mistral)`), so
-it's never ambiguous whether a cloud provider is in use.
+Mistral needs an API key — either a `getfrompass` entry
+(`emed-code/mistral/api_key`) or the `MISTRAL_API_KEY` env var works.
 
-Type a message and press Enter to send it. The reply appears in the
-chat log above once the provider responds (no streaming yet — one
-request is sent and it waits for the complete reply). `Up`/`Down`/
-`PageUp`/`PageDown` scroll the log; `Ctrl-C` or `Ctrl-Q` quits.
+Run `cargo run -- --help` for the full flag reference.
+
+Type a message and press Enter to send it. `Up`/`Down`/`PageUp`/
+`PageDown` scroll the log; `Ctrl-C` or `Ctrl-Q` quits.
 
 ### Running the full local test suite
 
@@ -56,7 +59,9 @@ depend on anything outside the checkout.
   trait, `OllamaClient`/`MistralClient`, `clap`-based provider/model
   selection, `getfrompass`+env-var Mistral credentials, active-provider
   indicator in the chat title.
-- **Phase 3 — Agent loop + file tools**: tool-calling, sandboxed
-  `read_file`/`write_file`.
-- **Phase 4 — Diff preview + confirmation**: show a diff before any
-  write, require confirmation.
+- **Phase 3 — Agent loop + read-only file tools (Mistral only)**:
+  multi-turn tool-calling, sandboxed `read_file`/`list_files`. Ollama
+  tool-calling is its own later phase, not part of this one.
+- **Phase 4 — write_file + diff preview + confirmation**: `write_file`
+  ships together with a diff shown before any write and y/n
+  confirmation gating it — never before that gate exists.

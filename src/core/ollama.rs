@@ -1,14 +1,30 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ChatError, LlmClient};
+use super::{ChatError, LlmClient, LlmResponse, Message, ToolDefinition};
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
 pub(crate) const OLLAMA_MODEL: &str = "mistral-nemo";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct OllamaMessage {
     role: String,
     content: String,
+}
+
+fn to_ollama_messages(messages: &[Message]) -> Vec<OllamaMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::User { content } => OllamaMessage {
+                role: "user".to_string(),
+                content: content.clone(),
+            },
+            Message::Assistant { content } => OllamaMessage {
+                role: "assistant".to_string(),
+                content: content.clone(),
+            },
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -29,13 +45,10 @@ fn extract_reply(json: &str) -> Result<String, ChatError> {
     Ok(response.message.content)
 }
 
-fn fetch_ollama_reply(model: &str, text: &str) -> Result<String, ChatError> {
+fn fetch_ollama_reply(model: &str, messages: Vec<OllamaMessage>) -> Result<String, ChatError> {
     let request = OllamaRequest {
         model: model.to_string(),
-        messages: vec![OllamaMessage {
-            role: "user".to_string(),
-            content: text.to_string(),
-        }],
+        messages,
         stream: false,
     };
 
@@ -60,9 +73,15 @@ impl OllamaClient {
 }
 
 impl LlmClient for OllamaClient {
-    fn send(&self, message: &str) -> Result<String, ChatError> {
-        let body = fetch_ollama_reply(&self.model, message)?;
-        extract_reply(&body)
+    fn send(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ChatError> {
+        let ollama_messages = to_ollama_messages(messages);
+        let body = fetch_ollama_reply(&self.model, ollama_messages)?;
+        let text = extract_reply(&body)?;
+        Ok(LlmResponse::Text(text))
     }
 }
 
@@ -135,5 +154,37 @@ mod tests {
     fn ollama_client_implements_llm_client() {
         fn assert_is_llm_client<C: LlmClient>() {}
         assert_is_llm_client::<OllamaClient>();
+    }
+
+    // The whole point of Core threading real conversation history
+    // through send() is lost if the concrete client then only looks at
+    // the last message — this proves the full history actually reaches
+    // Ollama's wire format, not just the latest turn.
+    #[test]
+    fn to_ollama_messages_maps_user_and_assistant_roles() {
+        let messages = vec![
+            Message::User {
+                content: "hello".to_string(),
+            },
+            Message::Assistant {
+                content: "hi there".to_string(),
+            },
+        ];
+
+        let mapped = to_ollama_messages(&messages);
+
+        assert_eq!(
+            mapped,
+            vec![
+                OllamaMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string()
+                },
+                OllamaMessage {
+                    role: "assistant".to_string(),
+                    content: "hi there".to_string()
+                },
+            ]
+        );
     }
 }

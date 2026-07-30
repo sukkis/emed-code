@@ -51,12 +51,23 @@ outgrow thread-per-request.
 ## `LlmClient` trait: `Core` talks to providers only through this
 
 `Core` never calls a provider's HTTP shape directly. It holds an
-`Arc<dyn LlmClient + Send + Sync>` and calls `client.send(&self, message:
-&str) -> Result<String, ChatError>` — a plain sync method, no
-`async-trait`, matching the rest of the project's sync-loop-plus-threads
-concurrency model. `OllamaClient` is the first implementation (a
-`MistralClient` is next); adding a provider means writing a new
-`LlmClient` impl, not touching `Core`.
+`Arc<dyn LlmClient + Send + Sync>` and calls `client.send(&self, messages:
+&[Message], tools: &[ToolDefinition]) -> Result<LlmResponse, ChatError>`
+— a plain sync method, no `async-trait`, matching the rest of the
+project's sync-loop-plus-threads concurrency model. `OllamaClient` and
+`MistralClient` are the two implementations; adding a provider means
+writing a new `LlmClient` impl, not touching `Core`.
+
+`messages`/`tools`/`LlmResponse` (added when `Core` gained real
+conversation history — see "Conversation history" below) let a single
+method signature represent both a plain chat turn and a tool-calling
+turn: `tools` may be empty (as it always is today — nothing constructs a
+non-empty `ToolDefinition` list yet), and `LlmResponse` is `Text(String)`
+for a final answer or `ToolCalls(Vec<ToolCall>)` for one or more
+requested tool invocations. Each provider maps the shared `Message` enum
+into its own private wire-format type (`OllamaMessage`/`MistralMessage`)
+via a small `to_ollama_messages`/`to_mistral_messages` function — the
+provider never sees `Message` directly beyond that mapping step.
 
 `Arc`, not `Box`: dynamic dispatch (a trait object, not a generic
 `Core<C: LlmClient>`) was chosen because the concrete client isn't known
@@ -75,6 +86,35 @@ independent one pointing at the same value. The `+ Send + Sync` bound on
 the trait object is required because `Arc<T>` is only itself safe to
 move/share across threads when `T: Send + Sync`; the compiler can't
 infer that for an arbitrary `dyn LlmClient`, so it's stated explicitly.
+
+## Conversation history: `Message` enum, mutated only on the polling thread
+
+`Core` holds a `Vec<Message>` that grows for the whole session — every
+user message and assistant reply gets appended, and the full history is
+sent with every request (each provider maps it into its own wire
+format; see the `LlmClient` section above). `Message` is an enum
+(`User { content: String }`, `Assistant { content: String }`), not a
+flat struct with optional fields, matching every other enum decision in
+this codebase (`ChatError`, `CredentialSource`, `ProviderLabel`) — a
+tool-result-carrying variant will get added once tool-calling actually
+needs one, and Rust's exhaustive matching makes that a compiler-guided
+addition rather than a risky one.
+
+Deliberately unbounded and uncompacted for now: nothing trims or
+summarizes history as it grows, so a very long session sends a
+correspondingly large request every time. This isn't an oversight —
+conversation summarization has been a named future item since before
+Phase 1 started; it just had nothing concrete to apply to until history
+existed at all.
+
+History is mutated only on the thread that calls `poll_events()`, never
+on the spawned background thread. `submit_user_message` clones the
+current history into the closure that thread runs (so the network call
+sees an accurate snapshot), but `self.history` itself stays exclusively
+owned by `Core`; `poll_events()` is what appends the assistant's reply
+back into it as `CoreEvent`s get drained. This avoids needing any
+shared-mutable-state primitive (a `Mutex` around history, say) — there's
+effectively a single writer, the thread that drives the UI loop.
 
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 
@@ -172,21 +212,31 @@ small and dumb as possible, with everything else a plain function over
 data:
 
 - `fetch_ollama_reply`/`fetch_mistral_reply` — the only parts that touch
-  `ureq`. Collapse every failure mode (connection refused, timeout,
-  non-2xx status) into `Result<String, ChatError>` (specifically
-  `ChatError::Connection`). Neither has a unit test of its own; each has
-  a `local`-feature-gated smoke test instead (see "The `local` Cargo
-  feature" below).
+  `ureq`. Take the already-mapped wire-format message list (built by
+  `to_ollama_messages`/`to_mistral_messages`) and collapse every failure
+  mode (connection refused, timeout, non-2xx status) into
+  `Result<String, ChatError>` (specifically `ChatError::Connection`).
+  Neither has a unit test of its own; each has a `local`-feature-gated
+  smoke test instead (see "The `local` Cargo feature" below).
+- `to_ollama_messages`/`to_mistral_messages` — pure: map the shared
+  `Message` history into each provider's own wire-format type. Tested
+  directly (fixture `Message` list in, expected wire messages out) —
+  this is what actually makes `Core`'s conversation history reach the
+  provider, so it earns its own test rather than only being exercised
+  indirectly.
 - `extract_reply`/`extract_mistral_reply` — pure: parse a response body
   into the reply text or a `ChatError`. Tested with fixture JSON
   strings, no network involved. `OllamaClient::send`/`MistralClient::send`
-  are each just their provider's fetch-then-extract call chained.
-- `to_core_event` — pure and now provider-agnostic: takes the
-  `Result<String, ChatError>` a `LlmClient::send` call already produced
-  (fetch *and* parse are done by then) and wraps it into a `CoreEvent`.
-  It doesn't parse anything itself, unlike before this trait existed —
-  parsing is each provider's own job, since that's the part that differs
-  between them.
+  are each just their provider's map-then-fetch-then-extract calls
+  chained.
+- `to_core_event` — pure and provider-agnostic: takes the
+  `Result<LlmResponse, ChatError>` a `LlmClient::send` call already
+  produced and wraps it into a `CoreEvent` — `Text` becomes
+  `AssistantChunk`, `ToolCalls` currently becomes a placeholder `Error`
+  (nothing produces that variant yet; real dispatch is a later Phase 3
+  step), and any `ChatError` becomes `Error`. It doesn't parse anything
+  itself — parsing is each provider's own job, since that's the part
+  that differs between them.
 
 This means the interesting behavior (what happens on a malformed
 response vs. a failed request) is covered by fast, deterministic unit
