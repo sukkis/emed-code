@@ -64,6 +64,20 @@ dependency. `Auth` exists for Mistral's API-key rejection case, which
 `OllamaClient` has no way to hit (no credentials involved) but the enum
 is shared across every `LlmClient` impl.
 
+`extract_mistral_reply` is where `Auth` actually gets populated: Mistral
+can send back one of two shapes on any given request — a success
+envelope (`{"choices": [...]}`) or an error envelope (`{"message": ...,
+"request_id": ...}`, e.g. on a 401), and there's no HTTP status code
+available at this pure-parsing layer to tell them apart up front (that
+arrives in Step 4, alongside the real network call). So it tries the
+success shape first; if that fails to deserialize, it tries the error
+shape; if that also fails, it surfaces the *original* success-shape
+parse error as `ChatError::MalformedResponse` rather than the second
+attempt's (a generic "wasn't valid JSON at all" is a more useful message
+than "also didn't look like an error envelope"). This means a real
+Mistral auth failure comes back as `ChatError::Auth("Unauthorized")`,
+not lumped in with genuinely malformed responses.
+
 ## Testing strategy: pure decision logic vs. a thin I/O shell
 
 Provider integration code is split so the actual network call is as
