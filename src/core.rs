@@ -2,16 +2,46 @@
 // No ratatui/crossterm imports — tui-facing rendering/input state
 // lives in the tui module instead.
 
+use std::fmt;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq)]
 pub enum CoreEvent {
     AssistantChunk(String),
     Error(String),
+}
+
+// Hand-written, not `thiserror` — see project-plan.md's Dependency
+// Discipline note: a handful of variants isn't worth a dependency.
+#[derive(Debug, PartialEq)]
+pub enum ChatError {
+    Connection(String),
+    MalformedResponse(String),
+    Auth(String),
+}
+
+impl fmt::Display for ChatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChatError::Connection(message) => write!(f, "connection error: {message}"),
+            ChatError::MalformedResponse(message) => {
+                write!(f, "malformed response: {message}")
+            }
+            ChatError::Auth(message) => write!(f, "authentication error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ChatError {}
+
+// Implemented by each provider's client; Core talks to whichever one is
+// active only through this, never through a provider-specific type.
+pub trait LlmClient {
+    fn send(&self, message: &str) -> Result<String, ChatError>;
 }
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/chat";
@@ -35,22 +65,20 @@ struct ChatResponse {
     message: OllamaMessage,
 }
 
-fn extract_reply(json: &str) -> Result<String> {
-    let response: ChatResponse = serde_json::from_str(json)?;
+fn extract_reply(json: &str) -> Result<String, ChatError> {
+    let response: ChatResponse =
+        serde_json::from_str(json).map_err(|e| ChatError::MalformedResponse(e.to_string()))?;
     Ok(response.message.content)
 }
 
-fn to_core_event(fetch_result: std::result::Result<String, String>) -> CoreEvent {
-    match fetch_result {
-        Ok(body) => match extract_reply(&body) {
-            Ok(text) => CoreEvent::AssistantChunk(text),
-            Err(e) => CoreEvent::Error(e.to_string()),
-        },
-        Err(message) => CoreEvent::Error(message),
+fn to_core_event(send_result: Result<String, ChatError>) -> CoreEvent {
+    match send_result {
+        Ok(text) => CoreEvent::AssistantChunk(text),
+        Err(e) => CoreEvent::Error(e.to_string()),
     }
 }
 
-fn fetch_ollama_reply(text: &str) -> std::result::Result<String, String> {
+fn fetch_ollama_reply(text: &str) -> Result<String, ChatError> {
     let request = ChatRequest {
         model: MODEL.to_string(),
         messages: vec![OllamaMessage {
@@ -62,15 +90,25 @@ fn fetch_ollama_reply(text: &str) -> std::result::Result<String, String> {
 
     let mut response = ureq::post(OLLAMA_URL)
         .send_json(&request)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ChatError::Connection(e.to_string()))?;
 
     response
         .body_mut()
         .read_to_string()
-        .map_err(|e| e.to_string())
+        .map_err(|e| ChatError::Connection(e.to_string()))
+}
+
+pub struct OllamaClient;
+
+impl LlmClient for OllamaClient {
+    fn send(&self, message: &str) -> Result<String, ChatError> {
+        let body = fetch_ollama_reply(message)?;
+        extract_reply(&body)
+    }
 }
 
 pub struct Core {
+    client: Arc<dyn LlmClient + Send + Sync>,
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
 }
@@ -83,14 +121,19 @@ impl Default for Core {
 
 impl Core {
     pub fn new() -> Self {
+        Self::with_client(Arc::new(OllamaClient))
+    }
+
+    pub fn with_client(client: Arc<dyn LlmClient + Send + Sync>) -> Self {
         let (tx, rx) = mpsc::channel();
-        Core { tx, rx }
+        Core { client, tx, rx }
     }
 
     pub fn submit_user_message(&mut self, text: String) {
         let tx = self.tx.clone();
+        let client = Arc::clone(&self.client);
         thread::spawn(move || {
-            let event = to_core_event(fetch_ollama_reply(&text));
+            let event = to_core_event(client.send(&text));
             let _ = tx.send(event);
         });
     }
@@ -156,40 +199,41 @@ mod tests {
     }
 
     #[test]
-    fn extract_reply_errors_on_malformed_json() {
+    fn extract_reply_returns_a_malformed_response_chat_error_on_bad_json() {
         let json = r#"{ "message": { "role": "assistant" "#;
 
         let result = extract_reply(json);
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ChatError::MalformedResponse(_))));
     }
 
-    // to_core_event() is the pure decision logic that turns "did the
-    // Ollama request succeed" into a CoreEvent, kept separate from the
-    // actual ureq I/O so these three cases don't need a live server.
+    // to_core_event() is the pure, provider-agnostic decision logic that
+    // turns "did the client's send() succeed" into a CoreEvent. It no
+    // longer parses anything itself — parsing is each LlmClient impl's
+    // job (see extract_reply) — so it only ever sees already-extracted
+    // reply text or a ChatError.
     #[test]
-    fn to_core_event_returns_assistant_chunk_for_a_well_formed_response() {
-        let body = r#"{ "message": { "role": "assistant", "content": "hi there" }, "done": true }"#
-            .to_string();
-
-        let event = to_core_event(Ok(body));
+    fn to_core_event_returns_assistant_chunk_for_a_successful_send() {
+        let event = to_core_event(Ok("hi there".to_string()));
 
         assert_eq!(event, CoreEvent::AssistantChunk("hi there".to_string()));
     }
 
     #[test]
-    fn to_core_event_returns_error_for_a_malformed_response_body() {
-        let body = "{ not valid json".to_string();
-
-        let event = to_core_event(Ok(body));
+    fn to_core_event_returns_error_for_any_chat_error() {
+        let event = to_core_event(Err(ChatError::Connection("connection refused".to_string())));
 
         assert!(matches!(event, CoreEvent::Error(_)));
     }
 
+    // Compile-time proof that OllamaClient actually satisfies the
+    // LlmClient trait Core depends on. Not a behavioral test — send()
+    // needs a real network round-trip, which stays out of scope for a
+    // unit test (see tests/real_ollama_smoke_test.rs) — just that the
+    // trait binding holds.
     #[test]
-    fn to_core_event_returns_error_when_the_request_itself_failed() {
-        let event = to_core_event(Err("connection refused".to_string()));
-
-        assert!(matches!(event, CoreEvent::Error(_)));
+    fn ollama_client_implements_llm_client() {
+        fn assert_is_llm_client<C: LlmClient>() {}
+        assert_is_llm_client::<OllamaClient>();
     }
 }

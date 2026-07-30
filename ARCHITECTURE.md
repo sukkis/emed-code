@@ -25,6 +25,45 @@ to call once per UI redraw without ever stalling on network I/O. No
 style. Revisit only if real concurrent-provider or cancellation needs
 outgrow thread-per-request.
 
+## `LlmClient` trait: `Core` talks to providers only through this
+
+`Core` never calls a provider's HTTP shape directly. It holds an
+`Arc<dyn LlmClient + Send + Sync>` and calls `client.send(&self, message:
+&str) -> Result<String, ChatError>` — a plain sync method, no
+`async-trait`, matching the rest of the project's sync-loop-plus-threads
+concurrency model. `OllamaClient` is the first implementation (a
+`MistralClient` is next); adding a provider means writing a new
+`LlmClient` impl, not touching `Core`.
+
+`Arc`, not `Box`: dynamic dispatch (a trait object, not a generic
+`Core<C: LlmClient>`) was chosen because the concrete client isn't known
+until a `--provider` CLI flag is parsed at startup — there's no
+generics-only capability the trait's plain sync method needs that would
+justify monomorphization instead. `Arc` specifically (rather than `Box`)
+is required by the concurrency model above: `submit_user_message` spawns
+a new thread per call, and that thread's `move` closure needs its own
+usable handle to the client while `Core` keeps using its own handle for
+every later call — `Box`'s exclusive ownership can only ever have one
+owner, so the client would have to be moved permanently out of `Core`
+into the first thread that used it. `Arc`'s reference-counted *shared*
+ownership lets `Core` keep a handle while `Arc::clone` (an O(1) refcount
+bump, not a copy of the client itself) hands the spawned thread an
+independent one pointing at the same value. The `+ Send + Sync` bound on
+the trait object is required because `Arc<T>` is only itself safe to
+move/share across threads when `T: Send + Sync`; the compiler can't
+infer that for an arbitrary `dyn LlmClient`, so it's stated explicitly.
+
+## Error handling: a hand-written `ChatError` enum, no `thiserror`
+
+Provider errors are `ChatError` (`Connection`, `MalformedResponse`,
+`Auth`), with hand-written `Display`/`std::error::Error` impls rather
+than `thiserror`-derived ones — see `docs/project-plan.md`'s Dependency
+Discipline note: a handful of variants is a small, genuinely instructive
+amount of code for a learning-focused project, not boilerplate worth a
+dependency. `Auth` exists for Mistral's API-key rejection case, which
+`OllamaClient` has no way to hit (no credentials involved) but the enum
+is shared across every `LlmClient` impl.
+
 ## Testing strategy: pure decision logic vs. a thin I/O shell
 
 Provider integration code is split so the actual network call is as
@@ -33,10 +72,16 @@ data:
 
 - `fetch_ollama_reply` — the only part that touches `ureq`. Collapses
   every failure mode (connection refused, timeout, non-2xx status) into
-  a plain `Result<String, String>`.
-- `to_core_event` — pure: takes that `Result<String, String>`, returns a
-  `CoreEvent`. Tested with plain fixture strings/`Err` values, no network
-  involved.
+  `Result<String, ChatError>` (specifically `ChatError::Connection`).
+- `extract_reply` — pure: parses a response body into the reply text or
+  `ChatError::MalformedResponse`. Tested with fixture JSON strings, no
+  network involved. `OllamaClient::send` is just these two calls chained.
+- `to_core_event` — pure and now provider-agnostic: takes the
+  `Result<String, ChatError>` a `LlmClient::send` call already produced
+  (fetch *and* parse are done by then) and wraps it into a `CoreEvent`.
+  It doesn't parse anything itself, unlike before this trait existed —
+  parsing is each provider's own job, since that's the part that differs
+  between them.
 
 This means the interesting behavior (what happens on a malformed
 response vs. a failed request) is covered by fast, deterministic unit
