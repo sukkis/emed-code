@@ -6,8 +6,12 @@
 use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
+use std::sync::mpsc;
 
-use super::{FileAccessSecurity, SandboxError, SandboxPath, ToolCall, ToolDefinition};
+use super::{
+    ConfirmationChoice, CoreEvent, DiffLine, FileAccessSecurity, SandboxError, SandboxPath,
+    ToolCall, ToolDefinition,
+};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum ToolError {
@@ -19,6 +23,13 @@ pub(crate) enum ToolError {
     // for a rejected symlink's target — the LLM already knows exactly
     // which path it requested.
     AccessDenied,
+    // The user declined a write_file confirmation prompt. Not a
+    // technical failure — flows through the same Result<String,
+    // ToolError> pipeline as every other outcome so nothing downstream
+    // (history, CoreEvent construction) needs a separate code path for
+    // it; the TUI's "error: " prefix reads fine for "this didn't
+    // happen because you said no."
+    WriteDeclined,
 }
 
 impl fmt::Display for ToolError {
@@ -31,6 +42,7 @@ impl fmt::Display for ToolError {
             ToolError::AccessDenied => {
                 write!(f, "access to this path is restricted by security policy")
             }
+            ToolError::WriteDeclined => write!(f, "user declined this write"),
         }
     }
 }
@@ -38,6 +50,12 @@ impl fmt::Display for ToolError {
 #[derive(Deserialize)]
 struct PathArgs {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct WriteArgs {
+    path: String,
+    content: String,
 }
 
 // A small, explicitly non-exhaustive starter list of sensitive-by-
@@ -107,13 +125,12 @@ fn list_files(
     Ok(names.join("\n"))
 }
 
-// Not yet added to tool_definitions()/dispatch — real and
-// unit-tested, but unreachable from a live agent loop until the
-// confirmation gate (Step 5) and the wiring itself (Step 6) exist.
-// Same sandboxing + blocklist checks as read_file/list_files, plus the
+// pub(crate): called both by write_file_with_confirmation below (after
+// a user has already approved the write) and, eventually, tests. Same
+// sandboxing + blocklist checks as read_file/list_files, plus the
 // actual write; returns () rather than echoing content back, since
 // there's nothing useful to hand back beyond success/failure itself.
-fn write_file(
+pub(crate) fn write_file(
     root: &Path,
     requested: &Path,
     content: &str,
@@ -127,6 +144,55 @@ fn write_file(
         return Err(ToolError::AccessDenied);
     }
     std::fs::write(sandbox_path.as_path(), content).map_err(|_| ToolError::IoFailure)
+}
+
+// The confirmation-gated entry point the agent loop calls for a
+// "write_file" tool call — not yet reachable from a real provider
+// (Step 6 is what advertises it), but real and unit-tested, and
+// exercised end-to-end by core.rs's agent-loop tests via a scripted
+// client. Validates first (so a forbidden path never even shows a
+// confirmation prompt), then proposes the change and blocks for an
+// answer, then delegates the actual write back to write_file above —
+// a deliberate, cheap redundant re-validation in exchange for one
+// source of truth on sandboxing/blocklist logic, rather than
+// duplicating it inline here.
+pub(crate) fn write_file_with_confirmation(
+    root: &Path,
+    file_access_security: FileAccessSecurity,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    let args: WriteArgs =
+        serde_json::from_str(&tool_call.arguments).map_err(|_| ToolError::MalformedArguments)?;
+    let requested = Path::new(&args.path);
+
+    let sandbox_path =
+        SandboxPath::new_for_write(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
+    }
+
+    let old_content = std::fs::read_to_string(sandbox_path.as_path()).unwrap_or_default();
+    let diff = super::generate_diff(&old_content, &args.content);
+
+    let _ = tx.send(CoreEvent::WriteProposed {
+        path: args.path.clone(),
+        diff,
+    });
+
+    // A dropped/errored receive (e.g. the app exiting mid-confirmation)
+    // fails safe to Decline — never a silent apply just because no
+    // real answer arrived.
+    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
+        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
+        ConfirmationChoice::Apply => {
+            write_file(root, requested, &args.content, file_access_security)
+                .map(|()| format!("wrote {}", args.path))
+        }
+    }
 }
 
 // The list of tools actually advertised to a provider. Kept next to
@@ -560,6 +626,99 @@ mod tests {
             std::fs::read_to_string(root.path().join(".env")).unwrap(),
             "SECRET=1"
         );
+    }
+
+    // Phase 4 Step 5a: the confirmation-gated write path. confirm_tx is
+    // pre-loaded with a choice before calling, since mpsc::channel is
+    // unbounded — the function's own confirm_rx.recv() then picks it up
+    // immediately rather than actually blocking, keeping these tests
+    // synchronous (the real cross-thread blocking is exercised by
+    // core.rs's agent-loop-level test instead).
+    #[test]
+    fn write_file_with_confirmation_applies_the_write_when_confirmed() {
+        let root = TempDir::new();
+        let (tx, rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Apply).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path": "new.txt", "content": "hello"}"#.to_string(),
+        };
+
+        let result = write_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("wrote new.txt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
+            "hello"
+        );
+        match rx.try_recv().unwrap() {
+            CoreEvent::WriteProposed { path, diff } => {
+                assert_eq!(path, "new.txt");
+                assert_eq!(diff, vec![DiffLine::Added("hello".to_string())]);
+            }
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_file_with_confirmation_declines_without_writing() {
+        let root = TempDir::new();
+        let (tx, _rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Decline).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path": "new.txt", "content": "hello"}"#.to_string(),
+        };
+
+        let result = write_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::WriteDeclined));
+        assert!(!root.path().join("new.txt").exists());
+    }
+
+    // The point of this test: a forbidden path must be rejected before
+    // ever asking for confirmation — confirm_rx never receives anything
+    // here, so if the implementation asked for confirmation first, this
+    // test would hang (recv() blocks forever with no timeout) rather
+    // than return the wrong answer.
+    #[test]
+    fn write_file_with_confirmation_rejects_a_blocked_path_without_asking() {
+        let root = TempDir::new();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path": ".env", "content": "SECRET=evil"}"#.to_string(),
+        };
+
+        let result = write_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+        assert!(!root.path().join(".env").exists());
+        assert!(rx.try_recv().is_err());
     }
 
     // Guards against drift between what's advertised to the model and

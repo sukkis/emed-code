@@ -204,6 +204,32 @@ already in place; this step only builds and proves the write logic
 itself. See `docs/write-file.md` for the remaining steps (the
 confirmation gate, then the wiring that finally makes this reachable).
 
+### The confirmation gate (Phase 4 Step 5a, 2026-07-31) — real, tested, still not reachable from a real provider
+
+`write_file` calls are now routed through
+`tools::write_file_with_confirmation`, which validates the path
+(sandbox + content-sensitivity blocklist, identical to `write_file`
+itself) *before* ever proposing a write — a forbidden path is rejected
+immediately with no confirmation dialog, so there's nothing shown to
+approve for a request that was never going to be allowed. Only a
+validated write generates a diff and blocks for a real user answer via
+a new `Core`↔TUI channel. Verified end-to-end (not just at the
+function level) via a scripted `LlmClient`: the real agent loop
+genuinely pauses — the target file is confirmed absent from disk right
+after the proposal event arrives, before any confirmation is sent —
+and only proceeds once `Core::respond_to_confirmation` is called.
+
+A dropped/errored confirmation receive (e.g. the app exiting
+mid-confirmation) fails safe to declining the write, never to a silent
+apply — same fail-safe-not-fail-open posture as `Settings::load`.
+
+Still not reachable from a real provider or a live agent loop driven by
+an actual model — `write_file` isn't advertised via
+`tool_definitions()` yet (Step 6). The TUI also can't yet actually
+answer a confirmation prompt from a real key press — `App`'s
+pending-confirmation input handling and the real diff/menu rendering
+are Step 5b.
+
 ## Backlog (not yet implemented)
 
 Nothing currently tracked here — the content-sensitivity-filtering gap

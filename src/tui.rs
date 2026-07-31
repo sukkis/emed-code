@@ -32,6 +32,14 @@ fn format_core_event(event: CoreEvent) -> String {
             Ok(_) => format!("tool: {name}({arguments}) -> ok"),
             Err(error) => format!("tool: {name}({arguments}) -> error: {error}"),
         },
+        // Minimal, functional stopgap (Rust's exhaustiveness requires
+        // an arm now that CoreEvent::WriteProposed exists) — Step 5b is
+        // what renders the real colored diff + numbered confirmation
+        // menu, same treatment Phase 3's ToolCall variant got between
+        // its own introduction and its dedicated rendering step.
+        CoreEvent::WriteProposed { path, diff } => {
+            format!("write proposed: {path} ({} lines)", diff.len())
+        }
         CoreEvent::Error(message) => format!("error: {message}"),
     }
 }

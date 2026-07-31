@@ -469,8 +469,11 @@ leave a feature half-built.
 Runs entirely on `submit_user_message`'s spawned background thread, in
 a plain `loop`: call `client.send(&history, &tool_defs)`; `Text` means
 done (send `CoreEvent::AssistantChunk`, return); `ToolCalls` means
-dispatch each one (`tools::dispatch`), append a `Message::ToolCalls` +
-`Message::ToolResult` pair to the loop's *local* history for each, send
+handling each one — `tools::dispatch` for everything except
+`"write_file"`, which routes to `tools::write_file_with_confirmation`
+instead (see "The confirmation gate" below for why) — append a
+`Message::ToolCalls` + `Message::ToolResult` pair to the loop's *local*
+history for each, send
 one `CoreEvent::ToolCall { id, name, arguments, result }` per call (once
 dispatch has already completed — not a separate proposed/finished pair,
 since local file tools finish near-instantly and there's no
@@ -515,6 +518,78 @@ separate helper that only ever got called for its other two branches,
 with a now-factually-wrong third one, stopped earning its keep; the
 two one-line mappings it used to do are inlined directly into the
 loop's `match` arms instead.
+
+## The confirmation gate: a second, bidirectional channel (Phase 4 Step 5a)
+
+Every previous `Core`↔TUI interaction has been strictly one-directional
+(`run_agent_loop`'s background thread only ever *sends* `CoreEvent`s;
+`App` only ever *reads* `Core`'s public methods). `write_file` needs
+the opposite: the loop must pause mid-call, let the user see a diff,
+and only then know whether to write and what tool result to hand back.
+
+**A fresh `mpsc` channel per message, not one long-lived one.** `Core`
+gains a `confirm_tx: Option<mpsc::Sender<ConfirmationChoice>>` field.
+Each `submit_user_message` call creates a brand new
+`(confirm_tx, confirm_rx)` pair — mirroring the fresh `thread::spawn`
+already happening on every call — stores the `Sender` half on `Core`,
+and moves the `Receiver` half into that call's spawned thread. This
+sidesteps `mpsc::Receiver` not being `Clone`: a single long-lived
+receiver could only ever be moved into the *first* spawned thread, so
+a second `submit_user_message` call would have nothing to move.
+`Core::respond_to_confirmation(&mut self, choice: ConfirmationChoice)`
+sends through whichever `Sender` is currently stored — a no-op if
+nothing is actually waiting (unset, or its thread already gone), since
+sending into a channel nobody's listening to just fails silently.
+
+**Where the blocking actually happens**: `tools::write_file_with_confirmation`
+(called from `run_agent_loop`'s per-call loop instead of `dispatch` for
+a `"write_file"` call) validates the path first — `SandboxPath::new_for_write`
+(Step 1) and the content-sensitivity blocklist (Step 3's `is_content_restricted`),
+exactly as `write_file` itself does — *before* ever proposing anything.
+A forbidden path fails immediately with no confirmation dialog shown at
+all; there's nothing to confirm about a request that's simply not
+allowed. Only once validation passes does it read the existing content
+(empty if the file doesn't exist yet), generate a diff
+(`generate_diff`), send `CoreEvent::WriteProposed { path, diff }`, and
+block on `confirm_rx.recv()`.
+
+**Fails safe on the receive, not just the write.** A dropped or errored
+`recv()` (e.g. the app exiting mid-confirmation, so nothing will ever
+answer) resolves to `ConfirmationChoice::Decline`, never a silent
+apply — same fail-safe-not-fail-open philosophy as `Settings::load`'s
+handling of a missing/malformed config file.
+
+**The decline outcome flows through the existing `Result<String,
+ToolError>` pipeline**, not a separate data path: a new
+`ToolError::WriteDeclined` variant represents it, so `content_for_history`/
+`CoreEvent::ToolCall` construction — both already written to branch on
+`Ok`/`Err` — need no changes at all to handle it correctly. `Apply`
+delegates the actual write back to `write_file` (Step 4), which
+re-validates the path a second time — a deliberate, cheap redundant
+filesystem check in exchange for keeping sandboxing/blocklist logic in
+exactly one place, rather than duplicating it inline in the
+confirmation path.
+
+**No per-write correlation id needed on `WriteProposed`.** `run_agent_loop`
+already processes `calls` one at a time in its existing loop, so a
+model batching several `write_file` calls in one turn just becomes
+several sequential confirmation prompts — only one can ever be
+outstanding at once, so there's no ambiguity about which confirmation
+answers which proposal without needing to track one.
+
+**A deliberate revision to `dispatch`'s stated invariant** ("the only
+thing the agent loop calls" — see "Tool execution" above): `write_file`
+doesn't fit `dispatch`'s pure-computation-in, `Result`-out contract,
+since it needs to emit an event and block mid-call. `dispatch` remains
+the single router for every tool that *doesn't* need to pause for user
+input; `write_file` is routed around it by name, deliberately, not
+squeezed into a shape it doesn't fit.
+
+`tui.rs`'s `format_core_event` gained a minimal, functional stopgap arm
+for `CoreEvent::WriteProposed` (Rust's exhaustiveness requires one) —
+same treatment `ToolCall` got between its own introduction and Phase
+3's dedicated rendering step; Step 5b replaces it with the real colored
+diff and numbered confirmation menu.
 
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 
