@@ -128,10 +128,14 @@ fn list_files(
 fn list_files_recursive(
     root: &Path,
     requested: &Path,
-    // Unused until Step 2 adds restricted-path/noise-directory skipping.
-    _file_access_security: FileAccessSecurity,
+    file_access_security: FileAccessSecurity,
 ) -> Result<String, ToolError> {
     let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
+    }
 
     // relative_path() is empty for the project root itself (querying
     // "."), so this naturally starts every entry unprefixed rather than
@@ -139,9 +143,25 @@ fn list_files_recursive(
     let relative_prefix = sandbox_path.relative_path().to_string_lossy().into_owned();
 
     let mut entries = Vec::new();
-    walk_recursive(sandbox_path.as_path(), &relative_prefix, &mut entries)?;
+    walk_recursive(
+        sandbox_path.as_path(),
+        &relative_prefix,
+        file_access_security,
+        &mut entries,
+    )?;
     entries.sort();
     Ok(entries.join("\n"))
+}
+
+// Distinct from is_content_restricted: this is a usefulness concern
+// (don't flood a listing with build artifacts), not a security control,
+// so it's never gated by strict/loose — loose mode exists to allow
+// reading sensitive files, not to bring back target/node_modules noise.
+// Small and deliberately non-exhaustive, same framing as
+// is_content_restricted's own list — easy to extend later, not an
+// attempt to be complete now.
+fn is_noise_directory(name: &str) -> bool {
+    matches!(name, "target" | ".git" | "node_modules")
 }
 
 // Paths are joined as plain strings, not via PathBuf, so the output is
@@ -156,6 +176,7 @@ fn list_files_recursive(
 fn walk_recursive(
     absolute_dir: &Path,
     relative_prefix: &str,
+    file_access_security: FileAccessSecurity,
     entries: &mut Vec<String>,
 ) -> Result<(), ToolError> {
     let read_dir = std::fs::read_dir(absolute_dir).map_err(|_| ToolError::IoFailure)?;
@@ -165,14 +186,21 @@ fn walk_recursive(
         let file_type = entry.file_type().map_err(|_| ToolError::IoFailure)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let relative_path = if relative_prefix.is_empty() {
-            name
+            name.clone()
         } else {
             format!("{relative_prefix}/{name}")
         };
 
         if file_type.is_dir() {
             entries.push(format!("{relative_path}/"));
-            walk_recursive(&entry.path(), &relative_path, entries)?;
+
+            // The name still gets listed above either way — only
+            // recursing into it is what these two checks suppress.
+            let restricted = file_access_security == FileAccessSecurity::Strict
+                && is_content_restricted(Path::new(&relative_path));
+            if !restricted && !is_noise_directory(&name) {
+                walk_recursive(&entry.path(), &relative_path, file_access_security, entries)?;
+            }
         } else {
             entries.push(relative_path);
         }
@@ -491,6 +519,94 @@ mod tests {
             result,
             Ok("link_dir\nreal_target/\nreal_target/secret.txt".to_string())
         );
+    }
+
+    // Extends list_files's existing per-level rule to every level: a
+    // restricted directory's name still shows up (existence isn't
+    // hidden), but nothing inside it is ever enumerated, no matter how
+    // deep in the tree it's found.
+    #[test]
+    fn list_files_recursive_skips_enumerating_into_a_restricted_directory_but_still_shows_its_name()
+    {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "").unwrap();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok(".ssh/\nnotes.txt".to_string()));
+    }
+
+    #[test]
+    fn list_files_recursive_rejects_a_directly_restricted_top_level_directory() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result =
+            list_files_recursive(root.path(), Path::new(".ssh"), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn list_files_recursive_recurses_into_a_restricted_directory_in_loose_mode() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Loose);
+
+        assert_eq!(result, Ok(".ssh/\n.ssh/id_rsa".to_string()));
+    }
+
+    // Distinct from restricted-path skipping: a noise directory's
+    // contents aren't sensitive, just unhelpful volume (build
+    // artifacts), so this is a usefulness concern rather than a
+    // security control.
+    #[test]
+    fn list_files_recursive_skips_a_noise_directory_but_still_shows_its_name() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target").join("binary"), "").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok("Cargo.toml\ntarget/".to_string()));
+    }
+
+    // Noise-directory skipping isn't gated by strict/loose at all —
+    // loose mode exists to allow reading sensitive files, not to bring
+    // back build-artifact noise, so target/.git/node_modules stay
+    // skipped either way.
+    #[test]
+    fn list_files_recursive_skips_a_noise_directory_even_in_loose_mode() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target").join("binary"), "").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Loose);
+
+        assert_eq!(result, Ok("Cargo.toml\ntarget/".to_string()));
+    }
+
+    // Unlike a restricted path, a noise directory isn't a security
+    // boundary — there's no reason to refuse an explicit, deliberate
+    // query into it directly. The skip only suppresses incidental
+    // recursion into it from a parent listing.
+    #[test]
+    fn list_files_recursive_lists_a_directly_queried_noise_directory_normally() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target").join("binary"), "").unwrap();
+
+        let result =
+            list_files_recursive(root.path(), Path::new("target"), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok("target/binary".to_string()));
     }
 
     #[test]
