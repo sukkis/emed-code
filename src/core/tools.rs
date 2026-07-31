@@ -299,7 +299,9 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_files".to_string(),
-            description: "List files and directories within a directory in the project."
+            description: "List files and directories within a directory in the project. Not \
+                recursive — a nested directory's contents won't appear. Use \
+                list_files_recursive if you need to search deeper than one level."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -315,10 +317,12 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "list_files_recursive".to_string(),
             description: "Recursively list every file and directory nested under a directory \
-                in the project, not just its immediate children. Returned paths are always \
-                relative to the project root, ready to pass directly to read_file/write_file \
-                without modification. Directories end with a trailing \"/\"; build/VCS noise \
-                (target, .git, node_modules) is shown by name but not descended into."
+                in the project, not just its immediate children. Use this whenever you don't \
+                know exactly where a file or directory is located, instead of guessing a path \
+                or asking the user to clarify. Returned paths are always relative to the \
+                project root, ready to pass directly to read_file/write_file without \
+                modification. Directories end with a trailing \"/\"; build/VCS noise (target, \
+                .git, node_modules) is shown by name but not descended into."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
