@@ -3,6 +3,7 @@
 // lives in the tui module instead.
 
 mod credentials;
+mod diff;
 mod mistral;
 mod ollama;
 mod sandbox_path;
@@ -13,6 +14,7 @@ pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_a
 pub use mistral::MistralClient;
 pub use ollama::OllamaClient;
 
+pub(crate) use diff::{DiffLine, generate_diff};
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};

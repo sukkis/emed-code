@@ -380,6 +380,39 @@ way `read_file` refuses a blocked file directly — checked before
 `std::fs::read_dir` runs at all, so there's no code path where a
 blocked directory's contents get enumerated even partially.
 
+## Diff generation: `DiffLine`, a pure wrapper around `similar` (Phase 4 Step 2)
+
+`src/core/diff.rs` holds `DiffLine` (`Added`/`Removed`/`Unchanged`,
+each carrying one line's text) and `generate_diff(old: &str, new: &str)
+-> Vec<DiffLine>`. Structured per-line data, not a pre-formatted
+string — deliberately, so the TUI can render `Added`/`Removed` with
+real color (Step 3) rather than relying on a text convention like
+unified diff's `+`/`-` prefixes, which was the whole point of
+overriding the initial plain-text recommendation for this feature (see
+`docs/write-file.md`).
+
+`generate_diff` is a thin, pure wrapper around
+`similar::TextDiff::from_lines(old, new)` — the Myers-diff algorithm
+itself isn't re-implemented or second-guessed here, only mapped into
+this project's own `DiffLine` shape. One thing worth knowing:
+`similar`'s `Change::value()` includes each line's own trailing
+newline (`from_lines` splits on it but keeps it attached to the line
+that precedes it), which gets trimmed off — `DiffLine` holds one
+line's text, not the newline that separates it from the next one.
+
+`similar` (`3.1.1`) has zero external dependencies with its default
+features (`std` + `text`) — its heavier features (`bytes`, `unicode`)
+that would pull in `bstr`/`unicode-segmentation` aren't enabled.
+Justified back when this project's overall plan was first sketched
+(`docs/project-plan.md`): a real algorithm, not boilerplate, so worth a
+dependency rather than hand-rolling — unlike `thiserror`, there's a
+genuine correctness cost to getting a diff algorithm wrong.
+
+Not yet reachable from anything real — `generate_diff`/`DiffLine` are
+unit-tested directly but unused outside their own tests until Step 3
+(rendering) and Step 4 (the actual `write_file` tool) build on top of
+them.
+
 ## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
 
 Runs entirely on `submit_user_message`'s spawned background thread, in
