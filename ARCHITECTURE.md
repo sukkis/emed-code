@@ -177,6 +177,37 @@ reasoning as `ChatError` over `thiserror`: a small enough amount of code
 that writing it directly is more instructive than depending on it, for
 a learning-focused project.
 
+### `new_for_write`: validating a target that may not exist yet (Phase 4 Step 1)
+
+`SandboxPath::new` requires the full target to already exist (it
+canonicalizes the whole candidate path, which fails on a nonexistent
+file) — fine for read-only tools, but `write_file` needs to accept a
+path that doesn't exist yet. `new_for_write(root: &Path, requested:
+&Path) -> Result<Self, SandboxError>` validates in two stages instead:
+
+1. **The parent directory must already exist.** `requested.file_name()`
+   pulls off the last path component (`None` for something like `"."`/
+   `".."`, folded into `NotFound` rather than a new variant, since it's
+   the same "nothing to identify here" condition); the parent is
+   canonicalized and checked for containment the same way `new` checks
+   its whole candidate. No `mkdir -p` — a missing parent directory is
+   `Err(NotFound)`, not auto-created (directory creation is its own,
+   not-yet-built tool with its own security posture; see
+   `SECURITY.md`).
+2. **If the target already exists, it's re-validated in full.**
+   `candidate.canonicalize().unwrap_or(candidate)` tries to
+   canonicalize the exact target; success means the target already
+   exists (the overwrite case), so any symlink sitting at that name is
+   resolved and re-checked for containment — the same guarantee reads
+   already get. Failure means the target doesn't exist yet (the create
+   case), so the parent-only-canonicalized candidate is used as-is,
+   which is still safe: `file_name()` already guaranteed the last
+   component has no `.`/`..` to exploit.
+
+Not yet reachable from any tool — real and unit-tested, but unused
+outside its own tests until `write_file` is built on top of it (Phase
+4's later steps).
+
 ## Tool execution: `dispatch()` is the only thing the agent loop calls
 
 `src/core/tools.rs` holds `read_file`/`list_files` and `dispatch(root:

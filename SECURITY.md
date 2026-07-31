@@ -84,6 +84,31 @@ test against the real Mistral API (not just a fake test client)
 confirms a task requiring multiple tool calls (list a directory, then
 read a file in it) completes correctly.
 
+### `SandboxPath::new_for_write` (Phase 4 Step 1, 2026-07-31)
+
+A second constructor, for `write_file`'s eventual use: validates a
+target that may not exist yet (creating a new file), requiring only
+that its *parent* directory already exists and resolves inside the
+sandbox. If the target itself already exists (the overwrite case), it
+is still fully canonicalized and re-checked, so a symlink sitting at
+that name pointing outside the sandbox is caught — the same guarantee
+reads already get. No `mkdir -p`: a missing parent directory is
+rejected, not auto-created. See `ARCHITECTURE.md` for the full
+two-stage validation logic.
+
+Directory auto-creation is deliberately out of scope here — flagged as
+its own future tool with its own security posture (sketched: gated by
+`file_access_security`, where `strict` never auto-creates, a future
+`medium` level would auto-create with the same confirmation gate
+`write_file` itself uses, and `loose` would auto-create instantly
+within the sandbox). Not built, noted so it isn't rediscovered from
+scratch later.
+
+**Not yet reachable from any tool** — real and unit-tested (including
+the symlink-escape and overwrite-symlink-escape cases), but unused
+outside its own tests until `write_file` is built on top of it later
+in Phase 4.
+
 ### 40-tool-call cap
 
 The 40-tool-call cap and per-batch rejection are implemented and

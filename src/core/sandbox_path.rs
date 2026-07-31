@@ -62,6 +62,56 @@ impl SandboxPath {
         })
     }
 
+    // For write_file: the target may not exist yet (creating a new
+    // file), so only the *parent* directory needs to already exist and
+    // be canonicalized/contained — no mkdir -p, the parent must be real.
+    // If the target itself already exists (the overwrite case), it's
+    // still canonicalized in full and re-checked for containment, so a
+    // symlink sitting at that name pointing outside the sandbox is
+    // caught, same guarantee `new` gives reads.
+    pub(crate) fn new_for_write(root: &Path, requested: &Path) -> Result<Self, SandboxError> {
+        let canonical_root = root.canonicalize().map_err(|_| SandboxError::NotFound)?;
+
+        // file_name() is None for a path with no normal final component
+        // (e.g. ".", ".."), which can't be a write target either way —
+        // folded into NotFound rather than a new variant, since it's the
+        // same "nothing to identify here" condition.
+        let file_name = requested.file_name().ok_or(SandboxError::NotFound)?;
+        let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+
+        let candidate_parent = canonical_root.join(parent);
+        let canonical_parent = candidate_parent
+            .canonicalize()
+            .map_err(|_| SandboxError::NotFound)?;
+
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err(SandboxError::Escapes);
+        }
+
+        let candidate = canonical_parent.join(file_name);
+        // If the target already exists, canonicalizing it in full
+        // resolves a symlink at that exact name; if it doesn't exist
+        // yet, canonicalize simply fails and the already-contained
+        // (parent-only-canonicalized) candidate is used as-is — safe,
+        // since file_name() above guarantees no ".."/"." component to
+        // exploit.
+        let canonical = candidate.canonicalize().unwrap_or(candidate);
+
+        if !canonical.starts_with(&canonical_root) {
+            return Err(SandboxError::Escapes);
+        }
+
+        let relative = canonical
+            .strip_prefix(&canonical_root)
+            .expect("just checked canonical starts_with canonical_root")
+            .to_path_buf();
+
+        Ok(SandboxPath {
+            absolute: canonical,
+            relative,
+        })
+    }
+
     pub(crate) fn as_path(&self) -> &Path {
         &self.absolute
     }
@@ -183,6 +233,83 @@ mod tests {
         let result = SandboxPath::new(root.path(), Path::new("nope.txt"));
 
         assert_eq!(result, Err(SandboxError::NotFound));
+    }
+
+    // Phase 4 Step 1: a write-oriented constructor, for a target that
+    // may not exist yet (write_file can create a new file, not just
+    // overwrite one). Unlike SandboxPath::new, only the *parent*
+    // directory needs to already exist.
+    #[test]
+    fn sandbox_path_new_for_write_accepts_a_new_file_in_an_existing_directory() {
+        let root = TempDir::new();
+
+        let result = SandboxPath::new_for_write(root.path(), Path::new("new.txt"));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sandbox_path_new_for_write_accepts_overwriting_an_existing_file() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("existing.txt"), "old content").unwrap();
+
+        let result = SandboxPath::new_for_write(root.path(), Path::new("existing.txt"));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sandbox_path_new_for_write_rejects_a_missing_parent_directory() {
+        let root = TempDir::new();
+
+        let result = SandboxPath::new_for_write(root.path(), Path::new("no_such_dir/new.txt"));
+
+        assert_eq!(result, Err(SandboxError::NotFound));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sandbox_path_new_for_write_rejects_a_parent_directory_escaping_via_symlink() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside_dir = outer.path().join("outside_dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, root.join("link_dir")).unwrap();
+
+        let result = SandboxPath::new_for_write(&root, Path::new("link_dir/new.txt"));
+
+        assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    // The concrete case that justifies still canonicalizing the full
+    // path when the target already exists: an overwrite must not be
+    // allowed to write through a symlink pointing outside the sandbox,
+    // the same guarantee SandboxPath::new already gives reads.
+    #[test]
+    #[cfg(unix)]
+    fn sandbox_path_new_for_write_rejects_overwriting_a_symlink_that_escapes_the_sandbox() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let secret = outer.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("link.txt")).unwrap();
+
+        let result = SandboxPath::new_for_write(&root, Path::new("link.txt"));
+
+        assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    #[test]
+    fn sandbox_path_new_for_write_relative_path_is_relative_to_root() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+
+        let sandbox_path =
+            SandboxPath::new_for_write(root.path(), Path::new("sub/new.txt")).unwrap();
+
+        assert_eq!(sandbox_path.relative_path(), Path::new("sub/new.txt"));
     }
 
     // Review focus for this step: a rejected symlink's error must not
