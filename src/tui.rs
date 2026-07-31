@@ -61,16 +61,45 @@ fn format_core_event(event: CoreEvent) -> String {
 // know) — revisit once there's a concrete reason to pad to width.
 fn render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>> {
     diff.iter()
-        .map(|line| match line {
-            DiffLine::Added(text) => {
-                Line::styled(format!("+{text}"), Style::new().bg(Color::Green))
-            }
-            DiffLine::Removed(text) => {
-                Line::styled(format!("-{text}"), Style::new().bg(Color::Red))
-            }
-            DiffLine::Unchanged(text) => Line::from(format!(" {text}")),
+        .flat_map(|line| match line {
+            DiffLine::Added(line_text) => diff_line_with_annotation(
+                format!("+{}", line_text.text),
+                Some(Style::new().bg(Color::Green)),
+                line_text.no_trailing_newline,
+            ),
+            DiffLine::Removed(line_text) => diff_line_with_annotation(
+                format!("-{}", line_text.text),
+                Some(Style::new().bg(Color::Red)),
+                line_text.no_trailing_newline,
+            ),
+            DiffLine::Unchanged(line_text) => diff_line_with_annotation(
+                format!(" {}", line_text.text),
+                None,
+                line_text.no_trailing_newline,
+            ),
         })
         .collect()
+}
+
+// Appends git's own "\ No newline at end of file" convention as a
+// separate, unstyled line immediately after the affected one — stays
+// truthful to what write_file actually puts on disk (a missing final
+// newline is a real difference), rather than silently folding it into
+// the line's own text or hiding it.
+fn diff_line_with_annotation(
+    text: String,
+    style: Option<Style>,
+    no_trailing_newline: bool,
+) -> Vec<Line<'static>> {
+    let line = match style {
+        Some(style) => Line::styled(text, style),
+        None => Line::from(text),
+    };
+    if no_trailing_newline {
+        vec![line, Line::from("\\ No newline at end of file")]
+    } else {
+        vec![line]
+    }
 }
 
 // One entry in the chat log — an enum, not a plain String, specifically
@@ -451,6 +480,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::DiffLineText;
+
+    fn line(text: &str) -> DiffLineText {
+        DiffLineText {
+            text: text.to_string(),
+            no_trailing_newline: false,
+        }
+    }
+
+    fn line_missing_newline(text: &str) -> DiffLineText {
+        DiffLineText {
+            text: text.to_string(),
+            no_trailing_newline: true,
+        }
+    }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -865,9 +909,9 @@ mod tests {
         use ratatui::style::Color;
 
         let diff = vec![
-            DiffLine::Unchanged("same".to_string()),
-            DiffLine::Removed("old".to_string()),
-            DiffLine::Added("new".to_string()),
+            DiffLine::Unchanged(line("same")),
+            DiffLine::Removed(line("old")),
+            DiffLine::Added(line("new")),
         ];
 
         let lines = render_diff_lines(&diff);
@@ -892,15 +936,29 @@ mod tests {
     #[test]
     fn render_diff_lines_keeps_a_text_prefix_alongside_color() {
         let diff = vec![
-            DiffLine::Unchanged("same".to_string()),
-            DiffLine::Removed("old".to_string()),
-            DiffLine::Added("new".to_string()),
+            DiffLine::Unchanged(line("same")),
+            DiffLine::Removed(line("old")),
+            DiffLine::Added(line("new")),
         ];
 
         let lines = render_diff_lines(&diff);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
         assert_eq!(texts, vec![" same", "-old", "+new"]);
+    }
+
+    // git's own convention for a missing final newline: a separate,
+    // unstyled annotation line immediately after the affected one —
+    // not folded into the line's own text or colored, since it's a
+    // note about the file, not part of its content.
+    #[test]
+    fn render_diff_lines_annotates_a_line_missing_its_trailing_newline() {
+        let diff = vec![DiffLine::Removed(line_missing_newline("old"))];
+
+        let lines = render_diff_lines(&diff);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert_eq!(texts, vec!["-old", "\\ No newline at end of file"]);
     }
 
     #[test]
@@ -1037,7 +1095,7 @@ mod tests {
 
         app.apply_core_events(vec![CoreEvent::WriteProposed {
             path: "notes.txt".to_string(),
-            diff: vec![DiffLine::Added("hello".to_string())],
+            diff: vec![DiffLine::Added(line("hello"))],
         }]);
 
         assert_eq!(app.pending_confirmation(), Some("notes.txt"));
@@ -1128,8 +1186,8 @@ mod tests {
         app.apply_core_events(vec![CoreEvent::WriteProposed {
             path: "notes.txt".to_string(),
             diff: vec![
-                DiffLine::Removed("old line".to_string()),
-                DiffLine::Added("new line".to_string()),
+                DiffLine::Removed(line("old line")),
+                DiffLine::Added(line("new line")),
             ],
         }]);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();

@@ -204,13 +204,28 @@ structurally cannot reach.
 `generate_diff(old: &str, new: &str) -> Vec<DiffLine>` is a thin, pure
 wrapper around `similar::TextDiff::from_lines` — the diffing algorithm
 itself isn't reimplemented, only mapped into this project's own
-`DiffLine` (`Added`/`Removed`/`Unchanged`) shape. Structured per-line
-data, not a pre-formatted string, specifically so the TUI can render
-`Added`/`Removed` with real color rather than relying on a text
+`DiffLine` (`Added`/`Removed`/`Unchanged`, each wrapping a
+`DiffLineText { text, no_trailing_newline }`) shape. Structured
+per-line data, not a pre-formatted string, specifically so the TUI can
+render `Added`/`Removed` with real color rather than relying on a text
 convention like unified diff's `+`/`-` prefixes alone.
 
-`render_diff_lines` turns that data into styled ratatui `Line`s —
-a colored *background* band (red for removed, green for added), not
+`no_trailing_newline` exists because `similar` compares raw lines
+including their line terminator, so a file's last line with vs.
+without a trailing newline counts as two different lines even when
+their visible text is identical — without tracking this explicitly,
+that shows up as a confusing Removed+Added pair of seemingly identical
+text. The fix is not to hide the difference: this diff is a preview of
+exactly what `write_file` is about to put on disk, so silently
+collapsing a real byte-level difference into "unchanged" would make
+the confirmation prompt lie about what's being approved. Instead,
+`render_diff_lines` follows `git diff`'s own convention — a separate,
+unstyled `\ No newline at end of file` line immediately after the
+affected one — staying fully truthful while making clear why the two
+lines look the same.
+
+`render_diff_lines` turns diff data into styled ratatui `Line`s — a
+colored *background* band (red for removed, green for added), not
 colored text, so a future per-line syntax-highlighting pass has the
 text-color channel free rather than competing with diff coloring for
 it. Each line also keeps a `+`/`-`/` ` text prefix alongside the color,

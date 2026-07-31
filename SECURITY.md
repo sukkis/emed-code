@@ -85,6 +85,11 @@ filtering, identical to a read) *before* anything is even shown for
 approval, so a forbidden path never reaches the confirmation prompt at
 all. If the confirmation channel is ever interrupted (e.g. the app
 closing mid-prompt) the write is treated as declined, never applied.
+The diff itself stays fully truthful to the bytes about to be
+written — even a difference as small as a missing trailing newline is
+shown explicitly rather than ever being normalized away, since the
+approval is only meaningful if the preview genuinely matches what
+happens on disk.
 
 This is offered to Mistral alongside the read tools — Ollama has no
 tool-calling at all yet, so it can't reach any of this either way.

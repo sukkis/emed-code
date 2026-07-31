@@ -11,7 +11,7 @@ mod settings;
 mod tools;
 
 pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
-pub use diff::DiffLine;
+pub use diff::{DiffLine, DiffLineText};
 pub use mistral::MistralClient;
 pub use ollama::OllamaClient;
 
