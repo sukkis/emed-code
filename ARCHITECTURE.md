@@ -413,6 +413,35 @@ unit-tested directly but unused outside their own tests until Step 3
 (rendering) and Step 4 (the actual `write_file` tool) build on top of
 them.
 
+## Colored diff rendering: `render_diff_lines` (Phase 4 Step 3)
+
+`tui.rs`'s `render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>>`
+turns diff data into styled ratatui `Line`s — the first per-line-styled
+content anywhere in this TUI (everything else is plain, unstyled
+text). Not wired into `App`'s log/`draw` pipeline yet — tested directly
+against constructed `DiffLine` data via `TestBackend`, checking actual
+rendered cell colors, not just text content.
+
+**Background color, not text color** — corrected after an initial
+implementation used `Style::fg` (colored text). The user wants this to
+match Claude Code's own diff display: a colored line *band* (red for
+removed, green for added), not colored text, specifically so a future
+per-line syntax-highlighting pass (not built, not scheduled) has the
+text-color channel free rather than competing with diff coloring for
+it. Each line also keeps a `+`/`-`/` ` text prefix alongside its color
+— a terminal without color support, or a color-blind user, still gets
+a real signal, not just a color-only distinction that vanishes without
+color.
+
+**Known, deliberate limitation, tracked as its own future step**: the
+background only covers the line's own text width, not the full render
+width — a true edge-to-edge band (matching Claude Code's actual look)
+needs the text padded out to the real terminal width, which isn't
+knowable at this pure, `Vec<DiffLine> → Vec<Line>` stage (no `Frame`/
+width available here). Explicitly deferred to its own step at the end
+of Phase 4, once real wiring into `draw` (Step 5) makes the actual
+width available to pad against — see `docs/write-file.md`.
+
 ## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
 
 Runs entirely on `submit_user_message`'s spawned background thread, in

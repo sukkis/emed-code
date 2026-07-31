@@ -4,10 +4,12 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use crate::core::{Core, CoreEvent};
+use crate::core::{Core, CoreEvent, DiffLine};
 
 const SCROLL_STEP: usize = 1;
 const PAGE_SCROLL_STEP: usize = 5;
@@ -32,6 +34,35 @@ fn format_core_event(event: CoreEvent) -> String {
         },
         CoreEvent::Error(message) => format!("error: {message}"),
     }
+}
+
+// Turns diff data into styled lines — a red background for removed, a
+// green background for added, unstyled for unchanged (matches Claude
+// Code's own diff display: a colored line band, not colored text —
+// this leaves room for per-line syntax highlighting later without the
+// two competing for the same visual channel). Each line keeps a
+// "+"/"-"/" " text prefix alongside its color, same convention as a
+// unified diff, so a terminal without color support (or a color-blind
+// user) still gets a real signal, not just a color-only distinction.
+// This is the first per-line-styled content anywhere in this TUI —
+// everything else is plain, unstyled text.
+//
+// The background only covers the line's own text, not the full render
+// width (that would need padding to a width this pure function doesn't
+// know) — revisit once this is wired into draw's real chat log
+// (Step 5), where the actual width is available.
+fn render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>> {
+    diff.iter()
+        .map(|line| match line {
+            DiffLine::Added(text) => {
+                Line::styled(format!("+{text}"), Style::new().bg(Color::Green))
+            }
+            DiffLine::Removed(text) => {
+                Line::styled(format!("-{text}"), Style::new().bg(Color::Red))
+            }
+            DiffLine::Unchanged(text) => Line::from(format!(" {text}")),
+        })
+        .collect()
 }
 
 // offset is "how many lines scrolled up from the bottom" (0 = latest).
@@ -738,6 +769,53 @@ mod tests {
             content.contains("tool: read_file"),
             "expected the tool-call prefix to render: {content:?}"
         );
+    }
+
+    // Phase 4 Step 3: colored diff rendering. Not wired into App's log/
+    // draw pipeline yet — tested directly against constructed DiffLine
+    // data (Step 5 is what makes a real CoreEvent produce diffs to
+    // show).
+    #[test]
+    fn render_diff_lines_colors_added_and_removed_line_backgrounds_and_leaves_unchanged_plain() {
+        use ratatui::style::Color;
+
+        let diff = vec![
+            DiffLine::Unchanged("same".to_string()),
+            DiffLine::Removed("old".to_string()),
+            DiffLine::Added("new".to_string()),
+        ];
+
+        let lines = render_diff_lines(&diff);
+
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines.clone()), frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.get(0, 0).bg, Color::Reset);
+        assert_eq!(buffer.get(0, 1).bg, Color::Red);
+        assert_eq!(buffer.get(0, 2).bg, Color::Green);
+    }
+
+    // The +/-/space text prefix must survive alongside the color, so a
+    // terminal without color support (or a color-blind user) still gets
+    // a real signal, not just an invisible-without-color distinction.
+    #[test]
+    fn render_diff_lines_keeps_a_text_prefix_alongside_color() {
+        let diff = vec![
+            DiffLine::Unchanged("same".to_string()),
+            DiffLine::Removed("old".to_string()),
+            DiffLine::Added("new".to_string()),
+        ];
+
+        let lines = render_diff_lines(&diff);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert_eq!(texts, vec![" same", "-old", "+new"]);
     }
 
     #[test]
