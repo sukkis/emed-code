@@ -246,6 +246,62 @@ Codified as its own regression test
 so this is caught by a fast, deterministic test from now on, not only
 by the slow, real-network one.
 
+## Settings: `~/.config/emed-code/settings.toml`, fail-safe, not yet consulted
+
+`src/core/settings.rs` holds `Settings { file_access_security:
+FileAccessSecurity }` and `FileAccessSecurity` (`Strict`/`Loose`,
+`Strict` the `#[default]` variant) — an enum-of-kinds for the setting's
+value, not a raw `String`, matching every other enum decision in this
+codebase (`ChatError`, `CredentialSource`, `Message`): an unrecognized
+string can't silently become a third, unintended state, because there
+is no `String` field left to hold one.
+
+Split into a pure function and a thin I/O shell, the same pattern as
+`extract_mistral_reply`/`fetch_mistral_reply`: `Settings::parse(toml_str:
+&str) -> Settings` does the actual `basic_toml::from_str` parse and is
+what the unit tests exercise directly (no filesystem access needed);
+`Settings::load() -> Settings` resolves the real path via
+`dirs::config_dir()` (added specifically for this — it gets
+`XDG_CONFIG_HOME`/`AppData`/`Library` conventions right across Linux,
+Windows, and macOS for one dependency, cheaper than hand-rolling and
+then getting it wrong the first time this runs somewhere that isn't
+Linux), reads it, and hands the contents to `parse`. Not unit-tested
+itself, same as `Core::with_client`'s real `std::env::current_dir()`
+call — only the pure logic around it is.
+
+**Fails safe, never panics, never fails open.** `Settings::parse` uses
+`.unwrap_or_default()` on the parse `Result` — a missing file, an empty
+file, malformed TOML, and an unrecognized `file_access_security` value
+(e.g. `"yolo"`) all collapse to the exact same outcome: `Settings::default()`,
+i.e. `Strict`. There is deliberately no partial-recovery logic that
+tries to salvage a malformed file's other fields; with only one field
+today that would be pure speculation, and the fail-safe direction
+(defaulting to the *more* restrictive value) is what makes collapsing
+every failure mode into one outcome safe to do at all — the alternative
+of failing *open* would turn a typo in a config file into a silent
+security regression.
+
+**Why `~/.config/emed-code/`, not project-root or `~/.local/share/`**:
+this file will drive which files `read_file`/`list_files` refuse to
+touch (Step 8b) — it is deliberately *outside* the sandbox
+`SandboxPath` enforces, so a future `write_file` tool (Phase 4) can
+never reach it, even indirectly through prompt-injection-driven
+self-modification. A security-relevant guardrail that could be edited
+by the same tool it constrains would not be much of a guardrail. This
+mirrors the reasoning behind resolving Mistral's API key via
+`getfrompass` rather than a project-local file (see "Credentials"
+below): anything that gates what the model can do or see should live
+somewhere the model's own tool access structurally cannot.
+
+Threaded into `Core` the same way as `root`: `Core::with_client` calls
+`Settings::load()` once at construction and stores the result in a new
+`settings: Settings` field. **Not yet consulted by `dispatch`/the file
+tools** — this step only makes the setting real, tested, and loaded;
+Step 8b is what actually branches on `FileAccessSecurity` to block
+`.env`/`.ssh`/etc. `cargo build`/`clippy` currently report `settings`
+as dead code and the `FileAccessSecurity` re-export as unused — expected
+and transient, same treatment as `SandboxPath` between Steps 2 and 3.
+
 ## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
 
 Runs entirely on `submit_user_message`'s spawned background thread, in

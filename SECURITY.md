@@ -90,10 +90,33 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   the log made using the feature genuinely unpleasant, not just a
   privacy nicety).
 
+- **Settings system: `~/.config/emed-code/settings.toml`, fail-safe,
+  structurally tamper-resistant (2026-07-31).** `src/core/settings.rs`'s
+  `Settings::load()` reads one setting, `file_access_security`
+  (`strict`/`loose`, defaulting to `strict`). A missing file, an empty
+  file, malformed TOML, or an unrecognized value all fail safe to the
+  same `strict` default — never a panic, never a fail-open state. **This
+  file cannot be easily tampered with by anything emed-code's own tools
+  can reach**: it lives outside the sandboxed project root that
+  `SandboxPath` bounds, resolved via the OS's real config-directory
+  convention (`dirs::config_dir()`), not a project-relative path — so
+  even once Phase 4 adds a `write_file` tool, there is no path a
+  prompt-injection-driven "edit your own settings to loosen file
+  access" attempt could construct that `SandboxPath` would accept,
+  short of the model already having arbitrary filesystem access outside
+  emed-code entirely. Same reasoning as resolving Mistral's API key via
+  `getfrompass` rather than a project-local file: anything that gates
+  what the model can do or see must live somewhere the model's own tool
+  access structurally cannot reach, not just somewhere it conventionally
+  shouldn't. **Not yet consulted by any tool** — `Core` loads it, but
+  `read_file`/`list_files` don't branch on it yet; see the backlog item
+  below (tracked as Step 8b).
+
 ## Backlog (not yet implemented)
 
 - **No content-sensitivity filtering on file tools (flagged
-  2026-07-30).** `SandboxPath` only enforces *where* a path may resolve
+  2026-07-30; settings mechanism landed 2026-07-31, filtering itself
+  still open).** `SandboxPath` only enforces *where* a path may resolve
   to — it says nothing about *which* files within that boundary are
   appropriate for an LLM-directed tool call to read. A `.env`, `.git/config`
   (can hold remote credentials), or similar sensitive-by-convention file
@@ -106,11 +129,12 @@ rationale — see `ARCHITECTURE.md` for the why behind a given decision.
   distinct, tool-specific instance of the parent `CLAUDE.md`'s "No
   secrets from plaintext" rule — that rule constrains what *I* read on
   the user's behalf; this is about what `read_file` lets *the LLM*
-  read, unconditionally. Proposed direction (not designed, not
-  scheduled): a guardrail-strictness setting (e.g. `file_access:
-  strict` blocking known-sensitive filename patterns) — deliberately
-  deferred until there's a settings system to hang it on, rather than
-  hardcoding a blocklist now with no way to configure it.
+  read, unconditionally. **The setting this will run on now exists**
+  (see "Settings system" below) but isn't consulted by `read_file`/
+  `list_files` yet — that wiring, plus the actual starter blocklist
+  (`.env`/`.env.*`, `.ssh/`, `.git/config`, `*.pem`, `*.key`,
+  explicitly non-exhaustive) and a new `ToolError::AccessDenied`
+  variant, is tracked as Step 8b in `docs/agent-loop.md`.
 
 ## Out of scope / not applicable
 

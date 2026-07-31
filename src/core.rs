@@ -6,6 +6,7 @@ mod credentials;
 mod mistral;
 mod ollama;
 mod sandbox_path;
+mod settings;
 mod tools;
 
 pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
@@ -15,6 +16,7 @@ pub use ollama::OllamaClient;
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
+pub(crate) use settings::{FileAccessSecurity, Settings};
 use tools::{dispatch, tool_definitions};
 
 use std::fmt;
@@ -203,6 +205,11 @@ fn run_agent_loop(
 pub struct Core {
     client: Arc<dyn LlmClient + Send + Sync>,
     root: PathBuf,
+    // Not yet consulted by dispatch()/the file tools — see settings.rs
+    // and SECURITY.md's backlog. Loaded here so it's real and tested
+    // end-to-end (missing/malformed file, real config path) before the
+    // next step wires it into tool behavior.
+    settings: Settings,
     history: Vec<Message>,
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
@@ -222,9 +229,11 @@ impl Core {
     pub fn with_client(client: Arc<dyn LlmClient + Send + Sync>) -> Self {
         let (tx, rx) = mpsc::channel();
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let settings = Settings::load();
         Core {
             client,
             root,
+            settings,
             history: Vec::new(),
             tx,
             rx,
@@ -405,6 +414,7 @@ mod tests {
         Core {
             client,
             root,
+            settings: Settings::default(),
             history: Vec::new(),
             tx,
             rx,
