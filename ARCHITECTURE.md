@@ -6,8 +6,9 @@ lives locally under `docs/` (gitignored, not part of this record).
 
 ## `core` / `tui` / `cli` module split
 
-`core` (`src/core.rs` plus `src/core/{ollama,mistral,credentials}.rs`)
-holds conversation state and provider round-trips; it has zero
+`core` (`src/core.rs` plus
+`src/core/{ollama,mistral,credentials,sandbox_path,tools}.rs`) holds
+conversation state and provider round-trips; it has zero
 `ratatui`/`crossterm` imports. It exposes exactly two entry points:
 `submit_user_message(&mut self, text: String)` and `poll_events(&mut
 self) -> Vec<CoreEvent>`. `tui` (`src/tui.rs`) owns all rendering/input
@@ -18,7 +19,7 @@ tested with zero terminal/rendering setup at all.
 
 Internally, `core.rs` itself only holds what's genuinely shared across
 providers — `Core`, `CoreEvent`, `ChatError`, the `LlmClient` trait, and
-`to_core_event` — and re-exports each submodule's public items (`pub
+`run_agent_loop` — and re-exports each submodule's public items (`pub
 use ollama::OllamaClient`, etc.) so nothing outside `core` needs to know
 about this internal layout; `cli.rs`'s `crate::core::OLLAMA_MODEL`/
 `crate::core::MISTRAL_MODEL` and `main.rs`'s `emed_code::core::{...}`
@@ -51,12 +52,23 @@ outgrow thread-per-request.
 ## `LlmClient` trait: `Core` talks to providers only through this
 
 `Core` never calls a provider's HTTP shape directly. It holds an
-`Arc<dyn LlmClient + Send + Sync>` and calls `client.send(&self, message:
-&str) -> Result<String, ChatError>` — a plain sync method, no
-`async-trait`, matching the rest of the project's sync-loop-plus-threads
-concurrency model. `OllamaClient` is the first implementation (a
-`MistralClient` is next); adding a provider means writing a new
-`LlmClient` impl, not touching `Core`.
+`Arc<dyn LlmClient + Send + Sync>` and calls `client.send(&self, messages:
+&[Message], tools: &[ToolDefinition]) -> Result<LlmResponse, ChatError>`
+— a plain sync method, no `async-trait`, matching the rest of the
+project's sync-loop-plus-threads concurrency model. `OllamaClient` and
+`MistralClient` are the two implementations; adding a provider means
+writing a new `LlmClient` impl, not touching `Core`.
+
+`messages`/`tools`/`LlmResponse` (added when `Core` gained real
+conversation history — see "Conversation history" below) let a single
+method signature represent both a plain chat turn and a tool-calling
+turn: `tools` may be empty (as it always is today — nothing constructs a
+non-empty `ToolDefinition` list yet), and `LlmResponse` is `Text(String)`
+for a final answer or `ToolCalls(Vec<ToolCall>)` for one or more
+requested tool invocations. Each provider maps the shared `Message` enum
+into its own private wire-format type (`OllamaMessage`/`MistralMessage`)
+via a small `to_ollama_messages`/`to_mistral_messages` function — the
+provider never sees `Message` directly beyond that mapping step.
 
 `Arc`, not `Box`: dynamic dispatch (a trait object, not a generic
 `Core<C: LlmClient>`) was chosen because the concrete client isn't known
@@ -75,6 +87,319 @@ independent one pointing at the same value. The `+ Send + Sync` bound on
 the trait object is required because `Arc<T>` is only itself safe to
 move/share across threads when `T: Send + Sync`; the compiler can't
 infer that for an arbitrary `dyn LlmClient`, so it's stated explicitly.
+
+## Conversation history: `Message` enum, mutated only on the polling thread
+
+`Core` holds a `Vec<Message>` that grows for the whole session — every
+user message, assistant reply, tool-call request, and tool result gets
+appended, and the full history is sent with every request (each
+provider maps it into its own wire format; see the `LlmClient` section
+above). `Message` is an enum (`User`, `Assistant`, `ToolCalls { calls:
+Vec<ToolCall> }`, `ToolResult { tool_call_id: String, content: String
+}`), not a flat struct with optional fields, matching every other enum
+decision in this codebase (`ChatError`, `CredentialSource`,
+`ProviderLabel`) — a tool-result-carrying variant was always the plan
+here (see the note below on when it actually arrived) rather than a
+speculative addition.
+
+`ToolCalls` holds one entry *per individual tool call*, not one entry
+per LLM turn — Mistral can in principle request several tool calls in a
+single turn (one assistant message, multiple `tool_calls`), and the
+textbook-correct shape would be one `Message::ToolCalls` holding all of
+them. This was a deliberate simplification, tried rather than researched
+to a standstill first, with a real assumption that needed checking: does
+Mistral's API tolerate several separate single-call turns as well as one
+multi-call turn?
+
+Confirmed working: a real end-to-end test
+(`tests/real_mistral_smoke_test.rs`) that requires at least two tool
+calls to complete (list a directory, then read a file in it) passes
+against the real API — order and `tool_call_id` correlation being
+preserved is what actually mattered, not whether the calls are grouped
+into one turn or several.
+
+Deliberately unbounded and uncompacted for now: nothing trims or
+summarizes history as it grows, so a very long session sends a
+correspondingly large request every time. This isn't an oversight —
+conversation summarization has been a named future item since before
+Phase 1 started; it just had nothing concrete to apply to until history
+existed at all.
+
+History is mutated only on the thread that calls `poll_events()`, never
+on the spawned background thread. `submit_user_message` clones the
+current history into the closure that thread runs (so the network call
+sees an accurate snapshot), but `self.history` itself stays exclusively
+owned by `Core`; `poll_events()` is what appends the assistant's reply
+(or, since the agent loop landed, a tool call's request+result pair)
+back into it as `CoreEvent`s get drained. This avoids needing any
+shared-mutable-state primitive (a `Mutex` around history, say) — there's
+effectively a single writer, the thread that drives the UI loop. The
+agent loop's own *local* copy of history (used to keep talking to the
+provider across loop iterations within one `submit_user_message` call)
+and `Core`'s *persistent* copy (rebuilt incrementally from the
+`CoreEvent` stream) are deliberately two separate `Vec<Message>` — see
+"The agent loop" below for why, and why they're kept in sync by
+convention rather than by sharing one data structure.
+
+## `SandboxPath`: containment enforced by the type system, not convention
+
+`SandboxPath::new(root: &Path, requested: &Path) -> Result<Self,
+SandboxError>` is the only way to construct one, and tool functions take
+`&SandboxPath`, never a raw `PathBuf`/`&str` — a call site can't forget
+to check containment, because there's no path type it could pass
+instead that would compile. This matters more here than in a typical
+read-only-file scenario: tool output (file contents) feeds back into the
+LLM conversation, so an escaped read is a real prompt-injection-adjacent
+exfiltration path, not a hypothetical one.
+
+Containment is checked against `std::fs::canonicalize`d paths — both
+`root` and the joined candidate — not lexical-only `.`/`..`
+normalization. This is the part that actually matters: a symlink placed
+*inside* the sandbox root pointing *outside* it looks contained as a
+literal string (`root/link`), and only resolving it (which
+`canonicalize` does, as a side effect of also resolving `.`/`..`) reveals
+where it really points. `SandboxPath::new` canonicalizes `root` itself on
+every call rather than trusting a caller to have done it once — the cost
+is one extra filesystem call, and it removes a caller-side contract that
+would otherwise be easy to get subtly wrong (e.g. a root path with an
+unresolved symlink component, which would break the `starts_with` prefix
+check in a way that's hard to notice).
+
+`SandboxError` (`NotFound`, `Escapes`) has hand-written `Display` text —
+fixed per variant, never interpolating the actual resolved path. A
+rejected symlink's error must not itself disclose where the symlink
+really pointed; that would defeat the point of rejecting it.
+
+Tests use a hand-rolled `Drop`-based `TempDir` guard (creates a real
+temp directory, removes it when dropped, even if a test panics
+partway through) rather than adding a `tempfile` dev-dependency — same
+reasoning as `ChatError` over `thiserror`: a small enough amount of code
+that writing it directly is more instructive than depending on it, for
+a learning-focused project.
+
+## Tool execution: `dispatch()` is the only thing the agent loop calls
+
+`src/core/tools.rs` holds `read_file`/`list_files` and `dispatch(root:
+&Path, tool_call: &ToolCall) -> Result<String, ToolError>` — the one
+function the agent loop calls for every `ToolCall` it gets back from a
+provider. `dispatch` matches on `tool_call.name`
+*first*, then parses that specific tool's own argument shape — not the
+other way around — so an unrecognized tool name never has to reason
+about argument parsing at all, and adding a third tool means one new
+match arm plus one new function here, nothing in the agent loop itself
+changes. This is deliberately the "clearly-bounded module" a future
+orchestrator-backed tool source (see the Nextcloud-MCP discussion that
+shaped this phase's scope) would swap in behind, without touching
+`Core`.
+
+Both tools go through `SandboxPath::new` before touching the filesystem
+at all — there's no code path in either function that calls
+`std::fs::read_to_string`/`std::fs::read_dir` on an unvalidated path.
+Errors are `ToolError`, not raw `std::io::Error`: `InvalidPath` wraps
+the underlying `SandboxError` (whose `Display` is already proven to
+never leak a resolved path — see `SandboxPath`'s section above),
+`IoFailure` covers a validated path that still fails to read (e.g.
+permission denied, deleted mid-flight), and `MalformedArguments`/
+`UnknownTool` cover dispatch-level failures. None of these variants
+carry a raw `std::io::Error` or any other type whose `Display` isn't
+under this project's own control.
+
+`tool_definitions() -> Vec<ToolDefinition>` (also in `tools.rs`, next to
+`dispatch`, not off in `core.rs`) is the fixed list actually advertised
+to a provider — kept beside `dispatch`'s match arms specifically so the
+two can't silently drift apart; a test asserts the names match. Each
+provider maps `ToolDefinition` into its own wire-format tool-schema type
+(`MistralTool`/`MistralFunctionDef` in `mistral.rs`, confirmed against
+Mistral's function-calling docs: `{"type": "function", "function":
+{name, description, parameters}}`) via a `to_mistral_tools` function,
+mirroring how `Message` gets mapped into each provider's own message
+type. `MistralRequest.tools: Vec<MistralTool>` uses `#[serde(
+skip_serializing_if = "Vec::is_empty")]` so a request with nothing to
+advertise omits the field entirely rather than sending `"tools": []`
+(harmless either way in practice, since `Core` always has at least the
+two built-in tools to advertise today, but avoids relying on that).
+
+On the response side, `extract_mistral_reply` returns
+`Result<LlmResponse, ChatError>` directly (not a bare `String`) — Mistral
+sends back either plain text or a tool-calling turn, so the function
+branches on whether any tool calls came back, rather than needing a
+separate provider-facing concept of "did the model call a tool."
+
+### A real bug, caught by the local-gated smoke test, not by unit tests
+
+`MistralResponseMessage.tool_calls` was first typed as a bare
+`Vec<MistralToolCall>` with `#[serde(default)]`, on the assumption that
+a plain-text reply simply omits the `tool_calls` key. `#[serde(default)]`
+only substitutes a default when a field is *missing* — it does not run
+when the field is present with an explicit JSON `null`. Mistral's real
+API does send `"tool_calls": null` explicitly for at least some
+plain-text replies once a request advertises tools (inconsistently —
+a later request in the same test session omitted the key instead,
+suggesting this varies), which serde then tried to deserialize directly
+into a `Vec`, failing with "invalid type: null, expected a sequence."
+The fixture-based unit tests never caught this because they were
+written before any real advertised-tools response existed to model the
+fixture on. Fixed by typing the field `Option<Vec<MistralToolCall>>`
+instead: `Option<T>` deserializes a JSON `null` as `None` natively (no
+special attribute needed for that case), and `#[serde(default)]` still
+covers a genuinely missing field the same way. `extract_mistral_reply`
+then does `.unwrap_or_default()` to treat both as "no tool calls."
+Codified as its own regression test
+(`extract_mistral_reply_treats_an_explicit_null_tool_calls_as_absent`)
+so this is caught by a fast, deterministic test from now on, not only
+by the slow, real-network one.
+
+## Settings: `~/.config/emed-code/settings.toml`, fail-safe
+
+`src/core/settings.rs` holds `Settings { file_access_security:
+FileAccessSecurity }` and `FileAccessSecurity` (`Strict`/`Loose`,
+`Strict` the `#[default]` variant) — an enum-of-kinds for the setting's
+value, not a raw `String`, matching every other enum decision in this
+codebase (`ChatError`, `CredentialSource`, `Message`): an unrecognized
+string can't silently become a third, unintended state, because there
+is no `String` field left to hold one.
+
+Split into a pure function and a thin I/O shell, the same pattern as
+`extract_mistral_reply`/`fetch_mistral_reply`: `Settings::parse(toml_str:
+&str) -> Settings` does the actual `basic_toml::from_str` parse and is
+what the unit tests exercise directly (no filesystem access needed);
+`Settings::load() -> Settings` resolves the real path via
+`dirs::config_dir()` (added specifically for this — it gets
+`XDG_CONFIG_HOME`/`AppData`/`Library` conventions right across Linux,
+Windows, and macOS for one dependency, cheaper than hand-rolling and
+then getting it wrong the first time this runs somewhere that isn't
+Linux), reads it, and hands the contents to `parse`. Not unit-tested
+itself, same as `Core::with_client`'s real `std::env::current_dir()`
+call — only the pure logic around it is.
+
+Threaded into `Core` the same way as `root`: `Core::with_client` calls
+`Settings::load()` once at construction and stores the result in a new
+`settings: Settings` field; `submit_user_message` copies out
+`settings.file_access_security` (a `Copy` enum, so no need to clone or
+share `Settings` itself across the thread boundary) and passes it into
+`run_agent_loop`, which threads it through to every `dispatch` call.
+
+### Fails safe, never panics, never fails open
+
+`Settings::parse` uses `.unwrap_or_default()` on the parse `Result` — a
+missing file, an empty file, malformed TOML, and an unrecognized
+`file_access_security` value (e.g. `"yolo"`) all collapse to the exact
+same outcome: `Settings::default()`, i.e. `Strict`. There is
+deliberately no partial-recovery logic that tries to salvage a
+malformed file's other fields; with only one field today that would be
+pure speculation, and the fail-safe direction (defaulting to the *more*
+restrictive value) is what makes collapsing every failure mode into
+one outcome safe to do at all — the alternative of failing *open*
+would turn a typo in a config file into a silent security regression.
+
+### Why `~/.config/emed-code/`, not project-root or `~/.local/share/`
+
+This file drives which files `read_file`/`list_files` refuse to touch
+(see "Content-sensitivity filtering" below) — it is deliberately
+*outside* the sandbox `SandboxPath` enforces, so a future `write_file`
+tool (Phase 4) can never reach it, even indirectly through
+prompt-injection-driven self-modification. A security-relevant
+guardrail that could be edited by the same tool it constrains would
+not be much of a guardrail. This mirrors the reasoning behind resolving
+Mistral's API key via `getfrompass` rather than a project-local file
+(see "Credentials" below): anything that gates what the model can do
+or see should live somewhere the model's own tool access structurally
+cannot.
+
+## Content-sensitivity filtering: blocking `read_file`/`list_files` on sensitive paths (Step 8b)
+
+`SandboxPath` gained a `relative_path()` accessor — the canonicalized
+(symlink-resolved), root-relative path, stored alongside the existing
+absolute path at construction time (one `strip_prefix` call, since the
+containment check already proves the relative path exists).
+`tools.rs`'s `is_content_restricted(relative_path: &Path) -> bool`
+matches this against a small, explicitly non-exhaustive starter
+blocklist: `.env`/`.env.*` and `*.pem`/`*.key` by filename, `.ssh` as a
+path component matched anywhere (not just at the root, so
+`project/.ssh/id_rsa` is caught too), and `.git/config` specifically
+(the last two path components, not all of `.git` — `.git/hooks/pre-commit`
+is unaffected).
+
+`read_file`/`list_files` each check this (only when
+`FileAccessSecurity::Strict`; `Loose` skips the check entirely, its one
+current distinct behavior) after `SandboxPath::new` succeeds but before
+touching the filesystem, returning the new `ToolError::AccessDenied` (a
+static message — unlike `SandboxError::Escapes`, there's nothing to
+hide here, since the LLM already knows exactly which path it
+requested).
+
+### Why the canonicalized path, not the raw requested string
+
+Checking the literal argument a tool call passed in (e.g.
+`"innocuous.txt"`) would miss a symlink with an innocuous name that
+actually resolves to a blocked file (e.g. `.env`) — exactly the same
+class of bypass `SandboxPath`'s containment check already had to
+account for. Matching against `relative_path()` instead means the
+blocklist inherits that same symlink-safety guarantee for free, rather
+than introducing a second, weaker path check right next to the
+stronger one. Covered by
+`read_file_blocks_a_symlink_that_resolves_to_a_blocked_file`.
+
+### `list_files`'s scope, specifically
+
+A blocked entry's *name* still appears in its parent directory's
+listing (existence isn't hidden — low risk), but listing *into* a
+blocked directory, or anything nested inside one, is refused the same
+way `read_file` refuses a blocked file directly — checked before
+`std::fs::read_dir` runs at all, so there's no code path where a
+blocked directory's contents get enumerated even partially.
+
+## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
+
+Runs entirely on `submit_user_message`'s spawned background thread, in
+a plain `loop`: call `client.send(&history, &tool_defs)`; `Text` means
+done (send `CoreEvent::AssistantChunk`, return); `ToolCalls` means
+dispatch each one (`tools::dispatch`), append a `Message::ToolCalls` +
+`Message::ToolResult` pair to the loop's *local* history for each, send
+one `CoreEvent::ToolCall { id, name, arguments, result }` per call (once
+dispatch has already completed — not a separate proposed/finished pair,
+since local file tools finish near-instantly and there's no
+meaningful in-progress state worth a second event), then loop again
+with the updated history; any `ChatError` means done (send
+`CoreEvent::Error`, return).
+
+`CoreEvent::ToolCall.result` is `Result<String, String>`, not a
+flattened `String` — refined after manual testing surfaced a real
+problem: asking the agent to read several files rendered their entire
+contents straight into the chat log, which was unpleasant to actually
+use, not just noisy. `Message::ToolResult`'s `content` (what the *model*
+sees on the next turn) still carries the full success-or-error text
+either way — only what reaches the `CoreEvent` (and therefore the TUI)
+distinguishes them, so `tui.rs`'s `format_core_event` can show just
+`"ok"` on success (the payload is for the model, not something the log
+needs to echo back at the user) while still showing an error's actual
+message in full (short and useful, unlike a whole file's contents).
+
+`MAX_TOOL_CALLS` (40) bounds the running count of *individual* tool
+calls across the whole loop, not rounds — a round-based cap wouldn't
+actually bound the risk it's meant to (a model batching many calls into
+one round would sail through a low round-count cap while still doing
+all that work) and would also cut off legitimate work (reading a new
+project's ~15-20 files, worst case one file per round, could exceed a
+cap like 10 rounds). Checked per-batch: if a round's calls would push
+the running total over the cap, the whole round is rejected with a
+`CoreEvent::Error`, not partially executed.
+
+`Core` gained a `root: PathBuf` field for this (`dispatch` needs a
+sandbox root and nothing previously provided one) — defaults to
+`std::env::current_dir()` in `with_client`, so `main.rs` needed no
+changes.
+
+The now-removed `to_core_event` free function used to do this Text/Err
+→ `CoreEvent` mapping (with a placeholder "tool calls not yet
+supported" arm for `ToolCalls`, since nothing produced that variant
+yet). Once the loop needed to handle `ToolCalls` with real dispatch
+logic — necessarily inline, since only the loop knows about the running
+tool-call count and can decide whether to continue — keeping a
+separate helper that only ever got called for its other two branches,
+with a now-factually-wrong third one, stopped earning its keep; the
+two one-line mappings it used to do are inlined directly into the
+loop's `match` arms instead.
 
 ## Error handling: a hand-written `ChatError` enum, no `thiserror`
 
@@ -104,7 +429,9 @@ didn't look like an error envelope"). This means a real Mistral auth
 failure comes back as `ChatError::Auth("Unauthorized")`, not lumped in
 with genuinely malformed responses.
 
-**Known limitation, deliberately deferred**: `ChatError::Connection`
+### Known limitation, deliberately deferred
+
+`ChatError::Connection`
 flattens whatever `ureq` produced (connection refused, timeout, DNS
 failure, TLS error, ...) into one `String` via `.to_string()`. That's
 fine today — nothing currently needs to tell those cases apart. It stops
@@ -172,21 +499,31 @@ small and dumb as possible, with everything else a plain function over
 data:
 
 - `fetch_ollama_reply`/`fetch_mistral_reply` — the only parts that touch
-  `ureq`. Collapse every failure mode (connection refused, timeout,
-  non-2xx status) into `Result<String, ChatError>` (specifically
-  `ChatError::Connection`). Neither has a unit test of its own; each has
-  a `local`-feature-gated smoke test instead (see "The `local` Cargo
-  feature" below).
+  `ureq`. Take the already-mapped wire-format message list (built by
+  `to_ollama_messages`/`to_mistral_messages`) and collapse every failure
+  mode (connection refused, timeout, non-2xx status) into
+  `Result<String, ChatError>` (specifically `ChatError::Connection`).
+  Neither has a unit test of its own; each has a `local`-feature-gated
+  smoke test instead (see "The `local` Cargo feature" below).
+- `to_ollama_messages`/`to_mistral_messages` — pure: map the shared
+  `Message` history into each provider's own wire-format type. Tested
+  directly (fixture `Message` list in, expected wire messages out) —
+  this is what actually makes `Core`'s conversation history reach the
+  provider, so it earns its own test rather than only being exercised
+  indirectly.
 - `extract_reply`/`extract_mistral_reply` — pure: parse a response body
   into the reply text or a `ChatError`. Tested with fixture JSON
   strings, no network involved. `OllamaClient::send`/`MistralClient::send`
-  are each just their provider's fetch-then-extract call chained.
-- `to_core_event` — pure and now provider-agnostic: takes the
-  `Result<String, ChatError>` a `LlmClient::send` call already produced
-  (fetch *and* parse are done by then) and wraps it into a `CoreEvent`.
-  It doesn't parse anything itself, unlike before this trait existed —
-  parsing is each provider's own job, since that's the part that differs
-  between them.
+  are each just their provider's map-then-fetch-then-extract calls
+  chained.
+- `run_agent_loop` — the one place a `Result<LlmResponse, ChatError>`
+  a `LlmClient::send` call produced becomes a `CoreEvent`: `Text`
+  becomes `AssistantChunk`, `ChatError` becomes `Error`, and
+  `ToolCalls` means dispatching each call and emitting one
+  `CoreEvent::ToolCall` per call (see "The agent loop" above). This
+  used to be a separate pure `to_core_event` function, removed once
+  handling `ToolCalls` needed real dispatch logic that only the loop
+  itself can drive (see that section for why).
 
 This means the interesting behavior (what happens on a malformed
 response vs. a failed request) is covered by fast, deterministic unit

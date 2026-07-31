@@ -15,6 +15,21 @@ const PAGE_SCROLL_STEP: usize = 5;
 fn format_core_event(event: CoreEvent) -> String {
     match event {
         CoreEvent::AssistantChunk(text) => format!("emed-code: {text}"),
+        // "tool: " is a distinct prefix from both "emed-code: " and
+        // "error: " — shows the call (name + arguments) that ran. On
+        // success, shows only "ok" — the result content (which could be
+        // an entire file's contents) is for the model, not something the
+        // chat log echoes back at the user. On failure, the error
+        // message itself is short and useful, so it's shown in full.
+        CoreEvent::ToolCall {
+            name,
+            arguments,
+            result,
+            ..
+        } => match result {
+            Ok(_) => format!("tool: {name}({arguments}) -> ok"),
+            Err(error) => format!("tool: {name}({arguments}) -> error: {error}"),
+        },
         CoreEvent::Error(message) => format!("error: {message}"),
     }
 }
@@ -656,6 +671,72 @@ mod tests {
         assert_eq!(
             format_core_event(CoreEvent::Error("connection refused".to_string())),
             "error: connection refused"
+        );
+    }
+
+    // "tool: " is a distinct prefix from both "emed-code: " (assistant
+    // replies) and "error: " — the point of this step, so a user can
+    // tell tool activity apart from either at a glance. Success shows
+    // only "ok", not the full result content — a read_file result could
+    // be an entire file's contents, which the model needs but the
+    // chat log doesn't need to echo back at the user.
+    #[test]
+    fn formats_a_successful_tool_call_without_echoing_the_full_result() {
+        assert_eq!(
+            format_core_event(CoreEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path": "notes.txt"}"#.to_string(),
+                result: Ok("the entire contents of a very long file".to_string()),
+            }),
+            r#"tool: read_file({"path": "notes.txt"}) -> ok"#
+        );
+    }
+
+    // Unlike a success, the error message itself is short and useful —
+    // shown in full, not hidden behind a generic "failed".
+    #[test]
+    fn formats_a_failed_tool_call_with_its_error_message() {
+        assert_eq!(
+            format_core_event(CoreEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path": "../secret.txt"}"#.to_string(),
+                result: Err("invalid path: path escapes the sandboxed directory".to_string()),
+            }),
+            r#"tool: read_file({"path": "../secret.txt"}) -> error: invalid path: path escapes the sandboxed directory"#
+        );
+    }
+
+    // TestBackend-level check, same style as the provider-label tests —
+    // proves a ToolCall event actually reaches the rendered chat log via
+    // App::apply_core_events, not just that format_core_event itself
+    // produces the right string in isolation.
+    #[test]
+    fn draws_a_tool_call_in_the_chat_log() {
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": "notes.txt"}"#.to_string(),
+            result: Ok("hello".to_string()),
+        }]);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            content.contains("tool: read_file"),
+            "expected the tool-call prefix to render: {content:?}"
         );
     }
 
