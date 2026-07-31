@@ -231,8 +231,10 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "write_file".to_string(),
             description: "Create a new file or overwrite an existing one within the project \
-                directory. The user is shown a diff and must approve it before anything is \
-                written — do not assume the write has happened until a result confirms it."
+                directory. Call this directly to propose the change — the system automatically \
+                shows the user a diff and requires their approval before anything is written, \
+                so do not ask the user for confirmation yourself first. Do not assume the write \
+                has happened until a result confirms it; the user may decline."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -279,7 +281,7 @@ pub(crate) fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::DiffLine;
+    use crate::core::{DiffLine, DiffLineText};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -682,7 +684,16 @@ mod tests {
         match rx.try_recv().unwrap() {
             CoreEvent::WriteProposed { path, diff } => {
                 assert_eq!(path, "new.txt");
-                assert_eq!(diff, vec![DiffLine::Added("hello".to_string())]);
+                // "hello" has no trailing newline in the tool call's
+                // literal content, so the diff correctly flags it —
+                // see diff.rs's DiffLineText.
+                assert_eq!(
+                    diff,
+                    vec![DiffLine::Added(DiffLineText {
+                        text: "hello".to_string(),
+                        no_trailing_newline: true,
+                    })]
+                );
             }
             other => panic!("expected WriteProposed, got {other:?}"),
         }

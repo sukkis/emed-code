@@ -104,6 +104,21 @@ order and `tool_call_id` correlation are what actually matter for a
 correct conversation, not whether the calls are grouped into one
 message or several.
 
+`Message::ToolResult` carries both a `tool_call_id` and the tool's own
+`name`, even though Mistral's wire format only ever needs the id.
+Ollama's `/api/chat` has no id concept at all — it correlates a result
+back to its request purely by tool name — so `OllamaClient` needs the
+name sitting directly on the result rather than scanning back through
+history for the matching `ToolCalls` entry. `OllamaClient` also
+synthesizes its own per-turn `ToolCall.id` (a simple counter; Ollama's
+response never includes one), used only for this project's own internal
+bookkeeping and never sent back over the wire. The one residual gap,
+not fixable from this side: Ollama's name-based correlation is
+inherently ambiguous if a model calls the same tool twice in one
+turn — results are sent back in call order as the best available
+mitigation, same as Mistral's own id-based correlation would fall back
+to if two calls ever somehow shared an id.
+
 History is mutated only on the thread that calls `poll_events()`, never
 on the background thread doing the network round-trip. That thread
 gets its own cloned snapshot of history to send; `Core`'s persistent
@@ -204,13 +219,28 @@ structurally cannot reach.
 `generate_diff(old: &str, new: &str) -> Vec<DiffLine>` is a thin, pure
 wrapper around `similar::TextDiff::from_lines` — the diffing algorithm
 itself isn't reimplemented, only mapped into this project's own
-`DiffLine` (`Added`/`Removed`/`Unchanged`) shape. Structured per-line
-data, not a pre-formatted string, specifically so the TUI can render
-`Added`/`Removed` with real color rather than relying on a text
+`DiffLine` (`Added`/`Removed`/`Unchanged`, each wrapping a
+`DiffLineText { text, no_trailing_newline }`) shape. Structured
+per-line data, not a pre-formatted string, specifically so the TUI can
+render `Added`/`Removed` with real color rather than relying on a text
 convention like unified diff's `+`/`-` prefixes alone.
 
-`render_diff_lines` turns that data into styled ratatui `Line`s —
-a colored *background* band (red for removed, green for added), not
+`no_trailing_newline` exists because `similar` compares raw lines
+including their line terminator, so a file's last line with vs.
+without a trailing newline counts as two different lines even when
+their visible text is identical — without tracking this explicitly,
+that shows up as a confusing Removed+Added pair of seemingly identical
+text. The fix is not to hide the difference: this diff is a preview of
+exactly what `write_file` is about to put on disk, so silently
+collapsing a real byte-level difference into "unchanged" would make
+the confirmation prompt lie about what's being approved. Instead,
+`render_diff_lines` follows `git diff`'s own convention — a separate,
+unstyled `\ No newline at end of file` line immediately after the
+affected one — staying fully truthful while making clear why the two
+lines look the same.
+
+`render_diff_lines` turns diff data into styled ratatui `Line`s — a
+colored *background* band (red for removed, green for added), not
 colored text, so a future per-line syntax-highlighting pass has the
 text-color channel free rather than competing with diff coloring for
 it. Each line also keeps a `+`/`-`/` ` text prefix alongside the color,

@@ -5,9 +5,21 @@
 // and tui::LogEntry::Diff, both public types.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffLine {
-    Added(String),
-    Removed(String),
-    Unchanged(String),
+    Added(DiffLineText),
+    Removed(DiffLineText),
+    Unchanged(DiffLineText),
+}
+
+// One line's text, plus whether it's missing a trailing newline in the
+// file it came from. A missing final newline is a real difference in
+// what's on disk, not a cosmetic one — git's own diff shows this
+// explicitly ("\ No newline at end of file") rather than hiding it, and
+// this project's diff should stay just as truthful about what
+// write_file is actually about to put on disk.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DiffLineText {
+    pub text: String,
+    pub no_trailing_newline: bool,
 }
 
 // Pure: no I/O. Wraps similar::TextDiff::from_lines, mapping its
@@ -20,15 +32,21 @@ pub(crate) fn generate_diff(old: &str, new: &str) -> Vec<DiffLine> {
     text_diff
         .iter_all_changes()
         .map(|change| {
-            // value() includes the line's own trailing newline (from_lines
-            // splits on it but keeps it attached) — trimmed here since
-            // DiffLine holds one line's text, not the newline that
-            // separates it from the next.
-            let text = change.value().trim_end_matches(['\n', '\r']).to_string();
+            let raw = change.value();
+            // from_lines splits on the newline but keeps it attached to
+            // the line that precedes it — a line missing that
+            // terminator is the file's actual last line with no
+            // trailing newline, not a coincidence of how lines were
+            // split.
+            let no_trailing_newline = !raw.ends_with('\n');
+            let line_text = DiffLineText {
+                text: raw.trim_end_matches(['\n', '\r']).to_string(),
+                no_trailing_newline,
+            };
             match change.tag() {
-                similar::ChangeTag::Delete => DiffLine::Removed(text),
-                similar::ChangeTag::Insert => DiffLine::Added(text),
-                similar::ChangeTag::Equal => DiffLine::Unchanged(text),
+                similar::ChangeTag::Delete => DiffLine::Removed(line_text),
+                similar::ChangeTag::Insert => DiffLine::Added(line_text),
+                similar::ChangeTag::Equal => DiffLine::Unchanged(line_text),
             }
         })
         .collect()
@@ -38,6 +56,20 @@ pub(crate) fn generate_diff(old: &str, new: &str) -> Vec<DiffLine> {
 mod tests {
     use super::*;
 
+    fn line(text: &str) -> DiffLineText {
+        DiffLineText {
+            text: text.to_string(),
+            no_trailing_newline: false,
+        }
+    }
+
+    fn line_missing_newline(text: &str) -> DiffLineText {
+        DiffLineText {
+            text: text.to_string(),
+            no_trailing_newline: true,
+        }
+    }
+
     #[test]
     fn generate_diff_marks_identical_content_as_unchanged() {
         let diff = generate_diff("a\nb\n", "a\nb\n");
@@ -45,8 +77,8 @@ mod tests {
         assert_eq!(
             diff,
             vec![
-                DiffLine::Unchanged("a".to_string()),
-                DiffLine::Unchanged("b".to_string()),
+                DiffLine::Unchanged(line("a")),
+                DiffLine::Unchanged(line("b")),
             ]
         );
     }
@@ -57,10 +89,7 @@ mod tests {
 
         assert_eq!(
             diff,
-            vec![
-                DiffLine::Added("a".to_string()),
-                DiffLine::Added("b".to_string()),
-            ]
+            vec![DiffLine::Added(line("a")), DiffLine::Added(line("b"))]
         );
     }
 
@@ -70,10 +99,7 @@ mod tests {
 
         assert_eq!(
             diff,
-            vec![
-                DiffLine::Removed("a".to_string()),
-                DiffLine::Removed("b".to_string()),
-            ]
+            vec![DiffLine::Removed(line("a")), DiffLine::Removed(line("b"))]
         );
     }
 
@@ -84,10 +110,44 @@ mod tests {
         assert_eq!(
             diff,
             vec![
-                DiffLine::Unchanged("a".to_string()),
-                DiffLine::Removed("b".to_string()),
-                DiffLine::Added("x".to_string()),
-                DiffLine::Unchanged("c".to_string()),
+                DiffLine::Unchanged(line("a")),
+                DiffLine::Removed(line("b")),
+                DiffLine::Added(line("x")),
+                DiffLine::Unchanged(line("c")),
+            ]
+        );
+    }
+
+    // similar::TextDiff::from_lines compares raw lines including their
+    // terminator, so "same" (no newline) and "same\n" count as two
+    // different lines even though their visible text is identical.
+    // Rather than hiding that difference (which would misrepresent what
+    // write_file is actually about to put on disk), each line remembers
+    // whether it's missing its trailing newline — tui.rs renders that
+    // as an explicit annotation, matching git's own "\ No newline at
+    // end of file".
+    #[test]
+    fn generate_diff_flags_a_line_missing_its_trailing_newline() {
+        let diff = generate_diff("same", "same\n");
+
+        assert_eq!(
+            diff,
+            vec![
+                DiffLine::Removed(line_missing_newline("same")),
+                DiffLine::Added(line("same")),
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_diff_flags_the_other_side_when_a_trailing_newline_is_removed() {
+        let diff = generate_diff("same\n", "same");
+
+        assert_eq!(
+            diff,
+            vec![
+                DiffLine::Removed(line("same")),
+                DiffLine::Added(line_missing_newline("same")),
             ]
         );
     }
