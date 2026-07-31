@@ -15,33 +15,50 @@ Four places hold project knowledge, each with a distinct job. Don't mix
 their content — a fact belongs in exactly one of these, and everything
 below points at the one that applies.
 
-- **`README.md`** — user-facing. What this is, how to build/run it, how
-  to configure it (API keys, provider selection), troubleshooting.
-  Written for someone using the tool, not building it. Also holds the
-  live roadmap (see "Suggested Rhythm" below).
+**Goals for anything public-facing** (README/ARCHITECTURE/SECURITY, and
+doc comments in code): nice enough that a user or contributor gets
+excited seeing it; terse "why" explanations on modules/functions,
+written as if this could ship on crates.io; readable by humans, not
+just technically correct; not overly long.
+
+**Never discuss state of development in code comments or public-facing
+documents.** No "Step N"/"Phase N" labels, no dates, no "not yet
+built"/"corrected after an earlier attempt"/"caught during
+implementation" narrative. These files describe the settled current
+design as if it had always been this way — the journey that got here
+belongs in `docs/<topic>.md` (gitignored), not in what ships.
+
+- **`README.md`** — the sales pitch. Get the user excited about what
+  this is, fast: benefits, then quick advice to start using it. Not a
+  tutorial (might add one separately later). Also holds the live
+  roadmap (see "Suggested Rhythm" below) — forward-looking capabilities,
+  not a phase-tracking status list.
 - **`ARCHITECTURE.md`** — maintainer-facing design decisions and their
-  rationale (the *why*): dependency choices, error-handling strategy,
-  security-relevant design (e.g. how API keys are read and passed
-  around). Updated as each increment's design is settled. This is the
-  durable record — if a future session needs to know why something was
-  built a certain way, it should be answerable from here without digging
-  through history.
-- **`SECURITY.md`** — living checklist of current security posture (what's
-  implemented, tied to the step that delivered it) plus a backlog of
-  known gaps not yet addressed. Tracks *status*, not rationale — see
-  ARCHITECTURE.md for the why behind a given decision. Update the
-  checklist and backlog as soon as something changes; this file should
-  always describe the real current state, not an aspirational one.
+  rationale (the *why*), for future me or a future contributor. Starts
+  with a picture and a high-level overview; technical details fall
+  clearly under relevant headings. Assumes the reader can also read
+  code — explain *why*, not *what*. Updated as each increment's design
+  is settled; this is the durable record — if a future session needs to
+  know why something was built a certain way, it should be answerable
+  from here without digging through history.
+- **`SECURITY.md`** — current security posture, for a user or a
+  developer. Starts with a high-level overview of the threats faced and
+  how the project responds; the position for each kind of vulnerability
+  is explained under its own relevant heading. Tracks *status*, not
+  rationale — see `ARCHITECTURE.md` for the why behind a given
+  decision. Update it as soon as something changes; it should always
+  describe the real current state, not an aspirational one.
 - **`docs/<topic>.md`** — internal planning/spec docs, one per increment
   or roadmap item. **Gitignored — local-only scratch material between us,
   not part of the repo.** Holds: increment scope, what's explicitly out
   of scope and why (including "Future: X" notes preserving design
   reasoning for deferred work, so it isn't rediscovered from scratch
   later), dependency justification, and the step-by-step breakdown
-  (test-first plan + review focus per step). Once an increment lands,
-  whatever's durable moves into README/ARCHITECTURE/SECURITY — `docs/`
-  itself is the trail that got us there, not the destination. It's fine
-  for it to go stale once an increment closes.
+  (test-first plan + review focus per step) — this is where "Step N",
+  dates, and process narrative belong, not in the other three. Once an
+  increment lands, whatever's durable moves into README/ARCHITECTURE/
+  SECURITY — `docs/` itself is the trail that got us there, not the
+  destination. It's fine for it to go stale once an increment closes.
 - **Never point at `docs/<topic>.md` (or anything else under `docs/`)
   from code comments, doc comments, or README/ARCHITECTURE/SECURITY.**
   Those files aren't in the repo, so the reference is dangling for

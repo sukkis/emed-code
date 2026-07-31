@@ -147,13 +147,12 @@ pub(crate) fn write_file(
 }
 
 // The confirmation-gated entry point the agent loop calls for a
-// "write_file" tool call — not yet reachable from a real provider
-// (Step 6 is what advertises it), but real and unit-tested, and
-// exercised end-to-end by core.rs's agent-loop tests via a scripted
-// client. Validates first (so a forbidden path never even shows a
-// confirmation prompt), then proposes the change and blocks for an
-// answer, then delegates the actual write back to write_file above —
-// a deliberate, cheap redundant re-validation in exchange for one
+// "write_file" tool call — exercised end-to-end by core.rs's
+// agent-loop tests via a scripted client. Validates first (so a
+// forbidden path never even shows a confirmation prompt), then
+// proposes the change and blocks for an answer, then delegates the
+// actual write back to write_file above — a deliberate, cheap
+// redundant re-validation in exchange for one
 // source of truth on sandboxing/blocklist logic, rather than
 // duplicating it inline here.
 pub(crate) fn write_file_with_confirmation(
@@ -395,7 +394,6 @@ mod tests {
         assert_eq!(result, Err(ToolError::MalformedArguments));
     }
 
-    // Step 8b: content-sensitivity filtering.
     #[test]
     fn read_file_blocks_a_dot_env_file_in_strict_mode() {
         let root = TempDir::new();
@@ -520,9 +518,9 @@ mod tests {
         assert_eq!(result, Err(ToolError::AccessDenied));
     }
 
-    // Phase 4 Step 4: the write_file tool logic itself — not yet added
-    // to tool_definitions()/dispatch, so unreachable from any live
-    // agent loop (that's Step 6). Real and unit-tested regardless.
+    // write_file isn't added to tool_definitions()/dispatch — it's
+    // routed around dispatch by name (see write_file_with_confirmation
+    // below), so it's tested directly here instead.
     #[test]
     fn write_file_creates_a_new_file_with_the_given_content() {
         let root = TempDir::new();
@@ -628,7 +626,7 @@ mod tests {
         );
     }
 
-    // Phase 4 Step 5a: the confirmation-gated write path. confirm_tx is
+    // Tests the confirmation-gated write path. confirm_tx is
     // pre-loaded with a choice before calling, since mpsc::channel is
     // unbounded — the function's own confirm_rx.recv() then picks it up
     // immediately rather than actually blocking, keeping these tests

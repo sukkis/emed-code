@@ -671,10 +671,10 @@ mod tests {
         assert!(matches!(events[0], CoreEvent::Error(_)));
     }
 
-    // Phase 4 Step 5a: the real cross-thread blocking. Deliberately
-    // observes the file *doesn't* exist yet right after WriteProposed
-    // arrives — proving the background thread is still paused, not just
-    // that respond_to_confirmation eventually produces the right
+    // The real cross-thread blocking. Deliberately observes the file
+    // *doesn't* exist yet right after WriteProposed arrives — proving
+    // the background thread is still paused, not just that
+    // respond_to_confirmation eventually produces the right
     // outcome regardless of timing.
     #[test]
     fn agent_loop_blocks_on_write_confirmation_then_applies_it() {
@@ -702,7 +702,10 @@ mod tests {
         core.respond_to_confirmation(ConfirmationChoice::Apply);
 
         let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
-        assert!(matches!(events[0], CoreEvent::ToolCall { result: Ok(_), .. }));
+        assert!(matches!(
+            events[0],
+            CoreEvent::ToolCall { result: Ok(_), .. }
+        ));
         assert_eq!(events[1], CoreEvent::AssistantChunk("wrote it".to_string()));
         assert_eq!(
             std::fs::read_to_string(root.path().join("new.txt")).unwrap(),

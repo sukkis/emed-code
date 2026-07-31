@@ -16,7 +16,7 @@
 // terse the model's actual reply turns out to be.
 #![cfg(feature = "local")]
 
-use emed_code::tui::{App, draw};
+use emed_code::tui::{App, LogEntry, draw};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -86,11 +86,13 @@ fn mini_session_scroll_position_survives_a_real_reply_but_not_a_new_submit() {
     let log_len_after_submit = app.log().len();
     poll_until_reply_lands(&mut app, log_len_after_submit, Duration::from_secs(30));
 
-    let reply = &app.log()[log_len_after_submit];
-    assert!(
-        !reply.starts_with("error: "),
-        "expected a real reply, got: {reply}"
-    );
+    match &app.log()[log_len_after_submit] {
+        LogEntry::Text(text) => assert!(
+            !text.starts_with("error: "),
+            "expected a real reply, got: {text}"
+        ),
+        LogEntry::Diff { .. } => panic!("unexpected diff entry — Ollama has no write_file tool"),
+    }
     assert_eq!(
         app.scroll_offset(),
         scrolled_offset,

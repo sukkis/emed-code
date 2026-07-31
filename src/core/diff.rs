@@ -1,7 +1,7 @@
 // Structured, per-line diff data — not a pre-formatted string —
 // specifically so the TUI can render Added/Removed with real color
-// (see tui.rs, Phase 4 Step 3) rather than relying on a text
-// convention like unified diff's +/- prefixes.
+// rather than relying on a text convention like unified diff's +/-
+// prefixes.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DiffLine {
     Added(String),

@@ -41,9 +41,8 @@ fn submit_user_message_gets_a_real_reply_from_local_ollama() {
         // advertises any tools, so it should be impossible for this to
         // ever produce a ToolCall event.
         CoreEvent::ToolCall { .. } => panic!("unexpected tool call from Ollama: {:?}", events[0]),
-        CoreEvent::WriteProposed { .. } => panic!(
-            "unexpected write proposal from Ollama: {:?}",
-            events[0]
-        ),
+        CoreEvent::WriteProposed { .. } => {
+            panic!("unexpected write proposal from Ollama: {:?}", events[0])
+        }
     }
 }

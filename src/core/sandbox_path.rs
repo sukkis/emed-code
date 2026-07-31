@@ -235,10 +235,10 @@ mod tests {
         assert_eq!(result, Err(SandboxError::NotFound));
     }
 
-    // Phase 4 Step 1: a write-oriented constructor, for a target that
-    // may not exist yet (write_file can create a new file, not just
-    // overwrite one). Unlike SandboxPath::new, only the *parent*
-    // directory needs to already exist.
+    // A write-oriented constructor, for a target that may not exist yet
+    // (write_file can create a new file, not just overwrite one).
+    // Unlike SandboxPath::new, only the *parent* directory needs to
+    // already exist.
     #[test]
     fn sandbox_path_new_for_write_accepts_a_new_file_in_an_existing_directory() {
         let root = TempDir::new();
