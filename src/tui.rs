@@ -4,10 +4,12 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use crate::core::{Core, CoreEvent};
+use crate::core::{ConfirmationChoice, Core, CoreEvent, DiffLine};
 
 const SCROLL_STEP: usize = 1;
 const PAGE_SCROLL_STEP: usize = 5;
@@ -30,7 +32,73 @@ fn format_core_event(event: CoreEvent) -> String {
             Ok(_) => format!("tool: {name}({arguments}) -> ok"),
             Err(error) => format!("tool: {name}({arguments}) -> error: {error}"),
         },
+        // Kept only for this match's exhaustiveness — App::apply_core_events
+        // intercepts CoreEvent::WriteProposed before it ever reaches
+        // format_core_event in the real app, since it needs the real
+        // colored diff + numbered menu, not plain text. Unreachable from
+        // the live app, but the type is still CoreEvent, so this arm has
+        // to exist for the match to compile.
+        CoreEvent::WriteProposed { path, diff } => {
+            format!("write proposed: {path} ({} lines)", diff.len())
+        }
         CoreEvent::Error(message) => format!("error: {message}"),
+    }
+}
+
+// Turns diff data into styled lines — a red background for removed, a
+// green background for added, unstyled for unchanged (matches Claude
+// Code's own diff display: a colored line band, not colored text —
+// this leaves room for per-line syntax highlighting later without the
+// two competing for the same visual channel). Each line keeps a
+// "+"/"-"/" " text prefix alongside its color, same convention as a
+// unified diff, so a terminal without color support (or a color-blind
+// user) still gets a real signal, not just a color-only distinction.
+// This is the first per-line-styled content anywhere in this TUI —
+// everything else is plain, unstyled text.
+//
+// The background only covers the line's own text, not the full render
+// width (that would need padding to a width this pure function doesn't
+// know) — revisit once there's a concrete reason to pad to width.
+fn render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>> {
+    diff.iter()
+        .map(|line| match line {
+            DiffLine::Added(text) => {
+                Line::styled(format!("+{text}"), Style::new().bg(Color::Green))
+            }
+            DiffLine::Removed(text) => {
+                Line::styled(format!("-{text}"), Style::new().bg(Color::Red))
+            }
+            DiffLine::Unchanged(text) => Line::from(format!(" {text}")),
+        })
+        .collect()
+}
+
+// One entry in the chat log — an enum, not a plain String, specifically
+// so a proposed write's diff can carry real per-line color through to
+// rendering (Text's word-wrapping/plain-string treatment doesn't apply
+// to it the way it does to everything else). pub, matching every other
+// data type App::log() and friends expose (CoreEvent, Message, ...) —
+// App::log() is itself a pub fn, so its element type needs to be too.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogEntry {
+    Text(String),
+    Diff { path: String, diff: Vec<DiffLine> },
+}
+
+// Turns one log entry into the wrapped/styled lines draw() renders.
+// Text wraps to width same as always; Diff gets a plain header line
+// (what's being proposed) followed by render_diff_lines' colored
+// output — not wrapped to width yet, same known limitation
+// render_diff_lines itself already documents (no edge-to-edge
+// background band either, for the same reason).
+fn render_log_entry(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
+    match entry {
+        LogEntry::Text(text) => wrap_text(text, width).into_iter().map(Line::from).collect(),
+        LogEntry::Diff { path, diff } => {
+            let mut lines = vec![Line::from(format!("Apply this change to {path}?"))];
+            lines.extend(render_diff_lines(diff));
+            lines
+        }
     }
 }
 
@@ -148,28 +216,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let chat_block = Block::bordered().title(chat_title);
     let chat_inner = chat_block.inner(chat_area);
 
-    let wrapped_lines: Vec<String> = app
+    let rendered_lines: Vec<Line<'static>> = app
         .log()
         .iter()
-        .flat_map(|entry| wrap_text(entry, chat_inner.width as usize))
+        .flat_map(|entry| render_log_entry(entry, chat_inner.width as usize))
         .collect();
     let visible_height = chat_inner.height as usize;
-    app.set_max_scroll(wrapped_lines.len().saturating_sub(visible_height));
-    let skip = chat_scroll_skip(wrapped_lines.len(), visible_height, app.scroll_offset());
+    app.set_max_scroll(rendered_lines.len().saturating_sub(visible_height));
+    let skip = chat_scroll_skip(rendered_lines.len(), visible_height, app.scroll_offset());
 
-    let chat_text = wrapped_lines.join("\n");
-    let chat = Paragraph::new(chat_text)
+    let chat = Paragraph::new(Text::from(rendered_lines))
         .block(chat_block)
         .scroll((skip, 0));
     frame.render_widget(chat, chat_area);
 
-    let input_block = Block::bordered().title("input");
-    let input_inner = input_block.inner(input_area);
-    let input = Paragraph::new(app.input_buffer()).block(input_block);
-    frame.render_widget(input, input_area);
+    // While a write is pending confirmation, the bottom area becomes a
+    // numbered menu instead of the normal typed-input box — chat input
+    // is blocked in this state (App::handle_key) anyway, so there's
+    // nothing meaningful to type or position a cursor in.
+    if let Some(path) = app.pending_confirmation() {
+        let menu_block = Block::bordered().title(format!("confirm write to {path}?"));
+        let menu = Paragraph::new("1. Yes (recommended)   2. No").block(menu_block);
+        frame.render_widget(menu, input_area);
+    } else {
+        let input_block = Block::bordered().title("input");
+        let input_inner = input_block.inner(input_area);
+        let input = Paragraph::new(app.input_buffer()).block(input_block);
+        frame.render_widget(input, input_area);
 
-    let cursor_x = input_inner.x + app.input_buffer().chars().count() as u16;
-    frame.set_cursor_position((cursor_x, input_inner.y));
+        let cursor_x = input_inner.x + app.input_buffer().chars().count() as u16;
+        frame.set_cursor_position((cursor_x, input_inner.y));
+    }
 }
 
 #[derive(Debug, Default)]
@@ -228,13 +305,19 @@ impl ProviderLabel {
 
 pub struct App {
     input: InputBox,
-    log: Vec<String>,
+    log: Vec<LogEntry>,
     core: Core,
     provider_label: ProviderLabel,
     scroll_offset: usize,
     // True ceiling for scroll_offset, as of the last draw call. Stale by
     // at most one frame — see scroll_up's doc comment.
     max_scroll: usize,
+    // Some(path) while a write_file confirmation is outstanding; None
+    // otherwise. Presence alone (not a separate bool) drives both
+    // App::handle_key's input routing and draw's menu-vs-input-box
+    // choice, since both need the same "am I waiting" fact and the menu
+    // additionally needs the path to render its title.
+    pending_confirmation: Option<String>,
 }
 
 impl Default for App {
@@ -256,6 +339,7 @@ impl App {
             provider_label,
             scroll_offset: 0,
             max_scroll: 0,
+            pending_confirmation: None,
         }
     }
 
@@ -265,7 +349,8 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Enter => self.submit(),
+            // Scrolling always works, pending confirmation or not — a
+            // long diff should be reviewable before deciding.
             KeyCode::Up => {
                 self.scroll_offset = scroll_up(self.scroll_offset, SCROLL_STEP, self.max_scroll)
             }
@@ -277,8 +362,26 @@ impl App {
             KeyCode::PageDown => {
                 self.scroll_offset = scroll_down(self.scroll_offset, PAGE_SCROLL_STEP)
             }
+            // While awaiting confirmation, every other key is routed
+            // here instead of falling through to normal chat input —
+            // 1/2 act immediately (no Enter needed), Enter alone
+            // defaults to the recommended choice (1/Apply), anything
+            // else is simply ignored rather than reaching InputBox.
+            _ if self.pending_confirmation.is_some() => match key.code {
+                KeyCode::Char('1') | KeyCode::Enter => {
+                    self.resolve_confirmation(ConfirmationChoice::Apply)
+                }
+                KeyCode::Char('2') => self.resolve_confirmation(ConfirmationChoice::Decline),
+                _ => {}
+            },
+            KeyCode::Enter => self.submit(),
             _ => self.input.handle_key(key),
         }
+    }
+
+    fn resolve_confirmation(&mut self, choice: ConfirmationChoice) {
+        self.core.respond_to_confirmation(choice);
+        self.pending_confirmation = None;
     }
 
     fn submit(&mut self) {
@@ -288,7 +391,7 @@ impl App {
         }
 
         self.core.submit_user_message(text.clone());
-        self.log.push(format!("you: {text}"));
+        self.log.push(LogEntry::Text(format!("you: {text}")));
         self.scroll_offset = 0;
     }
 
@@ -305,12 +408,27 @@ impl App {
     // no reset needed.
     fn apply_core_events(&mut self, events: Vec<CoreEvent>) {
         for event in events {
-            self.log.push(format_core_event(event));
+            match event {
+                // Intercepted here rather than going through
+                // format_core_event — this needs the real colored diff
+                // (as its own LogEntry::Diff) and to flip pending
+                // confirmation state, neither of which a pure
+                // CoreEvent -> String mapping can do.
+                CoreEvent::WriteProposed { path, diff } => {
+                    self.pending_confirmation = Some(path.clone());
+                    self.log.push(LogEntry::Diff { path, diff });
+                }
+                other => self.log.push(LogEntry::Text(format_core_event(other))),
+            }
         }
     }
 
-    pub fn log(&self) -> &[String] {
+    pub fn log(&self) -> &[LogEntry] {
         &self.log
+    }
+
+    pub fn pending_confirmation(&self) -> Option<&str> {
+        self.pending_confirmation.as_deref()
     }
 
     pub fn provider_label(&self) -> ProviderLabel {
@@ -601,7 +719,7 @@ mod tests {
 
         app.handle_key(press(KeyCode::Enter));
 
-        assert_eq!(app.log(), &["you: hi".to_string()]);
+        assert_eq!(app.log(), &[LogEntry::Text("you: hi".to_string())]);
         assert_eq!(app.input_buffer(), "");
     }
 
@@ -740,6 +858,51 @@ mod tests {
         );
     }
 
+    // Tests render_diff_lines directly against constructed DiffLine
+    // data, independent of how a real diff reaches the chat log.
+    #[test]
+    fn render_diff_lines_colors_added_and_removed_line_backgrounds_and_leaves_unchanged_plain() {
+        use ratatui::style::Color;
+
+        let diff = vec![
+            DiffLine::Unchanged("same".to_string()),
+            DiffLine::Removed("old".to_string()),
+            DiffLine::Added("new".to_string()),
+        ];
+
+        let lines = render_diff_lines(&diff);
+
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines.clone()), frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 1)].bg, Color::Red);
+        assert_eq!(buffer[(0, 2)].bg, Color::Green);
+    }
+
+    // The +/-/space text prefix must survive alongside the color, so a
+    // terminal without color support (or a color-blind user) still gets
+    // a real signal, not just an invisible-without-color distinction.
+    #[test]
+    fn render_diff_lines_keeps_a_text_prefix_alongside_color() {
+        let diff = vec![
+            DiffLine::Unchanged("same".to_string()),
+            DiffLine::Removed("old".to_string()),
+            DiffLine::Added("new".to_string()),
+        ];
+
+        let lines = render_diff_lines(&diff);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert_eq!(texts, vec![" same", "-old", "+new"]);
+    }
+
     #[test]
     fn scroll_up_increases_offset_by_step() {
         assert_eq!(scroll_up(0, 1, 10), 1);
@@ -865,6 +1028,134 @@ mod tests {
         assert_ne!(
             content_at_top, content_after_one_down,
             "expected a single Down press to move the view immediately, even after scrolling far past the top"
+        );
+    }
+
+    #[test]
+    fn write_proposed_event_sets_pending_confirmation() {
+        let mut app = App::new();
+
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![DiffLine::Added("hello".to_string())],
+        }]);
+
+        assert_eq!(app.pending_confirmation(), Some("notes.txt"));
+    }
+
+    #[test]
+    fn pressing_1_while_awaiting_confirmation_resolves_it() {
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![],
+        }]);
+
+        app.handle_key(press(KeyCode::Char('1')));
+
+        assert_eq!(app.pending_confirmation(), None);
+    }
+
+    #[test]
+    fn pressing_enter_while_awaiting_confirmation_defaults_to_apply() {
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![],
+        }]);
+
+        app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.pending_confirmation(), None);
+    }
+
+    #[test]
+    fn pressing_2_while_awaiting_confirmation_resolves_it() {
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![],
+        }]);
+
+        app.handle_key(press(KeyCode::Char('2')));
+
+        assert_eq!(app.pending_confirmation(), None);
+    }
+
+    #[test]
+    fn typing_while_awaiting_confirmation_does_not_reach_the_input_box() {
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![],
+        }]);
+
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        assert_eq!(app.input_buffer(), "");
+        assert_eq!(app.pending_confirmation(), Some("notes.txt"));
+    }
+
+    #[test]
+    fn scrolling_still_works_while_awaiting_confirmation() {
+        let mut app = App::new();
+        let words: Vec<String> = (1..=40).map(|n| format!("w{n}")).collect();
+        type_and_submit(&mut app, &words.join(" "));
+        rendered_content(&mut app);
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![],
+        }]);
+
+        app.handle_key(press(KeyCode::Up));
+
+        assert_eq!(app.scroll_offset(), 1);
+    }
+
+    // The point of this test: the colored diff and numbered menu
+    // actually reach the rendered frame via App::apply_core_events +
+    // draw, not just that the underlying pieces (render_diff_lines,
+    // pending_confirmation) work in isolation.
+    #[test]
+    fn draws_a_write_proposal_with_colored_diff_and_confirmation_menu() {
+        use ratatui::style::Color;
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.apply_core_events(vec![CoreEvent::WriteProposed {
+            path: "notes.txt".to_string(),
+            diff: vec![
+                DiffLine::Removed("old line".to_string()),
+                DiffLine::Added("new line".to_string()),
+            ],
+        }]);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        assert!(
+            content.contains("notes.txt"),
+            "expected the proposed path to render: {content:?}"
+        );
+        assert!(
+            content.contains("old line") && content.contains("new line"),
+            "expected the diff's line text to render: {content:?}"
+        );
+        assert!(
+            content.contains("Yes") && content.contains("No"),
+            "expected the numbered confirmation menu to render: {content:?}"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.bg == Color::Red),
+            "expected at least one cell with the removed-line background color"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.bg == Color::Green),
+            "expected at least one cell with the added-line background color"
         );
     }
 

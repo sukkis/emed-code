@@ -1,181 +1,123 @@
 # Security
 
-Current security posture and open gaps. This tracks *status*, not
-rationale — see `ARCHITECTURE.md` for the why behind a given decision.
+Current security posture — what's protected, how, and what isn't
+addressed yet. See `ARCHITECTURE.md` for the reasoning behind these
+choices; this document tracks position, not rationale.
 
-## Current status (implemented)
+## Overview
 
-### Phase 1 — Ollama, local-only
+emed-code hands an LLM the ability to read, and eventually write, files
+in your project, plus your Mistral API key if you use the cloud
+provider. The threats that follow from that:
 
-No credentials, API keys, or secrets of any kind are read, stored, or
-transmitted anywhere in the codebase. The only network calls are to a
-local Ollama instance (`http://localhost`). Nothing here to leak.
+- **Credential leakage** — the Mistral API key ending up somewhere it
+  shouldn't (logs, error messages, a request going to the wrong place).
+- **Sandbox escape** — a tool call reading or writing outside the
+  directory you launched emed-code from.
+- **Sensitive-file exposure** — a tool reading (and thereby sending to
+  a cloud provider) or overwriting a file like `.env` or an SSH key,
+  whether the model asks for it directly or via a symlink.
+- **Unsupervised writes** — any write happening without a human seeing
+  a diff and approving it first.
+- **Self-modifying security policy** — a compromised or
+  prompt-injected model trying to loosen its own restrictions by
+  editing the settings file that defines them.
 
-### Mistral credential resolution + a real request path (Phase 2)
+Each is addressed below under its own heading.
 
-`resolve_mistral_api_key`/`lookup_mistral_api_key` in `src/core.rs`:
-`getfrompass` (key `emed-code/mistral/api_key`) first, `MISTRAL_API_KEY`
-env var fallback if `pass` yields no value, `pass` preferred whenever
-both are present. Only `getfrompass::try_get_from_pass` is called —
-never the panicking `get_from_pass` or any write function.
+## Credential handling
 
-The resolved key is held as `Zeroizing<String>` regardless of which
-source supplied it, and passed into `MistralClient::new`, which uses it
-only to build the outgoing `Authorization: Bearer <key>` header in
-`fetch_mistral_reply`. A startup log line (`credential_log_message`)
-reports which source supplied the key, never the value, and
-deliberately names `getfrompass` rather than `pass` — see
-`ARCHITECTURE.md`.
+The Mistral API key is resolved via `getfrompass` first, falling back
+to the `MISTRAL_API_KEY` environment variable only when `getfrompass`
+has no value. Only the non-panicking `try_get_from_pass` is ever
+called — never a write function. The key is held as `Zeroizing<String>`
+regardless of source, used only to build the outgoing
+`Authorization` header, and never appears in a `ChatError` or any log
+line — a startup message reports *which source* supplied the key, never
+the value.
 
-Verified no key leakage into errors: the key is never passed into any
-`ChatError` variant; even a malformed key that fails header-value
-construction surfaces only a static `"failed to parse header value"`
-message (confirmed against the `http` crate's `InvalidHeaderValue`
-`Display` impl), not the attempted value.
+A missing key produces a clear error before the terminal UI even opens,
+rather than the app starting with no working provider.
 
-Now selectable from `cargo run` via `--provider mistral` (see
-`README.md`); on startup, a missing key produces a clear error before
-the TUI opens, rather than the app starting with no working provider
-(`main.rs` returns an `io::Error` from `lookup_mistral_api_key`'s
-`None` case before any terminal setup happens).
+## Local-first default and provider transparency
 
-### Local-first default
+A plain `cargo run`, with no flags, always defaults to local Ollama —
+never Mistral — so using a cloud provider is always an explicit choice.
+The active provider is shown in the chat title for the entire session,
+not just in a startup line that scrolls out of view once the terminal
+UI takes over, so it's never ambiguous whether a cloud call is in play.
 
-A new install (`cargo run`, no flags) defaults to local Ollama with
-`mistral-nemo` — enforced explicitly by `Cli`'s `default_value_t =
-Provider::Ollama`, not an accident of what's built so far, now that
-Mistral is also a real, selectable choice.
+## Sandboxed file access
 
-### Provider transparency
+`SandboxPath` is the only way any tool touches the filesystem — reads,
+listings, and writes are all validated against it before anything
+happens on disk. Containment is checked against canonicalized
+(symlink-resolved) paths, not lexical `.`/`..` normalization, so a
+symlink placed inside the sandboxed directory but pointing outside it
+is caught, both for existing targets (reads, overwrites) and for the
+write-specific case of a not-yet-existing file's parent directory.
+Rejection errors never include the actual resolved path, so a rejected
+symlink's real target isn't itself disclosed by the refusal.
 
-The active provider is shown in the chat block's title for the entire
-session (`emed-code — AI: local (ollama)` or `... cloud (mistral)`),
-not just in the startup-only credential log line, which scrolls out of
-view once the TUI's alternate screen takes over. A user can't lose
-track of whether a cloud provider is in use.
+## Content-sensitivity filtering
 
-### `SandboxPath` (Phase 3)
+Containment alone doesn't mean a file is appropriate to touch — a
+`.env` sitting legitimately inside your project is still a secret. In
+`strict` mode (the default), reads, listings, and writes all refuse a
+small, deliberately non-exhaustive set of sensitive-by-convention
+paths: `.env`/`.env.*`, the `.ssh` directory (anywhere in the path, not
+just at the root), `.git/config` specifically, and `*.pem`/`*.key`.
+This is checked against the canonicalized path, not the literal string
+a tool call passed in, so a symlink with an innocuous name pointing at
+a blocked file doesn't bypass it. A directory listing still shows a
+blocked entry's *name* (existence isn't hidden) but refuses to
+enumerate into it or read anything inside.
 
-`src/core/sandbox_path.rs`: `SandboxPath::new(root, requested)` is the
-only way to construct one, and it's the only type the file tools
-accept — a raw `PathBuf`/`&str` can't be passed to a tool function.
+`loose` mode disables this filtering entirely — an explicit,
+user-chosen tradeoff, not a default.
 
-Containment is checked against `std::fs::canonicalize`d paths (both
-`root` and the requested path), not lexical-only `.`/`..`
-normalization — verified via a real symlink test: a symlink placed
-*inside* the sandbox root pointing *outside* it is correctly rejected,
-which a string-only check would have missed. This matters because tool
-output (file contents) feeds back into the LLM conversation, making an
-escaped read a real prompt-injection-adjacent exfiltration path, not a
-theoretical one.
+## Unsupervised-write protection
 
-Rejection errors (`SandboxError::Escapes`/`NotFound`) are fixed,
-hand-written strings that never include the actual resolved path, so a
-rejected symlink's real target isn't itself disclosed via the error.
+Writing to disk always requires a human to see a diff and explicitly
+approve it first — there's no code path where a write happens without
+that. A proposed write is validated (sandbox + content-sensitivity
+filtering, identical to a read) *before* anything is even shown for
+approval, so a forbidden path never reaches the confirmation prompt at
+all. If the confirmation channel is ever interrupted (e.g. the app
+closing mid-prompt) the write is treated as declined, never applied.
 
-Fully wired into a real, live code path, verified against the real
-API: `Core`'s agent loop calls `tools::dispatch`, which calls
-`read_file`/`list_files`, which construct a `SandboxPath` before
-touching the filesystem at all. `MistralClient::send` advertises
-`tools::tool_definitions()` in every real request and parses
-`tool_calls` from the real response — `cargo run -- --provider
-mistral` can genuinely read files for you. A local-gated end-to-end
-test against the real Mistral API (not just a fake test client)
-confirms a task requiring multiple tool calls (list a directory, then
-read a file in it) completes correctly.
+This is offered to Mistral alongside the read tools — Ollama has no
+tool-calling at all yet, so it can't reach any of this either way.
 
-### 40-tool-call cap
+## Settings tamper-resistance
 
-The 40-tool-call cap and per-batch rejection are implemented and
-tested — a scripted client that never stops requesting tool calls is
-proven to terminate with a clear error after exactly 40 individual
-calls, not hang or loop unboundedly.
+`~/.config/emed-code/settings.toml` (the file that controls
+`strict`/`loose` filtering) lives outside the sandboxed directory
+entirely, resolved via the OS's own config-directory convention rather
+than a project-relative path. This means no file-writing tool this
+project builds can ever reach or modify it, however it's invoked —
+closing off a specific attack shape where a compromised or
+prompt-injected model tries to loosen its own restrictions by editing
+the policy that constrains it. The same reasoning is why the Mistral
+API key goes through `getfrompass` rather than a project-local file:
+anything that gates what the model can do must live somewhere its own
+tool access structurally cannot reach.
 
-### Tool-call transparency in the running TUI (refined 2026-07-30, after manual testing)
+A missing, empty, or malformed settings file always falls back to
+`strict` — never a crash, never a silent loosening of policy.
 
-Every tool invocation (name, arguments, success/failure) renders in the
-chat log with its own `"tool: "` prefix, distinct from `"emed-code: "`
-(assistant replies) and `"error: "` — extends the same transparency
-reasoning behind the provider indicator above to tool activity
-specifically: a user can see exactly which call ran and whether it
-succeeded, not just that something happened.
+## Runaway tool-call protection
 
-On success, only `"ok"` is shown — not the actual result content
-(`Message::ToolResult` still carries the full content to the model
-regardless, per its own turn in the conversation; only what's
-*displayed* changes). A read file's contents are still sent to the LLM
-provider either way — this doesn't change that (see the
-content-sensitivity-filtering section below for the actual exposure
-surface) — but it does mean file contents aren't *also* echoed into
-the user's own terminal scrollback/tmux pane, which is a real, if
-secondary, reduction in accidental-exposure surface (screen-sharing,
-terminal history, etc.), discovered as a usability rough edge during
-manual testing (dumping whole files into the log made using the
-feature genuinely unpleasant, not just a privacy nicety).
+A single user message is capped at 40 total individual tool calls,
+counted across the whole exchange rather than per round-trip (a
+round-based cap could be sailed through by a model batching many calls
+into one round). Exceeding it ends the exchange with a clear error
+rather than looping unboundedly.
 
-### Settings system: `~/.config/emed-code/settings.toml` (2026-07-31)
+## Out of scope
 
-`src/core/settings.rs`'s `Settings::load()` reads one setting,
-`file_access_security` (`strict`/`loose`, defaulting to `strict`). A
-missing file, an empty file, malformed TOML, or an unrecognized value
-all fail safe to the same `strict` default — never a panic, never a
-fail-open state.
-
-Structurally tamper-resistant: this file cannot be easily tampered with
-by anything emed-code's own tools can reach. It lives outside the
-sandboxed project root that `SandboxPath` bounds, resolved via the OS's
-real config-directory convention (`dirs::config_dir()`), not a
-project-relative path — so even with Phase 4's `write_file` tool, there
-is no path a prompt-injection-driven "edit your own settings to loosen
-file access" attempt could construct that `SandboxPath` would accept,
-short of the model already having arbitrary filesystem access outside
-emed-code entirely. Same reasoning as resolving Mistral's API key via
-`getfrompass` rather than a project-local file: anything that gates
-what the model can do or see must live somewhere the model's own tool
-access structurally cannot reach, not just somewhere it conventionally
-shouldn't.
-
-### Content-sensitivity filtering for `read_file`/`list_files` (Step 8b, 2026-07-31)
-
-`file_access_security` is now consulted on every tool call. In
-`strict` mode (the default), `read_file`/`list_files` refuse a small,
-explicitly non-exhaustive starter set of sensitive-by-convention paths:
-`.env`/`.env.*`, the `.ssh` directory (matched anywhere in the path,
-not just at the root), `.git/config` specifically (not all of `.git`),
-and `*.pem`/`*.key`. `loose` mode skips this check entirely — its one
-distinct behavior so far.
-
-The check matches against the canonicalized, symlink-resolved path
-(`SandboxPath::relative_path()`), not the raw requested string, so a
-symlink with an innocuous name pointing at a blocked file can't bypass
-it — covered by its own regression test.
-
-A blocked path produces the new `ToolError::AccessDenied` (a static
-message; unlike a rejected symlink, there's nothing to hide here, since
-the LLM already knows exactly which path it asked for). `list_files`
-still shows a blocked entry's *name* in its parent directory's listing
-(existence isn't hidden), but refuses to enumerate into a blocked
-directory or return anything inside one.
-
-This closes the content-sensitivity-filtering gap tracked in this
-file's backlog since Step 3 (2026-07-30).
-
-## Backlog (not yet implemented)
-
-Nothing currently tracked here — the content-sensitivity-filtering gap
-open since Step 3 (2026-07-30) was closed by Step 8b above
-(2026-07-31). See `ARCHITECTURE.md` for the starter blocklist's exact
-contents and why it's deliberately non-exhaustive rather than an
-attempt at a complete list.
-
-## Out of scope / not applicable
-
-### emed-code's own credentials
-
-No plaintext secrets files, `.env` parsing, or config-file credential
-storage exist for emed-code's *own* runtime needs (i.e. how it
-authenticates to Mistral), and none are planned — see parent
-`CLAUDE.md`'s "No secrets from plaintext" rule. This is unrelated to —
-and doesn't cover — what a file-reading tool might expose from a
-*user's* project; see the settings/content-sensitivity-filtering
-sections above for that.
+emed-code has no plaintext secrets files, `.env` parsing, or
+config-file credential storage for its *own* runtime needs — none are
+planned. This is separate from, and doesn't cover, what a file-reading
+tool might expose from a *user's* project; see "Content-sensitivity
+filtering" above for that.

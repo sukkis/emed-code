@@ -3,6 +3,7 @@
 // lives in the tui module instead.
 
 mod credentials;
+mod diff;
 mod mistral;
 mod ollama;
 mod sandbox_path;
@@ -10,14 +11,16 @@ mod settings;
 mod tools;
 
 pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
+pub use diff::DiffLine;
 pub use mistral::MistralClient;
 pub use ollama::OllamaClient;
 
+pub(crate) use diff::generate_diff;
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
 pub(crate) use settings::{FileAccessSecurity, Settings};
-use tools::{dispatch, tool_definitions};
+use tools::{dispatch, tool_definitions, write_file_with_confirmation};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -46,7 +49,26 @@ pub enum CoreEvent {
         // actual (short, useful) message in full.
         result: Result<String, String>,
     },
+    // A write_file call awaiting user confirmation — the agent loop's
+    // background thread blocks right after sending this, until
+    // Core::respond_to_confirmation is called. No correlating id: the
+    // loop processes tool calls one at a time, so only one of these can
+    // ever be outstanding at once.
+    WriteProposed {
+        path: String,
+        diff: Vec<DiffLine>,
+    },
     Error(String),
+}
+
+// The user's answer to a WriteProposed prompt. An enum, not a bool —
+// matches every other enum-of-kinds decision in this codebase, and
+// reads clearly at the call site (respond_to_confirmation(Apply), not
+// respond_to_confirmation(true)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConfirmationChoice {
+    Apply,
+    Decline,
 }
 
 // One entry in the conversation history. An enum, not a flat struct with
@@ -151,6 +173,7 @@ fn run_agent_loop(
     file_access_security: FileAccessSecurity,
     mut history: Vec<Message>,
     tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
 ) {
     let tool_defs = tool_definitions();
     let mut tool_call_count = 0usize;
@@ -177,7 +200,20 @@ fn run_agent_loop(
                     // The model needs the full content either way (what
                     // was read, or why it failed) — only the CoreEvent
                     // sent to the TUI distinguishes Ok from Err.
-                    let dispatch_result = dispatch(root, file_access_security, &call);
+                    // write_file needs the confirmation channel dispatch
+                    // doesn't have, so it's routed separately rather
+                    // than folded into dispatch's uniform signature.
+                    let dispatch_result = if call.name == "write_file" {
+                        write_file_with_confirmation(
+                            root,
+                            file_access_security,
+                            &call,
+                            tx,
+                            confirm_rx,
+                        )
+                    } else {
+                        dispatch(root, file_access_security, &call)
+                    };
                     let content_for_history = match &dispatch_result {
                         Ok(output) => output.clone(),
                         Err(e) => e.to_string(),
@@ -213,6 +249,12 @@ pub struct Core {
     history: Vec<Message>,
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
+    // A fresh channel is created per submit_user_message call (mirrors
+    // the fresh thread spawned each time) — Core keeps the Sender half
+    // so respond_to_confirmation can reach whichever loop is currently
+    // running; the Receiver half moves into that loop's thread. None
+    // until the first message is submitted.
+    confirm_tx: Option<mpsc::Sender<ConfirmationChoice>>,
 }
 
 impl Default for Core {
@@ -237,11 +279,15 @@ impl Core {
             history: Vec::new(),
             tx,
             rx,
+            confirm_tx: None,
         }
     }
 
     pub fn submit_user_message(&mut self, text: String) {
         self.history.push(Message::User { content: text });
+
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        self.confirm_tx = Some(confirm_tx);
 
         let tx = self.tx.clone();
         let client = Arc::clone(&self.client);
@@ -249,8 +295,25 @@ impl Core {
         let root = self.root.clone();
         let file_access_security = self.settings.file_access_security;
         thread::spawn(move || {
-            run_agent_loop(&client, &root, file_access_security, history, &tx);
+            run_agent_loop(
+                &client,
+                &root,
+                file_access_security,
+                history,
+                &tx,
+                &confirm_rx,
+            );
         });
+    }
+
+    // Answers a pending WriteProposed prompt. A no-op if nothing is
+    // actually waiting (confirm_tx unset, or its receiving thread
+    // already gone) — sending into a channel nobody's listening to just
+    // errors silently, which is fine here.
+    pub fn respond_to_confirmation(&mut self, choice: ConfirmationChoice) {
+        if let Some(tx) = &self.confirm_tx {
+            let _ = tx.send(choice);
+        }
     }
 
     pub fn poll_events(&mut self) -> Vec<CoreEvent> {
@@ -284,6 +347,11 @@ impl Core {
                         content,
                     });
                 }
+                // Not itself a tool result — history only gains a
+                // ToolCalls/ToolResult pair once the eventual
+                // CoreEvent::ToolCall (outcome: applied or declined)
+                // arrives, same as every other tool call.
+                CoreEvent::WriteProposed { .. } => {}
                 CoreEvent::Error(_) => {}
             }
             events.push(event);
@@ -419,6 +487,7 @@ mod tests {
             history: Vec::new(),
             tx,
             rx,
+            confirm_tx: None,
         }
     }
 
@@ -601,5 +670,77 @@ mod tests {
         let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
 
         assert!(matches!(events[0], CoreEvent::Error(_)));
+    }
+
+    // The real cross-thread blocking. Deliberately observes the file
+    // *doesn't* exist yet right after WriteProposed arrives — proving
+    // the background thread is still paused, not just that
+    // respond_to_confirmation eventually produces the right
+    // outcome regardless of timing.
+    #[test]
+    fn agent_loop_blocks_on_write_confirmation_then_applies_it() {
+        let root = TempDir::new();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path": "new.txt", "content": "hello"}"#.to_string(),
+        };
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("wrote it".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("write a file".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+        match &events[0] {
+            CoreEvent::WriteProposed { path, .. } => assert_eq!(path, "new.txt"),
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+        assert!(!root.path().join("new.txt").exists());
+
+        core.respond_to_confirmation(ConfirmationChoice::Apply);
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+        assert!(matches!(
+            events[0],
+            CoreEvent::ToolCall { result: Ok(_), .. }
+        ));
+        assert_eq!(events[1], CoreEvent::AssistantChunk("wrote it".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn agent_loop_produces_a_declined_tool_result_when_write_is_declined() {
+        let root = TempDir::new();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path": "new.txt", "content": "hello"}"#.to_string(),
+        };
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("ok, not writing".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("write a file".to_string());
+
+        poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+        core.respond_to_confirmation(ConfirmationChoice::Decline);
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+        match &events[0] {
+            CoreEvent::ToolCall {
+                result: Err(message),
+                ..
+            } => assert!(message.contains("declined")),
+            other => panic!("expected a declined ToolCall error, got {other:?}"),
+        }
+        assert!(!root.path().join("new.txt").exists());
     }
 }

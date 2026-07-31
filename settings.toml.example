@@ -2,7 +2,7 @@
 # liking. If that file doesn't exist (or fails to parse), emed-code
 # falls back to the defaults shown here.
 
-# Controls which files read_file/list_files will touch.
+# Controls which files read_file/list_files/write_file will touch.
 #   strict (default) — refuses .env/.env.*, .ssh/, .git/config, *.pem,
 #                       *.key (a small, non-exhaustive starter list)
 #   loose             — no content-sensitivity filtering

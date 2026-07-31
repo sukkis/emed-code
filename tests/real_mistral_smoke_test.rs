@@ -75,6 +75,12 @@ fn submit_user_message_gets_a_real_reply_from_mistral() {
                 events[0]
             )
         }
+        // write_file isn't advertised to any provider yet — impossible
+        // for a real model to trigger this today.
+        CoreEvent::WriteProposed { .. } => panic!(
+            "unexpected write proposal for a prompt needing none: {:?}",
+            events[0]
+        ),
     }
 }
 
