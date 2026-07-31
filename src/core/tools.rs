@@ -125,6 +125,62 @@ fn list_files(
     Ok(names.join("\n"))
 }
 
+fn list_files_recursive(
+    root: &Path,
+    requested: &Path,
+    // Unused until Step 2 adds restricted-path/noise-directory skipping.
+    _file_access_security: FileAccessSecurity,
+) -> Result<String, ToolError> {
+    let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+
+    // relative_path() is empty for the project root itself (querying
+    // "."), so this naturally starts every entry unprefixed rather than
+    // needing a "." special case.
+    let relative_prefix = sandbox_path.relative_path().to_string_lossy().into_owned();
+
+    let mut entries = Vec::new();
+    walk_recursive(sandbox_path.as_path(), &relative_prefix, &mut entries)?;
+    entries.sort();
+    Ok(entries.join("\n"))
+}
+
+// Paths are joined as plain strings, not via PathBuf, so the output is
+// always "/"-separated regardless of platform — this string is read by
+// an LLM and fed back into read_file/write_file's own path argument,
+// not used as a real filesystem path itself.
+//
+// file_type() (not metadata()) is what makes symlinked directories leaf
+// entries for free: it reports a symlink's own type, never following
+// it, so is_dir() is simply false for a symlink and it falls straight
+// into the leaf branch below with no special-casing needed.
+fn walk_recursive(
+    absolute_dir: &Path,
+    relative_prefix: &str,
+    entries: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    let read_dir = std::fs::read_dir(absolute_dir).map_err(|_| ToolError::IoFailure)?;
+
+    for entry in read_dir {
+        let entry = entry.map_err(|_| ToolError::IoFailure)?;
+        let file_type = entry.file_type().map_err(|_| ToolError::IoFailure)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative_path = if relative_prefix.is_empty() {
+            name
+        } else {
+            format!("{relative_prefix}/{name}")
+        };
+
+        if file_type.is_dir() {
+            entries.push(format!("{relative_path}/"));
+            walk_recursive(&entry.path(), &relative_path, entries)?;
+        } else {
+            entries.push(relative_path);
+        }
+    }
+
+    Ok(())
+}
+
 // pub(crate): called both by write_file_with_confirmation below (after
 // a user has already approved the write) and, eventually, tests. Same
 // sandboxing + blocklist checks as read_file/list_files, plus the
@@ -355,6 +411,86 @@ mod tests {
         let result = list_files(root.path(), Path::new("."), FileAccessSecurity::Strict);
 
         assert_eq!(result, Ok("a.txt\nb.txt".to_string()));
+    }
+
+    // Directories get their own entry (trailing "/") at every level, not
+    // just files — extends list_files's existing one-level behavior
+    // (which already shows both kinds) rather than losing information
+    // relative to it.
+    #[test]
+    fn list_files_recursive_returns_sorted_root_relative_paths_for_nested_entries() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("src").join("core")).unwrap();
+        std::fs::write(root.path().join("src").join("main.rs"), "").unwrap();
+        std::fs::write(root.path().join("src").join("core").join("mod.rs"), "").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(
+            result,
+            Ok("notes.txt\nsrc/\nsrc/core/\nsrc/core/mod.rs\nsrc/main.rs".to_string())
+        );
+    }
+
+    // The whole point of this tool: paths are anchored to the project
+    // root regardless of what directory was actually queried, so a
+    // result can be fed directly into read_file/write_file with no
+    // recomposition — querying "src" still returns "src/core/mod.rs",
+    // not "core/mod.rs". Note "src" itself isn't in the output: querying
+    // a directory lists what's inside it, not the directory itself,
+    // matching list_files's own existing behavior.
+    #[test]
+    fn list_files_recursive_returns_paths_relative_to_the_root_not_the_queried_directory() {
+        let root = TempDir::new();
+        std::fs::create_dir_all(root.path().join("src").join("core")).unwrap();
+        std::fs::write(root.path().join("src").join("main.rs"), "").unwrap();
+        std::fs::write(root.path().join("src").join("core").join("mod.rs"), "").unwrap();
+
+        let result =
+            list_files_recursive(root.path(), Path::new("src"), FileAccessSecurity::Strict);
+
+        assert_eq!(
+            result,
+            Ok("src/core/\nsrc/core/mod.rs\nsrc/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn list_files_recursive_shows_an_empty_directory_with_a_trailing_slash() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("empty_dir")).unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok("empty_dir/".to_string()));
+    }
+
+    // A symlinked directory is listed like any other entry but never
+    // descended into — no trailing "/" either, since that would assert
+    // something about what it resolves to, which the walk deliberately
+    // never checks (DirEntry::file_type() reports a symlink's own type,
+    // not its target's, so this falls out of the walk's is_dir() check
+    // with no special-casing needed). Avoids both cycle risk (a symlink
+    // could point at an ancestor) and symlink-escape risk, for free.
+    #[test]
+    #[cfg(unix)]
+    fn list_files_recursive_lists_a_symlinked_directory_as_a_leaf_without_descending_into_it() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("real_target")).unwrap();
+        std::fs::write(root.path().join("real_target").join("secret.txt"), "").unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("real_target"),
+            root.path().join("link_dir"),
+        )
+        .unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(
+            result,
+            Ok("link_dir\nreal_target/\nreal_target/secret.txt".to_string())
+        );
     }
 
     #[test]
