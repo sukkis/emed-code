@@ -104,6 +104,21 @@ order and `tool_call_id` correlation are what actually matter for a
 correct conversation, not whether the calls are grouped into one
 message or several.
 
+`Message::ToolResult` carries both a `tool_call_id` and the tool's own
+`name`, even though Mistral's wire format only ever needs the id.
+Ollama's `/api/chat` has no id concept at all — it correlates a result
+back to its request purely by tool name — so `OllamaClient` needs the
+name sitting directly on the result rather than scanning back through
+history for the matching `ToolCalls` entry. `OllamaClient` also
+synthesizes its own per-turn `ToolCall.id` (a simple counter; Ollama's
+response never includes one), used only for this project's own internal
+bookkeeping and never sent back over the wire. The one residual gap,
+not fixable from this side: Ollama's name-based correlation is
+inherently ambiguous if a model calls the same tool twice in one
+turn — results are sent back in call order as the best available
+mitigation, same as Mistral's own id-based correlation would fall back
+to if two calls ever somehow shared an id.
+
 History is mutated only on the thread that calls `poll_events()`, never
 on the background thread doing the network round-trip. That thread
 gets its own cloned snapshot of history to send; `Core`'s persistent

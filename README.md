@@ -12,11 +12,11 @@ Mistral's cloud API without leaving your terminal or tmux session.
   you're never surprised by a cloud call.
 - **Remembers the conversation.** Follow-up questions just work — no
   need to repeat context turn after turn.
-- **Understands your project.** With Mistral, it can read and list
-  files to answer real questions about your code — sandboxed to the
-  directory you launched it from, every file access shown transparently
-  in the chat log, and sensitive files (`.env`, `.ssh`, private keys)
-  refused by default.
+- **Understands your project.** It can read and list files to answer
+  real questions about your code, whichever provider you're talking
+  to — sandboxed to the directory you launched it from, every file
+  access shown transparently in the chat log, and sensitive files
+  (`.env`, `.ssh`, private keys) refused by default.
 - **Never writes blind.** It can create or edit files too, but always
   shows a colored diff and waits for your explicit approval first —
   nothing is written to disk without you seeing it.
@@ -41,9 +41,9 @@ Mistral needs an API key — either a `getfrompass` entry
 Ask it things like "what files are in this project?", "read Cargo.toml
 and tell me the package name", or "add a `.gitignore` entry for
 `target/`" — reads and writes are both sandboxed to wherever you
-launched it from, and any write shows you a diff to approve first.
-Ollama is chat-only for now; file-aware tools are Mistral-only until
-local tool-calling is built (see Roadmap).
+launched it from, and any write shows you a diff to approve first. This
+works the same way whether you're talking to a local Ollama model or
+Mistral's cloud API.
 
 Want to change which files it's willing to touch? Copy
 `settings.toml.example` to `~/.config/emed-code/settings.toml` and edit
@@ -68,9 +68,13 @@ why.
 
 ## Roadmap
 
-- Tool-calling for local Ollama models, not just Mistral
 - A directory-creation tool, with its own confirmation and security
   posture
+- An append/insert tool distinct from `write_file`'s whole-file
+  replace, so adding a line doesn't depend on the model correctly
+  reconstructing the entire file's contents
+- `list_files_recursive`, so a nested directory can be discovered in
+  one call instead of requiring the model to drill down level by level
 - Token/context usage shown in the UI
 - Independent read/write file-access strictness settings
 - Syntax-highlighted diffs
