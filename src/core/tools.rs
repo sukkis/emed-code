@@ -313,6 +313,25 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "list_files_recursive".to_string(),
+            description: "Recursively list every file and directory nested under a directory \
+                in the project, not just its immediate children. Returned paths are always \
+                relative to the project root, ready to pass directly to read_file/write_file \
+                without modification. Directories end with a trailing \"/\"; build/VCS noise \
+                (target, .git, node_modules) is shown by name but not descended into."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the directory, relative to the project root. Use \".\" for the project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
             name: "write_file".to_string(),
             description: "Create a new file or overwrite an existing one within the project \
                 directory. Call this directly to propose the change — the system automatically \
@@ -340,7 +359,7 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
 
 // Matches on the tool name first, then parses that specific tool's
 // arguments — not the other way around — so an unrecognized name never
-// has to care about argument shape at all, and a third tool means one
+// has to care about argument shape at all, and a new tool means one
 // new match arm plus one new function, nothing else.
 pub(crate) fn dispatch(
     root: &Path,
@@ -357,6 +376,11 @@ pub(crate) fn dispatch(
             let args: PathArgs = serde_json::from_str(&tool_call.arguments)
                 .map_err(|_| ToolError::MalformedArguments)?;
             list_files(root, Path::new(&args.path), file_access_security)
+        }
+        "list_files_recursive" => {
+            let args: PathArgs = serde_json::from_str(&tool_call.arguments)
+                .map_err(|_| ToolError::MalformedArguments)?;
+            list_files_recursive(root, Path::new(&args.path), file_access_security)
         }
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
@@ -637,6 +661,22 @@ mod tests {
         let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Ok("a.txt".to_string()));
+    }
+
+    #[test]
+    fn dispatch_routes_list_files_recursive_calls() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src").join("a.txt"), "").unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "list_files_recursive".to_string(),
+            arguments: r#"{"path": "."}"#.to_string(),
+        };
+
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
+
+        assert_eq!(result, Ok("src/\nsrc/a.txt".to_string()));
     }
 
     #[test]
@@ -1009,15 +1049,23 @@ mod tests {
     // it's handled separately by write_file_with_confirmation (see
     // run_agent_loop) — so this only guards tool_definitions() itself,
     // not a dispatch/definitions correspondence that no longer holds
-    // for all three tools.
+    // for all four tools.
     #[test]
-    fn tool_definitions_advertises_all_three_tools() {
+    fn tool_definitions_advertises_all_four_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
             .map(|definition| definition.name.as_str())
             .collect();
 
-        assert_eq!(names, vec!["read_file", "list_files", "write_file"]);
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "list_files",
+                "list_files_recursive",
+                "write_file"
+            ]
+        );
     }
 }
