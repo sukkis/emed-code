@@ -1,0 +1,9 @@
+# Copy this file to ~/.config/emed-code/settings.toml and edit to your
+# liking. If that file doesn't exist (or fails to parse), emed-code
+# falls back to the defaults shown here.
+
+# Controls which files read_file/list_files will touch.
+#   strict (default) — refuses .env/.env.*, .ssh/, .git/config, *.pem,
+#                       *.key (a small, non-exhaustive starter list)
+#   loose             — no content-sensitivity filtering
+file_access_security = "strict"

@@ -25,7 +25,15 @@ impl fmt::Display for SandboxError {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct SandboxPath(PathBuf);
+pub(crate) struct SandboxPath {
+    absolute: PathBuf,
+    // Canonicalized (symlink-resolved) and relative to root — kept
+    // alongside `absolute` specifically so the content-sensitivity
+    // blocklist (tools.rs) can match against it instead of the raw
+    // requested string, catching a symlink with an innocuous name that
+    // resolves to a blocked file.
+    relative: PathBuf,
+}
 
 impl SandboxPath {
     // Canonicalizes both root and the joined candidate path itself
@@ -39,15 +47,27 @@ impl SandboxPath {
             .canonicalize()
             .map_err(|_| SandboxError::NotFound)?;
 
-        if canonical.starts_with(&canonical_root) {
-            Ok(SandboxPath(canonical))
-        } else {
-            Err(SandboxError::Escapes)
+        if !canonical.starts_with(&canonical_root) {
+            return Err(SandboxError::Escapes);
         }
+
+        let relative = canonical
+            .strip_prefix(&canonical_root)
+            .expect("just checked canonical starts_with canonical_root")
+            .to_path_buf();
+
+        Ok(SandboxPath {
+            absolute: canonical,
+            relative,
+        })
     }
 
     pub(crate) fn as_path(&self) -> &Path {
-        &self.0
+        &self.absolute
+    }
+
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative
     }
 }
 
@@ -138,6 +158,22 @@ mod tests {
         let result = SandboxPath::new(&root, Path::new("link"));
 
         assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    // The canonicalized, symlink-resolved path relative to root — this
+    // is what the content-sensitivity blocklist (tools.rs) checks,
+    // specifically so a symlink with an innocuous name pointing at a
+    // blocked file (e.g. ".env") can't bypass a check against the
+    // literal requested string.
+    #[test]
+    fn sandbox_path_relative_path_returns_the_path_relative_to_root() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("sub").join("file.txt"), "hi").unwrap();
+
+        let sandbox_path = SandboxPath::new(root.path(), Path::new("sub/file.txt")).unwrap();
+
+        assert_eq!(sandbox_path.relative_path(), Path::new("sub/file.txt"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ tested with zero terminal/rendering setup at all.
 
 Internally, `core.rs` itself only holds what's genuinely shared across
 providers — `Core`, `CoreEvent`, `ChatError`, the `LlmClient` trait, and
-`to_core_event` — and re-exports each submodule's public items (`pub
+`run_agent_loop` — and re-exports each submodule's public items (`pub
 use ollama::OllamaClient`, etc.) so nothing outside `core` needs to know
 about this internal layout; `cli.rs`'s `crate::core::OLLAMA_MODEL`/
 `crate::core::MISTRAL_MODEL` and `main.rs`'s `emed_code::core::{...}`
@@ -109,7 +109,9 @@ textbook-correct shape would be one `Message::ToolCalls` holding all of
 them. This was a deliberate simplification, tried rather than researched
 to a standstill first, with a real assumption that needed checking: does
 Mistral's API tolerate several separate single-call turns as well as one
-multi-call turn? **Confirmed working**: a real end-to-end test
+multi-call turn?
+
+Confirmed working: a real end-to-end test
 (`tests/real_mistral_smoke_test.rs`) that requires at least two tool
 calls to complete (list a directory, then read a file in it) passes
 against the real API — order and `tool_call_id` correlation being
@@ -223,8 +225,9 @@ sends back either plain text or a tool-calling turn, so the function
 branches on whether any tool calls came back, rather than needing a
 separate provider-facing concept of "did the model call a tool."
 
-**A real bug, caught by the local-gated smoke test, not by unit
-tests**: `MistralResponseMessage.tool_calls` was first typed as a bare
+### A real bug, caught by the local-gated smoke test, not by unit tests
+
+`MistralResponseMessage.tool_calls` was first typed as a bare
 `Vec<MistralToolCall>` with `#[serde(default)]`, on the assumption that
 a plain-text reply simply omits the `tool_calls` key. `#[serde(default)]`
 only substitutes a default when a field is *missing* — it does not run
@@ -246,7 +249,7 @@ Codified as its own regression test
 so this is caught by a fast, deterministic test from now on, not only
 by the slow, real-network one.
 
-## Settings: `~/.config/emed-code/settings.toml`, fail-safe, not yet consulted
+## Settings: `~/.config/emed-code/settings.toml`, fail-safe
 
 `src/core/settings.rs` holds `Settings { file_access_security:
 FileAccessSecurity }` and `FileAccessSecurity` (`Strict`/`Loose`,
@@ -269,38 +272,82 @@ Linux), reads it, and hands the contents to `parse`. Not unit-tested
 itself, same as `Core::with_client`'s real `std::env::current_dir()`
 call — only the pure logic around it is.
 
-**Fails safe, never panics, never fails open.** `Settings::parse` uses
-`.unwrap_or_default()` on the parse `Result` — a missing file, an empty
-file, malformed TOML, and an unrecognized `file_access_security` value
-(e.g. `"yolo"`) all collapse to the exact same outcome: `Settings::default()`,
-i.e. `Strict`. There is deliberately no partial-recovery logic that
-tries to salvage a malformed file's other fields; with only one field
-today that would be pure speculation, and the fail-safe direction
-(defaulting to the *more* restrictive value) is what makes collapsing
-every failure mode into one outcome safe to do at all — the alternative
-of failing *open* would turn a typo in a config file into a silent
-security regression.
-
-**Why `~/.config/emed-code/`, not project-root or `~/.local/share/`**:
-this file will drive which files `read_file`/`list_files` refuse to
-touch (Step 8b) — it is deliberately *outside* the sandbox
-`SandboxPath` enforces, so a future `write_file` tool (Phase 4) can
-never reach it, even indirectly through prompt-injection-driven
-self-modification. A security-relevant guardrail that could be edited
-by the same tool it constrains would not be much of a guardrail. This
-mirrors the reasoning behind resolving Mistral's API key via
-`getfrompass` rather than a project-local file (see "Credentials"
-below): anything that gates what the model can do or see should live
-somewhere the model's own tool access structurally cannot.
-
 Threaded into `Core` the same way as `root`: `Core::with_client` calls
 `Settings::load()` once at construction and stores the result in a new
-`settings: Settings` field. **Not yet consulted by `dispatch`/the file
-tools** — this step only makes the setting real, tested, and loaded;
-Step 8b is what actually branches on `FileAccessSecurity` to block
-`.env`/`.ssh`/etc. `cargo build`/`clippy` currently report `settings`
-as dead code and the `FileAccessSecurity` re-export as unused — expected
-and transient, same treatment as `SandboxPath` between Steps 2 and 3.
+`settings: Settings` field; `submit_user_message` copies out
+`settings.file_access_security` (a `Copy` enum, so no need to clone or
+share `Settings` itself across the thread boundary) and passes it into
+`run_agent_loop`, which threads it through to every `dispatch` call.
+
+### Fails safe, never panics, never fails open
+
+`Settings::parse` uses `.unwrap_or_default()` on the parse `Result` — a
+missing file, an empty file, malformed TOML, and an unrecognized
+`file_access_security` value (e.g. `"yolo"`) all collapse to the exact
+same outcome: `Settings::default()`, i.e. `Strict`. There is
+deliberately no partial-recovery logic that tries to salvage a
+malformed file's other fields; with only one field today that would be
+pure speculation, and the fail-safe direction (defaulting to the *more*
+restrictive value) is what makes collapsing every failure mode into
+one outcome safe to do at all — the alternative of failing *open*
+would turn a typo in a config file into a silent security regression.
+
+### Why `~/.config/emed-code/`, not project-root or `~/.local/share/`
+
+This file drives which files `read_file`/`list_files` refuse to touch
+(see "Content-sensitivity filtering" below) — it is deliberately
+*outside* the sandbox `SandboxPath` enforces, so a future `write_file`
+tool (Phase 4) can never reach it, even indirectly through
+prompt-injection-driven self-modification. A security-relevant
+guardrail that could be edited by the same tool it constrains would
+not be much of a guardrail. This mirrors the reasoning behind resolving
+Mistral's API key via `getfrompass` rather than a project-local file
+(see "Credentials" below): anything that gates what the model can do
+or see should live somewhere the model's own tool access structurally
+cannot.
+
+## Content-sensitivity filtering: blocking `read_file`/`list_files` on sensitive paths (Step 8b)
+
+`SandboxPath` gained a `relative_path()` accessor — the canonicalized
+(symlink-resolved), root-relative path, stored alongside the existing
+absolute path at construction time (one `strip_prefix` call, since the
+containment check already proves the relative path exists).
+`tools.rs`'s `is_content_restricted(relative_path: &Path) -> bool`
+matches this against a small, explicitly non-exhaustive starter
+blocklist: `.env`/`.env.*` and `*.pem`/`*.key` by filename, `.ssh` as a
+path component matched anywhere (not just at the root, so
+`project/.ssh/id_rsa` is caught too), and `.git/config` specifically
+(the last two path components, not all of `.git` — `.git/hooks/pre-commit`
+is unaffected).
+
+`read_file`/`list_files` each check this (only when
+`FileAccessSecurity::Strict`; `Loose` skips the check entirely, its one
+current distinct behavior) after `SandboxPath::new` succeeds but before
+touching the filesystem, returning the new `ToolError::AccessDenied` (a
+static message — unlike `SandboxError::Escapes`, there's nothing to
+hide here, since the LLM already knows exactly which path it
+requested).
+
+### Why the canonicalized path, not the raw requested string
+
+Checking the literal argument a tool call passed in (e.g.
+`"innocuous.txt"`) would miss a symlink with an innocuous name that
+actually resolves to a blocked file (e.g. `.env`) — exactly the same
+class of bypass `SandboxPath`'s containment check already had to
+account for. Matching against `relative_path()` instead means the
+blocklist inherits that same symlink-safety guarantee for free, rather
+than introducing a second, weaker path check right next to the
+stronger one. Covered by
+`read_file_blocks_a_symlink_that_resolves_to_a_blocked_file`.
+
+### `list_files`'s scope, specifically
+
+A blocked entry's *name* still appears in its parent directory's
+listing (existence isn't hidden — low risk), but listing *into* a
+blocked directory, or anything nested inside one, is refused the same
+way `read_file` refuses a blocked file directly — checked before
+`std::fs::read_dir` runs at all, so there's no code path where a
+blocked directory's contents get enumerated even partially.
 
 ## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
 
@@ -382,7 +429,9 @@ didn't look like an error envelope"). This means a real Mistral auth
 failure comes back as `ChatError::Auth("Unauthorized")`, not lumped in
 with genuinely malformed responses.
 
-**Known limitation, deliberately deferred**: `ChatError::Connection`
+### Known limitation, deliberately deferred
+
+`ChatError::Connection`
 flattens whatever `ureq` produced (connection refused, timeout, DNS
 failure, TLS error, ...) into one `String` via `.to_string()`. That's
 fine today — nothing currently needs to tell those cases apart. It stops
@@ -467,14 +516,14 @@ data:
   strings, no network involved. `OllamaClient::send`/`MistralClient::send`
   are each just their provider's map-then-fetch-then-extract calls
   chained.
-- `to_core_event` — pure and provider-agnostic: takes the
-  `Result<LlmResponse, ChatError>` a `LlmClient::send` call already
-  produced and wraps it into a `CoreEvent` — `Text` becomes
-  `AssistantChunk`, `ToolCalls` currently becomes a placeholder `Error`
-  (nothing produces that variant yet; real dispatch is a later Phase 3
-  step), and any `ChatError` becomes `Error`. It doesn't parse anything
-  itself — parsing is each provider's own job, since that's the part
-  that differs between them.
+- `run_agent_loop` — the one place a `Result<LlmResponse, ChatError>`
+  a `LlmClient::send` call produced becomes a `CoreEvent`: `Text`
+  becomes `AssistantChunk`, `ChatError` becomes `Error`, and
+  `ToolCalls` means dispatching each call and emitting one
+  `CoreEvent::ToolCall` per call (see "The agent loop" above). This
+  used to be a separate pure `to_core_event` function, removed once
+  handling `ToolCalls` needed real dispatch logic that only the loop
+  itself can drive (see that section for why).
 
 This means the interesting behavior (what happens on a malformed
 response vs. a failed request) is covered by fast, deterministic unit

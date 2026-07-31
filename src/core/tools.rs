@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
 
-use super::{SandboxError, SandboxPath, ToolCall, ToolDefinition};
+use super::{FileAccessSecurity, SandboxError, SandboxPath, ToolCall, ToolDefinition};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum ToolError {
@@ -15,6 +15,10 @@ pub(crate) enum ToolError {
     IoFailure,
     UnknownTool(String),
     MalformedArguments,
+    // No need to hide anything in the message the way SandboxError does
+    // for a rejected symlink's target — the LLM already knows exactly
+    // which path it requested.
+    AccessDenied,
 }
 
 impl fmt::Display for ToolError {
@@ -24,6 +28,9 @@ impl fmt::Display for ToolError {
             ToolError::IoFailure => write!(f, "failed to access the filesystem"),
             ToolError::UnknownTool(name) => write!(f, "unknown tool: {name}"),
             ToolError::MalformedArguments => write!(f, "malformed tool arguments"),
+            ToolError::AccessDenied => {
+                write!(f, "access to this path is restricted by security policy")
+            }
         }
     }
 }
@@ -33,13 +40,62 @@ struct PathArgs {
     path: String,
 }
 
-fn read_file(root: &Path, requested: &Path) -> Result<String, ToolError> {
+// A small, explicitly non-exhaustive starter list of sensitive-by-
+// convention paths — easy to extend later, not an attempt to be
+// exhaustive now. Matches against the canonicalized, root-relative path
+// (SandboxPath::relative_path), not the raw requested string, so a
+// symlink with an innocuous name can't bypass this by pointing at a
+// blocked file.
+fn is_content_restricted(relative_path: &Path) -> bool {
+    let components: Vec<&str> = relative_path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+
+    if components.contains(&".ssh") {
+        return true;
+    }
+
+    if components.len() >= 2 && components[components.len() - 2] == ".git" {
+        return components[components.len() - 1] == "config";
+    }
+
+    match relative_path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => {
+            name == ".env"
+                || name.starts_with(".env.")
+                || name.ends_with(".pem")
+                || name.ends_with(".key")
+        }
+        None => false,
+    }
+}
+
+fn read_file(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+) -> Result<String, ToolError> {
     let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
+    }
     std::fs::read_to_string(sandbox_path.as_path()).map_err(|_| ToolError::IoFailure)
 }
 
-fn list_files(root: &Path, requested: &Path) -> Result<String, ToolError> {
+fn list_files(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+) -> Result<String, ToolError> {
     let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
+    }
     let entries = std::fs::read_dir(sandbox_path.as_path()).map_err(|_| ToolError::IoFailure)?;
 
     let mut names = Vec::new();
@@ -92,17 +148,21 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
 // arguments — not the other way around — so an unrecognized name never
 // has to care about argument shape at all, and a third tool means one
 // new match arm plus one new function, nothing else.
-pub(crate) fn dispatch(root: &Path, tool_call: &ToolCall) -> Result<String, ToolError> {
+pub(crate) fn dispatch(
+    root: &Path,
+    file_access_security: FileAccessSecurity,
+    tool_call: &ToolCall,
+) -> Result<String, ToolError> {
     match tool_call.name.as_str() {
         "read_file" => {
             let args: PathArgs = serde_json::from_str(&tool_call.arguments)
                 .map_err(|_| ToolError::MalformedArguments)?;
-            read_file(root, Path::new(&args.path))
+            read_file(root, Path::new(&args.path), file_access_security)
         }
         "list_files" => {
             let args: PathArgs = serde_json::from_str(&tool_call.arguments)
                 .map_err(|_| ToolError::MalformedArguments)?;
-            list_files(root, Path::new(&args.path))
+            list_files(root, Path::new(&args.path), file_access_security)
         }
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
@@ -146,7 +206,11 @@ mod tests {
         let root = TempDir::new();
         std::fs::write(root.path().join("notes.txt"), "hello there").unwrap();
 
-        let result = read_file(root.path(), Path::new("notes.txt"));
+        let result = read_file(
+            root.path(),
+            Path::new("notes.txt"),
+            FileAccessSecurity::Strict,
+        );
 
         assert_eq!(result, Ok("hello there".to_string()));
     }
@@ -162,7 +226,11 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(outer.path().join("secret.txt"), "secret").unwrap();
 
-        let result = read_file(&root, Path::new("../secret.txt"));
+        let result = read_file(
+            &root,
+            Path::new("../secret.txt"),
+            FileAccessSecurity::Strict,
+        );
 
         assert_eq!(result, Err(ToolError::InvalidPath(SandboxError::Escapes)));
     }
@@ -173,7 +241,7 @@ mod tests {
         std::fs::write(root.path().join("b.txt"), "").unwrap();
         std::fs::write(root.path().join("a.txt"), "").unwrap();
 
-        let result = list_files(root.path(), Path::new("."));
+        let result = list_files(root.path(), Path::new("."), FileAccessSecurity::Strict);
 
         assert_eq!(result, Ok("a.txt\nb.txt".to_string()));
     }
@@ -188,7 +256,7 @@ mod tests {
             arguments: r#"{"path": "notes.txt"}"#.to_string(),
         };
 
-        let result = dispatch(root.path(), &tool_call);
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Ok("hi".to_string()));
     }
@@ -203,7 +271,7 @@ mod tests {
             arguments: r#"{"path": "."}"#.to_string(),
         };
 
-        let result = dispatch(root.path(), &tool_call);
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Ok("a.txt".to_string()));
     }
@@ -217,7 +285,7 @@ mod tests {
             arguments: "{}".to_string(),
         };
 
-        let result = dispatch(root.path(), &tool_call);
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(
             result,
@@ -234,9 +302,134 @@ mod tests {
             arguments: "not valid json".to_string(),
         };
 
-        let result = dispatch(root.path(), &tool_call);
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Err(ToolError::MalformedArguments));
+    }
+
+    // Step 8b: content-sensitivity filtering.
+    #[test]
+    fn read_file_blocks_a_dot_env_file_in_strict_mode() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+
+        let result = read_file(root.path(), Path::new(".env"), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn read_file_allows_a_dot_env_file_in_loose_mode() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+
+        let result = read_file(root.path(), Path::new(".env"), FileAccessSecurity::Loose);
+
+        assert_eq!(result, Ok("SECRET=1".to_string()));
+    }
+
+    #[test]
+    fn read_file_blocks_a_file_inside_a_dot_ssh_directory() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result = read_file(
+            root.path(),
+            Path::new(".ssh/id_rsa"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn read_file_blocks_git_config() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".git").join("config"), "[core]").unwrap();
+
+        let result = read_file(
+            root.path(),
+            Path::new(".git/config"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn read_file_blocks_a_pem_file() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("key.pem"), "-----BEGIN").unwrap();
+
+        let result = read_file(
+            root.path(),
+            Path::new("key.pem"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    // The concrete case that justified checking the canonicalized path
+    // rather than the raw requested string: an innocuously-named
+    // symlink pointing at a blocked file must still be blocked.
+    #[test]
+    #[cfg(unix)]
+    fn read_file_blocks_a_symlink_that_resolves_to_a_blocked_file() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(root.path().join(".env"), root.path().join("innocuous.txt"))
+            .unwrap();
+
+        let result = read_file(
+            root.path(),
+            Path::new("innocuous.txt"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn list_files_blocks_enumerating_into_a_dot_ssh_directory() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result = list_files(root.path(), Path::new(".ssh"), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    // A blocked entry's name still shows up in its *parent* listing —
+    // existence isn't hidden, only enumerating into it / reading it is
+    // refused.
+    #[test]
+    fn list_files_still_shows_a_blocked_entrys_name_in_its_parent_listing() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::write(root.path().join("notes.txt"), "hi").unwrap();
+
+        let result = list_files(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok(".env\nnotes.txt".to_string()));
+    }
+
+    #[test]
+    fn dispatch_returns_access_denied_for_a_blocked_tool_call() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": ".env"}"#.to_string(),
+        };
+
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
     }
 
     // Guards against drift between what's advertised to the model and

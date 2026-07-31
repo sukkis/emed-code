@@ -148,6 +148,7 @@ pub trait LlmClient {
 fn run_agent_loop(
     client: &Arc<dyn LlmClient + Send + Sync>,
     root: &Path,
+    file_access_security: FileAccessSecurity,
     mut history: Vec<Message>,
     tx: &mpsc::Sender<CoreEvent>,
 ) {
@@ -176,7 +177,7 @@ fn run_agent_loop(
                     // The model needs the full content either way (what
                     // was read, or why it failed) — only the CoreEvent
                     // sent to the TUI distinguishes Ok from Err.
-                    let dispatch_result = dispatch(root, &call);
+                    let dispatch_result = dispatch(root, file_access_security, &call);
                     let content_for_history = match &dispatch_result {
                         Ok(output) => output.clone(),
                         Err(e) => e.to_string(),
@@ -205,10 +206,9 @@ fn run_agent_loop(
 pub struct Core {
     client: Arc<dyn LlmClient + Send + Sync>,
     root: PathBuf,
-    // Not yet consulted by dispatch()/the file tools — see settings.rs
-    // and SECURITY.md's backlog. Loaded here so it's real and tested
-    // end-to-end (missing/malformed file, real config path) before the
-    // next step wires it into tool behavior.
+    // Its file_access_security field is threaded through to dispatch()
+    // on every tool call (see run_agent_loop/submit_user_message) — see
+    // settings.rs and SECURITY.md for what it currently blocks.
     settings: Settings,
     history: Vec<Message>,
     tx: mpsc::Sender<CoreEvent>,
@@ -247,8 +247,9 @@ impl Core {
         let client = Arc::clone(&self.client);
         let history = self.history.clone();
         let root = self.root.clone();
+        let file_access_security = self.settings.file_access_security;
         thread::spawn(move || {
-            run_agent_loop(&client, &root, history, &tx);
+            run_agent_loop(&client, &root, file_access_security, history, &tx);
         });
     }
 
