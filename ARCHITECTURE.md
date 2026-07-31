@@ -442,6 +442,28 @@ width available here). Explicitly deferred to its own step at the end
 of Phase 4, once real wiring into `draw` (Step 5) makes the actual
 width available to pad against — see `docs/write-file.md`.
 
+## `write_file`'s tool logic (Phase 4 Step 4, unreachable from any tool yet)
+
+`tools.rs`'s `write_file(root, requested, content, file_access_security)
+-> Result<(), ToolError>` reuses exactly the same two guards
+`read_file`/`list_files` already have — `SandboxPath::new_for_write`
+(Step 1) for containment, then `is_content_restricted` (only in
+`strict` mode) for the same blocklist — before an actual
+`std::fs::write`. Returns `()` on success rather than echoing content
+back, since unlike `read_file` there's nothing useful to hand back
+beyond success/failure itself.
+
+Deliberately **not** added to `tool_definitions()`/`dispatch` yet —
+real and unit-tested (including that a rejected write, whether from
+sandbox escape or the blocklist, never touches the filesystem at all),
+but unreachable from a live agent loop until the confirmation gate
+(Step 5) and the wiring itself (Step 6) both exist. This is the same
+"build unreachable but tested, then wire in" pattern used throughout
+Phase 3, applied here for a stronger reason: wiring `write_file` in
+before its confirmation gate exists would violate this project's
+"always show diff before applying changes" pillar outright, not just
+leave a feature half-built.
+
 ## The agent loop: `run_agent_loop`, capped at `MAX_TOOL_CALLS`
 
 Runs entirely on `submit_user_message`'s spawned background thread, in

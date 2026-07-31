@@ -107,6 +107,28 @@ fn list_files(
     Ok(names.join("\n"))
 }
 
+// Not yet added to tool_definitions()/dispatch — real and
+// unit-tested, but unreachable from a live agent loop until the
+// confirmation gate (Step 5) and the wiring itself (Step 6) exist.
+// Same sandboxing + blocklist checks as read_file/list_files, plus the
+// actual write; returns () rather than echoing content back, since
+// there's nothing useful to hand back beyond success/failure itself.
+fn write_file(
+    root: &Path,
+    requested: &Path,
+    content: &str,
+    file_access_security: FileAccessSecurity,
+) -> Result<(), ToolError> {
+    let sandbox_path =
+        SandboxPath::new_for_write(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
+    }
+    std::fs::write(sandbox_path.as_path(), content).map_err(|_| ToolError::IoFailure)
+}
+
 // The list of tools actually advertised to a provider. Kept next to
 // dispatch()'s match arms (not off in core.rs) specifically so the two
 // can't drift apart silently — see the names-match test below.
@@ -430,6 +452,114 @@ mod tests {
         let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    // Phase 4 Step 4: the write_file tool logic itself — not yet added
+    // to tool_definitions()/dispatch, so unreachable from any live
+    // agent loop (that's Step 6). Real and unit-tested regardless.
+    #[test]
+    fn write_file_creates_a_new_file_with_the_given_content() {
+        let root = TempDir::new();
+
+        let result = write_file(
+            root.path(),
+            Path::new("new.txt"),
+            "hello there",
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
+            "hello there"
+        );
+    }
+
+    #[test]
+    fn write_file_overwrites_an_existing_file() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("existing.txt"), "old content").unwrap();
+
+        let result = write_file(
+            root.path(),
+            Path::new("existing.txt"),
+            "new content",
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("existing.txt")).unwrap(),
+            "new content"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_a_path_escaping_the_sandbox() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "secret").unwrap();
+
+        let result = write_file(
+            &root,
+            Path::new("../secret.txt"),
+            "pwned",
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::InvalidPath(SandboxError::Escapes)));
+        assert_eq!(
+            std::fs::read_to_string(outer.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_a_missing_parent_directory() {
+        let root = TempDir::new();
+
+        let result = write_file(
+            root.path(),
+            Path::new("no_such_dir/new.txt"),
+            "content",
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::InvalidPath(SandboxError::NotFound)));
+    }
+
+    #[test]
+    fn write_file_blocks_a_dot_env_file_in_strict_mode() {
+        let root = TempDir::new();
+
+        let result = write_file(
+            root.path(),
+            Path::new(".env"),
+            "SECRET=evil",
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+        assert!(!root.path().join(".env").exists());
+    }
+
+    #[test]
+    fn write_file_allows_a_dot_env_file_in_loose_mode() {
+        let root = TempDir::new();
+
+        let result = write_file(
+            root.path(),
+            Path::new(".env"),
+            "SECRET=1",
+            FileAccessSecurity::Loose,
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(".env")).unwrap(),
+            "SECRET=1"
+        );
     }
 
     // Guards against drift between what's advertised to the model and

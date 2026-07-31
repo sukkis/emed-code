@@ -185,6 +185,25 @@ directory or return anything inside one.
 This closes the content-sensitivity-filtering gap tracked in this
 file's backlog since Step 3 (2026-07-30).
 
+### `write_file`'s tool logic (Phase 4 Step 4, 2026-07-31) — real, but not yet reachable
+
+`tools.rs`'s `write_file` reuses the exact same two guards
+`read_file`/`list_files` already have before it touches disk:
+`SandboxPath::new_for_write` (containment, including a parent-directory
+symlink escape or an overwrite-target symlink escape) and the same
+content-sensitivity blocklist (only in `strict` mode). A rejected
+write — whether from sandbox escape or the blocklist — never calls
+`std::fs::write` at all; verified directly (a rejected write leaves no
+file on disk, and an escape attempt leaves the real target's contents
+unchanged).
+
+**Not yet advertised to any provider or callable from a live agent
+loop** — deliberately so. Phase 4's whole premise is that `write_file`
+never exists without its confirmation gate (diff preview + y/n)
+already in place; this step only builds and proves the write logic
+itself. See `docs/write-file.md` for the remaining steps (the
+confirmation gate, then the wiring that finally makes this reachable).
+
 ## Backlog (not yet implemented)
 
 Nothing currently tracked here — the content-sensitivity-filtering gap
