@@ -71,10 +71,16 @@ This is checked against the canonicalized path, not the literal string
 a tool call passed in, so a symlink with an innocuous name pointing at
 a blocked file doesn't bypass it. A directory listing still shows a
 blocked entry's *name* (existence isn't hidden) but refuses to
-enumerate into it or read anything inside.
+enumerate into it or read anything inside — recursive listing applies
+this same rule at every level of the tree, not just the top, so a
+restricted directory found partway down is still named but never
+descended into.
 
 `loose` mode disables this filtering entirely — an explicit,
-user-chosen tradeoff, not a default.
+user-chosen tradeoff, not a default. Recursive listing's separate
+skip-list for build/VCS noise (`target`, `.git`, `node_modules`) is not
+part of this filtering — it isn't a security control, so it stays in
+effect even in `loose` mode.
 
 ## Unsupervised-write protection
 

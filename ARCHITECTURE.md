@@ -156,13 +156,13 @@ sandbox is caught the same way a read would catch it.
 
 `dispatch(root, file_access_security, tool_call) -> Result<String,
 ToolError>` is what the agent loop calls for most tool calls —
-`read_file` and `list_files` today. It matches on the tool's name
-first, then parses that tool's own argument shape, so an unrecognized
-name never has to reason about arguments at all, and a new tool means
-one match arm plus one function. `tool_definitions()` (the list
-actually advertised to a provider) lives right beside `dispatch`'s
-match arms specifically so the two can't silently drift apart — a test
-asserts the names match.
+`read_file`, `list_files`, and `list_files_recursive` today. It matches
+on the tool's name first, then parses that tool's own argument shape,
+so an unrecognized name never has to reason about arguments at all, and
+a new tool means one match arm plus one function. `tool_definitions()`
+(the list actually advertised to a provider) lives right beside
+`dispatch`'s match arms specifically so the two can't silently drift
+apart — a test asserts the names match.
 
 `write_file` is routed *around* `dispatch`, by name, to
 `write_file_with_confirmation` instead. It doesn't fit `dispatch`'s
@@ -171,6 +171,38 @@ because it needs to pause mid-call and wait for a human decision (see
 "The confirmation gate" below). `dispatch` remains the router for every
 tool that doesn't need that; `write_file` is a deliberate exception,
 not a sign the abstraction is leaking.
+
+### Recursive listing
+
+`list_files_recursive` returns paths relative to the *project root*
+always, never relative to whatever directory was actually queried —
+deliberately, so a result can be fed straight into `read_file`/
+`write_file` with no recomposition step. That mattered in practice: the
+tool exists because a model once guessed a wrong top-level path for a
+nested directory and gave up rather than discovering the real one, and
+requiring it to then manually re-prepend a queried directory onto an
+already multi-segment path would reintroduce a smaller version of the
+same failure mode.
+
+The walk uses `DirEntry::file_type()`, not `Path::metadata()`, to
+decide whether to recurse into an entry. This isn't just a style
+choice: `file_type()` reports a symlink's own type without following
+it, so a symlinked directory simply fails the `is_dir()` check and
+becomes a leaf entry for free, with no explicit symlink-detection code
+needed. Using `metadata()` instead would have silently made the walk
+follow symlinks, reintroducing both a cycle risk (a symlink pointing at
+an ancestor) and a sandbox-escape risk the rest of this codebase is
+otherwise careful about.
+
+Noise directories (`target`, `.git`, `node_modules`) are skipped via
+`is_noise_directory` — deliberately a separate function from
+`is_content_restricted` below, not a shared one with an extra flag,
+because they answer different questions. Noise-skipping is a
+usefulness concern (don't flood a listing with build artifacts) and
+applies unconditionally; content-sensitivity filtering is a security
+control and only applies in `strict` mode. Keeping them structurally
+separate is what makes that difference obvious to a reader, rather than
+something to trace through a shared function's branches to confirm.
 
 ### Content-sensitivity filtering
 
@@ -187,6 +219,10 @@ entirely — before touching the filesystem, refusing with
 `ToolError::AccessDenied`. `list_files` still shows a blocked entry's
 *name* in its parent listing (existence isn't hidden) but refuses to
 enumerate into a blocked directory or read anything inside one.
+`list_files_recursive` applies the identical rule at *every* level of
+the walk, not just the one level `list_files` ever had to consider — a
+restricted directory encountered mid-tree is still listed by name, but
+the walk never descends into it.
 
 ## Settings
 

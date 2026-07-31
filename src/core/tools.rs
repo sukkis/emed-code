@@ -125,6 +125,90 @@ fn list_files(
     Ok(names.join("\n"))
 }
 
+fn list_files_recursive(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+) -> Result<String, ToolError> {
+    let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
+    }
+
+    // relative_path() is empty for the project root itself (querying
+    // "."), so this naturally starts every entry unprefixed rather than
+    // needing a "." special case.
+    let relative_prefix = sandbox_path.relative_path().to_string_lossy().into_owned();
+
+    let mut entries = Vec::new();
+    walk_recursive(
+        sandbox_path.as_path(),
+        &relative_prefix,
+        file_access_security,
+        &mut entries,
+    )?;
+    entries.sort();
+    Ok(entries.join("\n"))
+}
+
+// Distinct from is_content_restricted: this is a usefulness concern
+// (don't flood a listing with build artifacts), not a security control,
+// so it's never gated by strict/loose — loose mode exists to allow
+// reading sensitive files, not to bring back target/node_modules noise.
+// Small and deliberately non-exhaustive, same framing as
+// is_content_restricted's own list — easy to extend later, not an
+// attempt to be complete now.
+fn is_noise_directory(name: &str) -> bool {
+    matches!(name, "target" | ".git" | "node_modules")
+}
+
+// Paths are joined as plain strings, not via PathBuf, so the output is
+// always "/"-separated regardless of platform — this string is read by
+// an LLM and fed back into read_file/write_file's own path argument,
+// not used as a real filesystem path itself.
+//
+// file_type() (not metadata()) is what makes symlinked directories leaf
+// entries for free: it reports a symlink's own type, never following
+// it, so is_dir() is simply false for a symlink and it falls straight
+// into the leaf branch below with no special-casing needed.
+fn walk_recursive(
+    absolute_dir: &Path,
+    relative_prefix: &str,
+    file_access_security: FileAccessSecurity,
+    entries: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    let read_dir = std::fs::read_dir(absolute_dir).map_err(|_| ToolError::IoFailure)?;
+
+    for entry in read_dir {
+        let entry = entry.map_err(|_| ToolError::IoFailure)?;
+        let file_type = entry.file_type().map_err(|_| ToolError::IoFailure)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative_path = if relative_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative_prefix}/{name}")
+        };
+
+        if file_type.is_dir() {
+            entries.push(format!("{relative_path}/"));
+
+            // The name still gets listed above either way — only
+            // recursing into it is what these two checks suppress.
+            let restricted = file_access_security == FileAccessSecurity::Strict
+                && is_content_restricted(Path::new(&relative_path));
+            if !restricted && !is_noise_directory(&name) {
+                walk_recursive(&entry.path(), &relative_path, file_access_security, entries)?;
+            }
+        } else {
+            entries.push(relative_path);
+        }
+    }
+
+    Ok(())
+}
+
 // pub(crate): called both by write_file_with_confirmation below (after
 // a user has already approved the write) and, eventually, tests. Same
 // sandboxing + blocklist checks as read_file/list_files, plus the
@@ -215,7 +299,30 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_files".to_string(),
-            description: "List files and directories within a directory in the project."
+            description: "List files and directories within a directory in the project. Not \
+                recursive — a nested directory's contents won't appear. Use \
+                list_files_recursive if you need to search deeper than one level."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the directory, relative to the project root. Use \".\" for the project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_files_recursive".to_string(),
+            description: "Recursively list every file and directory nested under a directory \
+                in the project, not just its immediate children. Use this whenever you don't \
+                know exactly where a file or directory is located, instead of guessing a path \
+                or asking the user to clarify. Returned paths are always relative to the \
+                project root, ready to pass directly to read_file/write_file without \
+                modification. Directories end with a trailing \"/\"; build/VCS noise (target, \
+                .git, node_modules) is shown by name but not descended into."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -256,7 +363,7 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
 
 // Matches on the tool name first, then parses that specific tool's
 // arguments — not the other way around — so an unrecognized name never
-// has to care about argument shape at all, and a third tool means one
+// has to care about argument shape at all, and a new tool means one
 // new match arm plus one new function, nothing else.
 pub(crate) fn dispatch(
     root: &Path,
@@ -273,6 +380,11 @@ pub(crate) fn dispatch(
             let args: PathArgs = serde_json::from_str(&tool_call.arguments)
                 .map_err(|_| ToolError::MalformedArguments)?;
             list_files(root, Path::new(&args.path), file_access_security)
+        }
+        "list_files_recursive" => {
+            let args: PathArgs = serde_json::from_str(&tool_call.arguments)
+                .map_err(|_| ToolError::MalformedArguments)?;
+            list_files_recursive(root, Path::new(&args.path), file_access_security)
         }
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
@@ -357,6 +469,174 @@ mod tests {
         assert_eq!(result, Ok("a.txt\nb.txt".to_string()));
     }
 
+    // Directories get their own entry (trailing "/") at every level, not
+    // just files — extends list_files's existing one-level behavior
+    // (which already shows both kinds) rather than losing information
+    // relative to it.
+    #[test]
+    fn list_files_recursive_returns_sorted_root_relative_paths_for_nested_entries() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("src").join("core")).unwrap();
+        std::fs::write(root.path().join("src").join("main.rs"), "").unwrap();
+        std::fs::write(root.path().join("src").join("core").join("mod.rs"), "").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(
+            result,
+            Ok("notes.txt\nsrc/\nsrc/core/\nsrc/core/mod.rs\nsrc/main.rs".to_string())
+        );
+    }
+
+    // The whole point of this tool: paths are anchored to the project
+    // root regardless of what directory was actually queried, so a
+    // result can be fed directly into read_file/write_file with no
+    // recomposition — querying "src" still returns "src/core/mod.rs",
+    // not "core/mod.rs". Note "src" itself isn't in the output: querying
+    // a directory lists what's inside it, not the directory itself,
+    // matching list_files's own existing behavior.
+    #[test]
+    fn list_files_recursive_returns_paths_relative_to_the_root_not_the_queried_directory() {
+        let root = TempDir::new();
+        std::fs::create_dir_all(root.path().join("src").join("core")).unwrap();
+        std::fs::write(root.path().join("src").join("main.rs"), "").unwrap();
+        std::fs::write(root.path().join("src").join("core").join("mod.rs"), "").unwrap();
+
+        let result =
+            list_files_recursive(root.path(), Path::new("src"), FileAccessSecurity::Strict);
+
+        assert_eq!(
+            result,
+            Ok("src/core/\nsrc/core/mod.rs\nsrc/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn list_files_recursive_shows_an_empty_directory_with_a_trailing_slash() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("empty_dir")).unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok("empty_dir/".to_string()));
+    }
+
+    // A symlinked directory is listed like any other entry but never
+    // descended into — no trailing "/" either, since that would assert
+    // something about what it resolves to, which the walk deliberately
+    // never checks (DirEntry::file_type() reports a symlink's own type,
+    // not its target's, so this falls out of the walk's is_dir() check
+    // with no special-casing needed). Avoids both cycle risk (a symlink
+    // could point at an ancestor) and symlink-escape risk, for free.
+    #[test]
+    #[cfg(unix)]
+    fn list_files_recursive_lists_a_symlinked_directory_as_a_leaf_without_descending_into_it() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("real_target")).unwrap();
+        std::fs::write(root.path().join("real_target").join("secret.txt"), "").unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("real_target"),
+            root.path().join("link_dir"),
+        )
+        .unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(
+            result,
+            Ok("link_dir\nreal_target/\nreal_target/secret.txt".to_string())
+        );
+    }
+
+    // Extends list_files's existing per-level rule to every level: a
+    // restricted directory's name still shows up (existence isn't
+    // hidden), but nothing inside it is ever enumerated, no matter how
+    // deep in the tree it's found.
+    #[test]
+    fn list_files_recursive_skips_enumerating_into_a_restricted_directory_but_still_shows_its_name()
+    {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "").unwrap();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok(".ssh/\nnotes.txt".to_string()));
+    }
+
+    #[test]
+    fn list_files_recursive_rejects_a_directly_restricted_top_level_directory() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result =
+            list_files_recursive(root.path(), Path::new(".ssh"), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn list_files_recursive_recurses_into_a_restricted_directory_in_loose_mode() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh").join("id_rsa"), "private").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Loose);
+
+        assert_eq!(result, Ok(".ssh/\n.ssh/id_rsa".to_string()));
+    }
+
+    // Distinct from restricted-path skipping: a noise directory's
+    // contents aren't sensitive, just unhelpful volume (build
+    // artifacts), so this is a usefulness concern rather than a
+    // security control.
+    #[test]
+    fn list_files_recursive_skips_a_noise_directory_but_still_shows_its_name() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target").join("binary"), "").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok("Cargo.toml\ntarget/".to_string()));
+    }
+
+    // Noise-directory skipping isn't gated by strict/loose at all —
+    // loose mode exists to allow reading sensitive files, not to bring
+    // back build-artifact noise, so target/.git/node_modules stay
+    // skipped either way.
+    #[test]
+    fn list_files_recursive_skips_a_noise_directory_even_in_loose_mode() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target").join("binary"), "").unwrap();
+
+        let result = list_files_recursive(root.path(), Path::new("."), FileAccessSecurity::Loose);
+
+        assert_eq!(result, Ok("Cargo.toml\ntarget/".to_string()));
+    }
+
+    // Unlike a restricted path, a noise directory isn't a security
+    // boundary — there's no reason to refuse an explicit, deliberate
+    // query into it directly. The skip only suppresses incidental
+    // recursion into it from a parent listing.
+    #[test]
+    fn list_files_recursive_lists_a_directly_queried_noise_directory_normally() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target").join("binary"), "").unwrap();
+
+        let result =
+            list_files_recursive(root.path(), Path::new("target"), FileAccessSecurity::Strict);
+
+        assert_eq!(result, Ok("target/binary".to_string()));
+    }
+
     #[test]
     fn dispatch_routes_read_file_calls() {
         let root = TempDir::new();
@@ -385,6 +665,22 @@ mod tests {
         let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Ok("a.txt".to_string()));
+    }
+
+    #[test]
+    fn dispatch_routes_list_files_recursive_calls() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src").join("a.txt"), "").unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "list_files_recursive".to_string(),
+            arguments: r#"{"path": "."}"#.to_string(),
+        };
+
+        let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
+
+        assert_eq!(result, Ok("src/\nsrc/a.txt".to_string()));
     }
 
     #[test]
@@ -757,15 +1053,23 @@ mod tests {
     // it's handled separately by write_file_with_confirmation (see
     // run_agent_loop) — so this only guards tool_definitions() itself,
     // not a dispatch/definitions correspondence that no longer holds
-    // for all three tools.
+    // for all four tools.
     #[test]
-    fn tool_definitions_advertises_all_three_tools() {
+    fn tool_definitions_advertises_all_four_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
             .map(|definition| definition.name.as_str())
             .collect();
 
-        assert_eq!(names, vec!["read_file", "list_files", "write_file"]);
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "list_files",
+                "list_files_recursive",
+                "write_file"
+            ]
+        );
     }
 }
