@@ -37,9 +37,10 @@ fn submit_user_message_gets_a_real_reply_from_local_ollama() {
     match &events[0] {
         CoreEvent::AssistantChunk(text) => assert!(!text.is_empty()),
         CoreEvent::Error(message) => panic!("expected a reply, got an error: {message}"),
-        // Ollama gets no tool-calling this phase — OllamaClient never
-        // advertises any tools, so it should be impossible for this to
-        // ever produce a ToolCall event.
+        // Not impossible any more (tools are now advertised to Ollama
+        // too), but this prompt gives no reason to call one — a tool
+        // call here would be surprising model behavior worth
+        // investigating, not silently allowed.
         CoreEvent::ToolCall { .. } => panic!("unexpected tool call from Ollama: {:?}", events[0]),
         CoreEvent::WriteProposed { .. } => {
             panic!("unexpected write proposal from Ollama: {:?}", events[0])

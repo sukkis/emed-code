@@ -130,19 +130,10 @@ struct OllamaResponse {
     message: OllamaMessage,
 }
 
-fn extract_reply(json: &str) -> Result<String, ChatError> {
-    let response: OllamaResponse =
-        serde_json::from_str(json).map_err(|e| ChatError::MalformedResponse(e.to_string()))?;
-    Ok(response.message.content)
-}
-
-// The tool-calling-aware counterpart to extract_reply above — not yet
-// reachable from send() (see docs/ollama-tool-calling.md's Step 3),
-// proven correct here in isolation first. Mirrors Mistral's
-// extract_mistral_reply: empty/absent tool_calls means a plain-text
-// reply, otherwise each call gets a synthesized id (Ollama's own wire
-// format has none) and its arguments re-serialized from an object back
-// to the String shape ToolCall.arguments expects.
+// Mirrors Mistral's extract_mistral_reply: empty/absent tool_calls means
+// a plain-text reply, otherwise each call gets a synthesized id
+// (Ollama's own wire format has none) and its arguments re-serialized
+// from an object back to the String shape ToolCall.arguments expects.
 fn extract_ollama_reply(json: &str) -> Result<LlmResponse, ChatError> {
     let response: OllamaResponse =
         serde_json::from_str(json).map_err(|e| ChatError::MalformedResponse(e.to_string()))?;
@@ -164,12 +155,16 @@ fn extract_ollama_reply(json: &str) -> Result<LlmResponse, ChatError> {
     }
 }
 
-fn fetch_ollama_reply(model: &str, messages: Vec<OllamaMessage>) -> Result<String, ChatError> {
+fn fetch_ollama_reply(
+    model: &str,
+    messages: Vec<OllamaMessage>,
+    tools: Vec<OllamaTool>,
+) -> Result<String, ChatError> {
     let request = OllamaRequest {
         model: model.to_string(),
         messages,
         stream: false,
-        tools: vec![],
+        tools,
     };
 
     let mut response = ureq::post(OLLAMA_URL)
@@ -196,12 +191,12 @@ impl LlmClient for OllamaClient {
     fn send(
         &self,
         messages: &[Message],
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ChatError> {
         let ollama_messages = to_ollama_messages(messages);
-        let body = fetch_ollama_reply(&self.model, ollama_messages)?;
-        let text = extract_reply(&body)?;
-        Ok(LlmResponse::Text(text))
+        let ollama_tools = to_ollama_tools(tools);
+        let body = fetch_ollama_reply(&self.model, ollama_messages, ollama_tools)?;
+        extract_ollama_reply(&body)
     }
 }
 
@@ -304,37 +299,6 @@ mod tests {
 
     // A real (non-streaming) Ollama /api/chat response. We only care
     // about pulling the assistant's reply text back out of it.
-    #[test]
-    fn extract_reply_reads_assistant_content_from_a_well_formed_response() {
-        let json = r#"{
-            "model": "llama3",
-            "created_at": "2023-08-04T08:52:19.385406455-07:00",
-            "message": {
-                "role": "assistant",
-                "content": "hi there"
-            },
-            "done": true
-        }"#;
-
-        let reply = extract_reply(json).unwrap();
-
-        assert_eq!(reply, "hi there");
-    }
-
-    #[test]
-    fn extract_reply_returns_a_malformed_response_chat_error_on_bad_json() {
-        let json = r#"{ "message": { "role": "assistant" "#;
-
-        let result = extract_reply(json);
-
-        assert!(matches!(result, Err(ChatError::MalformedResponse(_))));
-    }
-
-    // extract_ollama_reply is the tool-calling-aware counterpart to
-    // extract_reply above — not yet reachable from send() (that's
-    // Step 3 in docs/ollama-tool-calling.md), proven correct here in
-    // isolation first. Plain-text replies map the same way either
-    // function is used.
     #[test]
     fn extract_ollama_reply_reads_assistant_content_from_a_well_formed_response() {
         let json = r#"{

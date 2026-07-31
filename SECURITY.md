@@ -91,8 +91,10 @@ shown explicitly rather than ever being normalized away, since the
 approval is only meaningful if the preview genuinely matches what
 happens on disk.
 
-This is offered to Mistral alongside the read tools — Ollama has no
-tool-calling at all yet, so it can't reach any of this either way.
+This applies identically to both providers — the confirmation gate is
+routed by tool name, not by which `LlmClient` is in use, so a local
+Ollama model reaches the exact same approval step a cloud Mistral model
+does.
 
 ## Settings tamper-resistance
 
