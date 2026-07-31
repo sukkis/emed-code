@@ -881,9 +881,9 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.get(0, 0).bg, Color::Reset);
-        assert_eq!(buffer.get(0, 1).bg, Color::Red);
-        assert_eq!(buffer.get(0, 2).bg, Color::Green);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 1)].bg, Color::Red);
+        assert_eq!(buffer[(0, 2)].bg, Color::Green);
     }
 
     // The +/-/space text prefix must survive alongside the color, so a

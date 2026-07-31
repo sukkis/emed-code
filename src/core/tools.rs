@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use super::{
-    ConfirmationChoice, CoreEvent, DiffLine, FileAccessSecurity, SandboxError, SandboxPath,
-    ToolCall, ToolDefinition,
+    ConfirmationChoice, CoreEvent, FileAccessSecurity, SandboxError, SandboxPath, ToolCall,
+    ToolDefinition,
 };
 
 #[derive(Debug, PartialEq)]
@@ -228,6 +228,27 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
+        ToolDefinition {
+            name: "write_file".to_string(),
+            description: "Create a new file or overwrite an existing one within the project \
+                directory. The user is shown a diff and must approve it before anything is \
+                written — do not assume the write has happened until a result confirms it."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file, relative to the project root."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The full new contents of the file."
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        },
     ]
 }
 
@@ -258,6 +279,7 @@ pub(crate) fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::DiffLine;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -719,18 +741,20 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    // Guards against drift between what's advertised to the model and
-    // what dispatch() actually recognizes — a typo in either place
-    // would otherwise only surface as a confusing runtime UnknownTool
-    // error against a real provider.
+    // Pins down exactly what's advertised to the model. write_file is
+    // included here even though dispatch() itself never routes it —
+    // it's handled separately by write_file_with_confirmation (see
+    // run_agent_loop) — so this only guards tool_definitions() itself,
+    // not a dispatch/definitions correspondence that no longer holds
+    // for all three tools.
     #[test]
-    fn tool_definitions_names_match_dispatchs_known_tool_names() {
+    fn tool_definitions_advertises_all_three_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
             .map(|definition| definition.name.as_str())
             .collect();
 
-        assert_eq!(names, vec!["read_file", "list_files"]);
+        assert_eq!(names, vec!["read_file", "list_files", "write_file"]);
     }
 }

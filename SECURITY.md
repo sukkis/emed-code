@@ -86,9 +86,8 @@ approval, so a forbidden path never reaches the confirmation prompt at
 all. If the confirmation channel is ever interrupted (e.g. the app
 closing mid-prompt) the write is treated as declined, never applied.
 
-The write path exists in the codebase but isn't yet advertised to any
-provider, so no model can currently trigger it — see `README.md`'s
-Roadmap for when that's expected to change.
+This is offered to Mistral alongside the read tools — Ollama has no
+tool-calling at all yet, so it can't reach any of this either way.
 
 ## Settings tamper-resistance
 

@@ -1,9 +1,10 @@
 // Structured, per-line diff data — not a pre-formatted string —
 // specifically so the TUI can render Added/Removed with real color
 // rather than relying on a text convention like unified diff's +/-
-// prefixes.
+// prefixes. pub, not pub(crate): it appears in CoreEvent::WriteProposed
+// and tui::LogEntry::Diff, both public types.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DiffLine {
+pub enum DiffLine {
     Added(String),
     Removed(String),
     Unchanged(String),
