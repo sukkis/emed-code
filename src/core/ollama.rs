@@ -61,17 +61,17 @@ fn to_ollama_messages(messages: &[Message]) -> Vec<OllamaMessage> {
                         .map(|call| OllamaToolCall {
                             function: OllamaFunctionCall {
                                 name: call.name.clone(),
-                                // ToolCall.arguments is always a valid JSON
-                                // string here — either synthesized by our
-                                // own extract_ollama_reply (parsed from a
-                                // real Ollama object and re-stringified) or
-                                // Mistral's raw pre-stringified arguments;
-                                // never hand-built. A model that hallucinated
-                                // malformed arguments would already have
-                                // failed at dispatch time, before this call
-                                // ever reaches history.
-                                arguments: serde_json::from_str(&call.arguments)
-                                    .unwrap_or(serde_json::Value::Null),
+                                // Invariant, not a fallible input: in an
+                                // Ollama session, this string only ever
+                                // comes from extract_ollama_reply's own
+                                // Value::to_string() a few calls earlier —
+                                // re-parsing it here is a strict round-trip
+                                // that cannot fail unless our own code
+                                // already corrupted it, which .expect()
+                                // surfaces loudly rather than masking.
+                                arguments: serde_json::from_str(&call.arguments).expect(
+                                    "ToolCall.arguments must be the JSON this client itself serialized",
+                                ),
                             },
                         })
                         .collect(),
