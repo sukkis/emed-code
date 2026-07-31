@@ -57,6 +57,7 @@ fn to_mistral_messages(messages: &[Message]) -> Vec<MistralMessage> {
             Message::ToolResult {
                 tool_call_id,
                 content,
+                ..
             } => MistralMessage {
                 role: "tool".to_string(),
                 content: Some(content.clone()),
@@ -504,6 +505,7 @@ mod tests {
             },
             Message::ToolResult {
                 tool_call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
                 content: "contents of a".to_string(),
             },
             Message::ToolCalls {
@@ -515,6 +517,7 @@ mod tests {
             },
             Message::ToolResult {
                 tool_call_id: "call_2".to_string(),
+                name: "read_file".to_string(),
                 content: "contents of b".to_string(),
             },
         ];

@@ -229,6 +229,7 @@ mod tests {
             },
             Message::ToolResult {
                 tool_call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
                 content: "contents".to_string(),
             },
         ];

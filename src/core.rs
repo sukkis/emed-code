@@ -93,8 +93,13 @@ pub enum Message {
         calls: Vec<ToolCall>,
     },
     // One tool's result, correlated back to its request via tool_call_id.
+    // Also carries the tool's own name, self-contained rather than
+    // requiring a provider to scan back through history for the
+    // matching ToolCalls entry — Ollama's wire format correlates a
+    // result to its request by name, not id, so it needs this directly.
     ToolResult {
         tool_call_id: String,
+        name: String,
         content: String,
     },
 }
@@ -220,6 +225,7 @@ fn run_agent_loop(
                     };
                     history.push(Message::ToolResult {
                         tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
                         content: content_for_history,
                     });
                     let _ = tx.send(CoreEvent::ToolCall {
@@ -344,6 +350,7 @@ impl Core {
                     };
                     self.history.push(Message::ToolResult {
                         tool_call_id: id.clone(),
+                        name: name.clone(),
                         content,
                     });
                 }
@@ -498,6 +505,10 @@ mod tests {
     struct ScriptedClient {
         responses: Vec<Result<LlmResponse, ChatError>>,
         call_count: AtomicUsize,
+        // Records every call's history, same purpose as RecordingClient's
+        // identical field — lets tests assert on exactly what history a
+        // scripted tool-call round-trip produced, not just its replies.
+        calls: Mutex<Vec<Vec<Message>>>,
     }
 
     impl ScriptedClient {
@@ -505,6 +516,7 @@ mod tests {
             ScriptedClient {
                 responses,
                 call_count: AtomicUsize::new(0),
+                calls: Mutex::new(Vec::new()),
             }
         }
     }
@@ -512,9 +524,10 @@ mod tests {
     impl LlmClient for ScriptedClient {
         fn send(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ChatError> {
+            self.calls.lock().unwrap().push(messages.to_vec());
             let index = self.call_count.fetch_add(1, Ordering::SeqCst);
             let index = index.min(self.responses.len() - 1);
             self.responses[index].clone()
@@ -577,6 +590,44 @@ mod tests {
         assert_eq!(
             events[1],
             CoreEvent::AssistantChunk("done reading".to_string())
+        );
+    }
+
+    // A tool result must carry its own tool's name — not just the
+    // tool_call_id — so a provider whose wire format correlates results
+    // by name rather than id (Ollama) has what it needs without scanning
+    // back through history to find the matching ToolCalls entry.
+    #[test]
+    fn agent_loop_tags_a_tool_result_with_the_tool_name() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "hello").unwrap();
+
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": "notes.txt"}"#.to_string(),
+        };
+
+        let scripted = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("done reading".to_string())),
+        ]));
+        let client: Arc<dyn LlmClient + Send + Sync> = scripted.clone();
+
+        let mut core = core_with_root(client, root.path().to_path_buf());
+        core.submit_user_message("read notes.txt".to_string());
+
+        poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+
+        let calls = scripted.calls.lock().unwrap();
+        let second_call_history = &calls[1];
+        assert!(
+            second_call_history.contains(&Message::ToolResult {
+                tool_call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                content: "hello".to_string(),
+            }),
+            "expected the second LLM call's history to include a ToolResult tagged with the tool's name, got {second_call_history:?}"
         );
     }
 
