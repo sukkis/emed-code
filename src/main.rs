@@ -32,8 +32,10 @@ fn main() -> io::Result<()> {
         }
     };
 
+    let agents_md_status = core.agents_md_status();
+
     ratatui::run(|terminal| {
-        let mut app = App::with_core(core, provider_label);
+        let mut app = App::with_core(core, provider_label, agents_md_status);
 
         loop {
             if event::poll(Duration::from_millis(100))?

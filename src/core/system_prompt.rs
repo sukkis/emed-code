@@ -80,12 +80,32 @@ pub(crate) fn global_agents_md_path() -> Option<PathBuf> {
 
 // The real entry point, called once at Core construction. Not
 // unit-tested directly, same treatment Settings::load()'s real I/O
-// already gets — read_agents_md and build_system_prompt are what's
-// independently tested.
-pub(crate) fn load_system_prompt(root: &Path) -> String {
+// already gets — read_agents_md, build_system_prompt, and
+// combine_with_status are what's independently tested. Reads each file
+// exactly once — Core reports this status back via agents_md_status()
+// rather than main.rs ever reading either file again itself.
+pub(crate) fn load_system_prompt(root: &Path) -> (String, AgentsMdStatus) {
     let global = global_agents_md_path().and_then(|path| read_agents_md(&path));
     let project = read_agents_md(&project_agents_md_path(root));
-    build_system_prompt(BASE_SYSTEM_PROMPT, global.as_deref(), project.as_deref())
+    combine_with_status(BASE_SYSTEM_PROMPT, global.as_deref(), project.as_deref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentsMdStatus {
+    pub project_found: bool,
+    pub global_found: bool,
+}
+
+fn combine_with_status(
+    base: &str,
+    global: Option<&str>,
+    project: Option<&str>,
+) -> (String, AgentsMdStatus) {
+    let status = AgentsMdStatus {
+        project_found: project.is_some(),
+        global_found: global.is_some(),
+    };
+    (build_system_prompt(base, global, project), status)
 }
 
 #[cfg(test)]
@@ -185,6 +205,63 @@ mod tests {
             ),
             "BASE\n\n## Your preferences (all projects)\n\nprefer tabs\n\n\
             ## This project\n\nrun `just test` before committing"
+        );
+    }
+
+    // combine_with_status's only new job over build_system_prompt is
+    // the true/false mapping — whether a source was found flows in as
+    // Some/None here exactly the same way read_agents_md's own tests
+    // already prove a real file's presence maps to Some/None, so no
+    // tempdir is needed to exercise this.
+    #[test]
+    fn combine_with_status_reports_neither_source_found() {
+        let (_, status) = combine_with_status("BASE", None, None);
+
+        assert_eq!(
+            status,
+            AgentsMdStatus {
+                project_found: false,
+                global_found: false
+            }
+        );
+    }
+
+    #[test]
+    fn combine_with_status_reports_only_global_found() {
+        let (_, status) = combine_with_status("BASE", Some("prefer tabs"), None);
+
+        assert_eq!(
+            status,
+            AgentsMdStatus {
+                project_found: false,
+                global_found: true
+            }
+        );
+    }
+
+    #[test]
+    fn combine_with_status_reports_only_project_found() {
+        let (_, status) = combine_with_status("BASE", None, Some("run `just test`"));
+
+        assert_eq!(
+            status,
+            AgentsMdStatus {
+                project_found: true,
+                global_found: false
+            }
+        );
+    }
+
+    #[test]
+    fn combine_with_status_reports_both_found() {
+        let (_, status) = combine_with_status("BASE", Some("prefer tabs"), Some("run `just test`"));
+
+        assert_eq!(
+            status,
+            AgentsMdStatus {
+                project_found: true,
+                global_found: true
+            }
         );
     }
 }

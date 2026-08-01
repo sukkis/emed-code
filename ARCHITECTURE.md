@@ -105,6 +105,12 @@ Both `AGENTS.md` files are read once, when the session starts. They
 aren't re-read during a session, so editing either file has no effect
 until the next run.
 
+Whether each file was found is shown in the chat title for the whole
+session, the same way the active provider already is — printing it
+once at startup instead would go unseen, since entering the terminal
+UI switches to a different screen buffer that hides anything printed
+before it.
+
 ## Conversation history
 
 `Core` holds a `Vec<Message>` that grows for the whole session and is

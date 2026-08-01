@@ -21,6 +21,7 @@ pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
 pub(crate) use settings::{FileAccessSecurity, Settings};
+pub use system_prompt::AgentsMdStatus;
 use system_prompt::load_system_prompt;
 use tools::{dispatch, tool_definitions, write_file_with_confirmation};
 
@@ -260,6 +261,7 @@ pub struct Core {
     // docs/system-prompt.md. Sent on every request via
     // submit_user_message; never recomputed mid-session.
     system_prompt: String,
+    agents_md_status: AgentsMdStatus,
     history: Vec<Message>,
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
@@ -286,12 +288,13 @@ impl Core {
         let (tx, rx) = mpsc::channel();
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let settings = Settings::load();
-        let system_prompt = load_system_prompt(&root);
+        let (system_prompt, agents_md_status) = load_system_prompt(&root);
         Core {
             client,
             root,
             settings,
             system_prompt,
+            agents_md_status,
             history: Vec::new(),
             tx,
             rx,
@@ -332,6 +335,13 @@ impl Core {
         if let Some(tx) = &self.confirm_tx {
             let _ = tx.send(choice);
         }
+    }
+
+    // For main.rs to print a startup line right after construction —
+    // reads the status Core already computed, never re-reads either
+    // AGENTS.md file itself.
+    pub fn agents_md_status(&self) -> AgentsMdStatus {
+        self.agents_md_status
     }
 
     pub fn poll_events(&mut self) -> Vec<CoreEvent> {
@@ -538,6 +548,13 @@ mod tests {
             root,
             settings: Settings::default(),
             system_prompt,
+            // No existing test varies this — see docs/system-prompt.md
+            // for why Step 4's own tests cover the real found/not-found
+            // mapping at the system_prompt.rs level instead.
+            agents_md_status: AgentsMdStatus {
+                project_found: false,
+                global_found: false,
+            },
             history: Vec::new(),
             tx,
             rx,
