@@ -3,6 +3,8 @@
 // current project. See docs/system-prompt.md for the reasoning behind
 // the base prompt's wording and the combination order.
 
+use std::path::{Path, PathBuf};
+
 // "You have no way to run code, a build, or tests" is only true until
 // a run_command tool exists (see docs/harness-roadmap.md) — this line
 // needs rewriting the day that lands, not before.
@@ -52,9 +54,105 @@ pub(crate) fn build_system_prompt(
     prompt
 }
 
+// Real I/O: reads an AGENTS.md-style file, failing safe to None on any
+// error (missing file, permissions, non-UTF8 content) — same treatment
+// Settings::load() already gives its own config file, never an error,
+// never a panic.
+pub(crate) fn read_agents_md(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+// AGENTS.md lives alongside the project's own code, inside the
+// sandboxed root — see docs/system-prompt.md for the self-modification
+// risk this implies and why it's accepted, and SECURITY.md for the
+// current-state note.
+pub(crate) fn project_agents_md_path(root: &Path) -> PathBuf {
+    root.join("AGENTS.md")
+}
+
+// Structurally outside SandboxPath's boundary — same tamper-resistance
+// property settings.toml already has. Not unit-tested directly (a real
+// dirs::config_dir() call), same treatment Settings::load()'s own path
+// resolution already gets.
+pub(crate) fn global_agents_md_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("emed-code").join("AGENTS.md"))
+}
+
+// The real entry point, called once at Core construction. Not
+// unit-tested directly, same treatment Settings::load()'s real I/O
+// already gets — read_agents_md and build_system_prompt are what's
+// independently tested.
+pub(crate) fn load_system_prompt(root: &Path) -> String {
+    let global = global_agents_md_path().and_then(|path| read_agents_md(&path));
+    let project = read_agents_md(&project_agents_md_path(root));
+    build_system_prompt(BASE_SYSTEM_PROMPT, global.as_deref(), project.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Hand-rolled instead of a tempfile dev-dependency — same reasoning
+    // as sandbox_path.rs's/tools.rs's/core.rs's identical fixture,
+    // duplicated rather than shared per this codebase's existing
+    // convention.
+    struct TempDir(PathBuf);
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "emed-code-system-prompt-test-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_agents_md_returns_none_for_a_missing_file() {
+        let dir = TempDir::new();
+
+        assert_eq!(read_agents_md(&dir.path().join("AGENTS.md")), None);
+    }
+
+    #[test]
+    fn read_agents_md_returns_the_file_contents_when_present() {
+        let dir = TempDir::new();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "run `just test` before committing").unwrap();
+
+        assert_eq!(
+            read_agents_md(&path),
+            Some("run `just test` before committing".to_string())
+        );
+    }
+
+    #[test]
+    fn project_agents_md_path_is_agents_md_directly_under_root() {
+        let dir = TempDir::new();
+
+        assert_eq!(
+            project_agents_md_path(dir.path()),
+            dir.path().join("AGENTS.md")
+        );
+    }
 
     #[test]
     fn build_system_prompt_with_neither_source_returns_just_the_base_prompt() {

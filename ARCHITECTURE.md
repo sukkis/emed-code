@@ -101,10 +101,9 @@ there's no need for one to override the other, since they're
 different kinds of information (personal style vs. project facts)
 rather than conflicting ones.
 
-Every request now carries a system entry ahead of the conversation,
-but it's empty for now — the base prompt and `AGENTS.md` content
-described above exist in code but aren't wired in to a real request
-yet.
+Both `AGENTS.md` files are read once, when the session starts. They
+aren't re-read during a session, so editing either file has no effect
+until the next run.
 
 ## Conversation history
 

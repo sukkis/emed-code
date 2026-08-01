@@ -21,6 +21,7 @@ pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
 pub(crate) use settings::{FileAccessSecurity, Settings};
+use system_prompt::load_system_prompt;
 use tools::{dispatch, tool_definitions, write_file_with_confirmation};
 
 use std::fmt;
@@ -255,6 +256,10 @@ pub struct Core {
     // on every tool call (see run_agent_loop/submit_user_message) — see
     // settings.rs and SECURITY.md for what it currently blocks.
     settings: Settings,
+    // Computed once here, at construction — see system_prompt.rs and
+    // docs/system-prompt.md. Sent on every request via
+    // submit_user_message; never recomputed mid-session.
+    system_prompt: String,
     history: Vec<Message>,
     tx: mpsc::Sender<CoreEvent>,
     rx: mpsc::Receiver<CoreEvent>,
@@ -281,10 +286,12 @@ impl Core {
         let (tx, rx) = mpsc::channel();
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let settings = Settings::load();
+        let system_prompt = load_system_prompt(&root);
         Core {
             client,
             root,
             settings,
+            system_prompt,
             history: Vec::new(),
             tx,
             rx,
@@ -300,10 +307,7 @@ impl Core {
 
         let tx = self.tx.clone();
         let client = Arc::clone(&self.client);
-        // Placeholder until Step 3 wires real AGENTS.md content in
-        // (see docs/system-prompt.md) — no system prompt content flows
-        // into a real request yet.
-        let system = String::new();
+        let system = self.system_prompt.clone();
         let history = self.history.clone();
         let root = self.root.clone();
         let file_access_security = self.settings.file_access_security;
@@ -384,15 +388,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     // Records every call it receives so tests can assert on exactly what
-    // history Core threaded through, without any real network I/O.
+    // history (and now system prompt) Core threaded through, without any
+    // real network I/O.
     struct RecordingClient {
         calls: Mutex<Vec<Vec<Message>>>,
+        systems: Mutex<Vec<String>>,
     }
 
     impl RecordingClient {
         fn new() -> Self {
             RecordingClient {
                 calls: Mutex::new(Vec::new()),
+                systems: Mutex::new(Vec::new()),
             }
         }
     }
@@ -400,12 +407,13 @@ mod tests {
     impl LlmClient for RecordingClient {
         fn send(
             &self,
-            _system: &str,
+            system: &str,
             messages: &[Message],
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ChatError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push(messages.to_vec());
+            self.systems.lock().unwrap().push(system.to_string());
             let reply_number = calls.len();
             Ok(LlmResponse::Text(format!("reply {reply_number}")))
         }
@@ -463,6 +471,31 @@ mod tests {
         );
     }
 
+    // Proves Core actually sends the system_prompt it was constructed
+    // with — not the empty placeholder Step 2 left in — and that it's
+    // the same value on every call, not recomputed or dropped after the
+    // first. See docs/system-prompt.md.
+    #[test]
+    fn submit_user_message_sends_cores_system_prompt_on_every_call() {
+        let root = TempDir::new();
+        let recorder = Arc::new(RecordingClient::new());
+        let client: Arc<dyn LlmClient + Send + Sync> = recorder.clone();
+        let mut core = core_with_root(
+            client,
+            root.path().to_path_buf(),
+            "custom system prompt".to_string(),
+        );
+
+        core.submit_user_message("first".to_string());
+        poll_until_nonempty(&mut core, Duration::from_secs(1));
+        core.submit_user_message("second".to_string());
+        poll_until_nonempty(&mut core, Duration::from_secs(1));
+
+        let systems = recorder.systems.lock().unwrap();
+        assert_eq!(systems[0], "custom system prompt");
+        assert_eq!(systems[1], "custom system prompt");
+    }
+
     // Hand-rolled instead of a tempfile dev-dependency — same reasoning
     // as sandbox_path.rs's/tools.rs's identical fixture, duplicated
     // rather than shared per this codebase's existing convention.
@@ -494,12 +527,17 @@ mod tests {
     // the real current_dir() — tests need a specific tempdir instead, so
     // this builds one directly via the struct literal (same module tree,
     // so Core's private fields are reachable here).
-    fn core_with_root(client: Arc<dyn LlmClient + Send + Sync>, root: PathBuf) -> Core {
+    fn core_with_root(
+        client: Arc<dyn LlmClient + Send + Sync>,
+        root: PathBuf,
+        system_prompt: String,
+    ) -> Core {
         let (tx, rx) = mpsc::channel();
         Core {
             client,
             root,
             settings: Settings::default(),
+            system_prompt,
             history: Vec::new(),
             tx,
             rx,
@@ -583,7 +621,7 @@ mod tests {
             Ok(LlmResponse::Text("done reading".to_string())),
         ]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("read notes.txt".to_string());
 
         let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
@@ -624,7 +662,7 @@ mod tests {
         ]));
         let client: Arc<dyn LlmClient + Send + Sync> = scripted.clone();
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("read notes.txt".to_string());
 
         poll_until_at_least(&mut core, 2, Duration::from_secs(1));
@@ -659,7 +697,7 @@ mod tests {
             Ok(LlmResponse::Text("done".to_string())),
         ]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("read a missing file".to_string());
 
         let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
@@ -686,7 +724,7 @@ mod tests {
             tool_call,
         ]))]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("loop forever".to_string());
 
         let events = poll_until_at_least(&mut core, 41, Duration::from_secs(5));
@@ -710,7 +748,7 @@ mod tests {
             "hi there".to_string(),
         ))]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("hello".to_string());
 
         let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
@@ -725,7 +763,7 @@ mod tests {
             "connection refused".to_string(),
         ))]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("hello".to_string());
 
         let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
@@ -751,7 +789,7 @@ mod tests {
             Ok(LlmResponse::Text("wrote it".to_string())),
         ]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("write a file".to_string());
 
         let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
@@ -788,7 +826,7 @@ mod tests {
             Ok(LlmResponse::Text("ok, not writing".to_string())),
         ]));
 
-        let mut core = core_with_root(client, root.path().to_path_buf());
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
         core.submit_user_message("write a file".to_string());
 
         poll_until_at_least(&mut core, 1, Duration::from_secs(1));

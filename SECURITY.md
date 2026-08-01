@@ -22,6 +22,9 @@ provider. The threats that follow from that:
 - **Self-modifying security policy** — a compromised or
   prompt-injected model trying to loosen its own restrictions by
   editing the settings file that defines them.
+- **Persisted prompt injection** — a compromised or prompt-injected
+  model writing instructions into a file it later reads back as
+  trusted context in a *future* session, not just the current one.
 
 Each is addressed below under its own heading.
 
@@ -118,6 +121,20 @@ tool access structurally cannot reach.
 
 A missing, empty, or malformed settings file always falls back to
 `strict` — never a crash, never a silent loosening of policy.
+
+## AGENTS.md content trust
+
+Global `AGENTS.md` (`~/.config/emed-code/AGENTS.md`) has the same
+tamper-resistance as `settings.toml` — outside the sandboxed directory,
+unreachable by any file-writing tool. Project `AGENTS.md` sits inside
+the sandbox and isn't protected the same way: a write to it is
+possible, and would change what a *later* session's system prompt
+contains. The same-session risk is bounded, since it's read once at
+startup, before any tool call runs — but a successful write today
+could still shape a future one. Mitigated the same way any other
+project file's integrity is: git visibility and the existing
+write-confirmation gate, not a technical restriction specific to this
+file.
 
 ## Runaway tool-call protection
 
