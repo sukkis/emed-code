@@ -83,6 +83,27 @@ an O(1) refcount bump giving the spawned thread an independent handle
 to the same value, where `Box`'s exclusive ownership could only ever
 hand the client to one thread, permanently.
 
+## System prompt
+
+Every request carries a system prompt built from three layers: a
+hardcoded base prompt, global user preferences, and project-specific
+preferences.
+
+Global preferences live in `AGENTS.md` in the user's config directory,
+outside the project. Project-specific preferences live in `AGENTS.md`
+in the project directory itself. Both files are optional — if neither
+exists, only the base prompt is sent.
+
+The three layers combine in that order, base first: general
+preferences before project-specific ones, ending closest to the actual
+conversation. If both `AGENTS.md` files exist, both are included —
+there's no need for one to override the other, since they're
+different kinds of information (personal style vs. project facts)
+rather than conflicting ones.
+
+Not yet reachable from any real request — this is built, but nothing
+sends it to a provider yet.
+
 ## Conversation history
 
 `Core` holds a `Vec<Message>` that grows for the whole session and is

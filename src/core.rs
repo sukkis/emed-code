@@ -8,6 +8,7 @@ mod mistral;
 mod ollama;
 mod sandbox_path;
 mod settings;
+mod system_prompt;
 mod tools;
 
 pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};

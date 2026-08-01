@@ -73,9 +73,6 @@ why.
 - An append/insert tool distinct from `write_file`'s whole-file
   replace, so adding a line doesn't depend on the model correctly
   reconstructing the entire file's contents
-- An "eagerness" setting that has the model explore the project
-  structure up front, rather than relying on it to reach for a listing
-  tool unprompted after an initial guess falls through
 - Token/context usage shown in the UI
 - Independent read/write file-access strictness settings
 - Syntax-highlighted diffs
