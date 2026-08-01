@@ -101,8 +101,10 @@ there's no need for one to override the other, since they're
 different kinds of information (personal style vs. project facts)
 rather than conflicting ones.
 
-Not yet reachable from any real request — this is built, but nothing
-sends it to a provider yet.
+Every request now carries a system entry ahead of the conversation,
+but it's empty for now — the base prompt and `AGENTS.md` content
+described above exist in code but aren't wired in to a real request
+yet.
 
 ## Conversation history
 

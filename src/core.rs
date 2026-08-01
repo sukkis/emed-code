@@ -161,6 +161,7 @@ impl std::error::Error for ChatError {}
 pub trait LlmClient {
     fn send(
         &self,
+        system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ChatError>;
@@ -175,6 +176,7 @@ pub trait LlmClient {
 // (deliberately kept in sync with) the shape pushed onto `history` here.
 fn run_agent_loop(
     client: &Arc<dyn LlmClient + Send + Sync>,
+    system: &str,
     root: &Path,
     file_access_security: FileAccessSecurity,
     mut history: Vec<Message>,
@@ -185,7 +187,7 @@ fn run_agent_loop(
     let mut tool_call_count = 0usize;
 
     loop {
-        match client.send(&history, &tool_defs) {
+        match client.send(system, &history, &tool_defs) {
             Ok(LlmResponse::Text(text)) => {
                 let _ = tx.send(CoreEvent::AssistantChunk(text));
                 return;
@@ -298,12 +300,17 @@ impl Core {
 
         let tx = self.tx.clone();
         let client = Arc::clone(&self.client);
+        // Placeholder until Step 3 wires real AGENTS.md content in
+        // (see docs/system-prompt.md) — no system prompt content flows
+        // into a real request yet.
+        let system = String::new();
         let history = self.history.clone();
         let root = self.root.clone();
         let file_access_security = self.settings.file_access_security;
         thread::spawn(move || {
             run_agent_loop(
                 &client,
+                &system,
                 &root,
                 file_access_security,
                 history,
@@ -393,6 +400,7 @@ mod tests {
     impl LlmClient for RecordingClient {
         fn send(
             &self,
+            _system: &str,
             messages: &[Message],
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ChatError> {
@@ -525,6 +533,7 @@ mod tests {
     impl LlmClient for ScriptedClient {
         fn send(
             &self,
+            _system: &str,
             messages: &[Message],
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ChatError> {

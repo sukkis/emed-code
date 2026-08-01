@@ -23,6 +23,15 @@ struct MistralMessage {
     tool_call_id: Option<String>,
 }
 
+fn mistral_system_message(system: &str) -> MistralMessage {
+    MistralMessage {
+        role: "system".to_string(),
+        content: Some(system.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
 fn to_mistral_messages(messages: &[Message]) -> Vec<MistralMessage> {
     messages
         .iter()
@@ -241,10 +250,12 @@ impl MistralClient {
 impl LlmClient for MistralClient {
     fn send(
         &self,
+        system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ChatError> {
-        let mistral_messages = to_mistral_messages(messages);
+        let mut mistral_messages = vec![mistral_system_message(system)];
+        mistral_messages.extend(to_mistral_messages(messages));
         let mistral_tools = to_mistral_tools(tools);
         let body =
             fetch_mistral_reply(&self.api_key, &self.model, mistral_messages, mistral_tools)?;
@@ -255,6 +266,21 @@ impl LlmClient for MistralClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The system-role wire-message prepended ahead of the mapped
+    // dialogue when a request is built — see docs/system-prompt.md.
+    #[test]
+    fn mistral_system_message_builds_the_expected_wire_shape() {
+        assert_eq!(
+            mistral_system_message("be helpful"),
+            MistralMessage {
+                role: "system".to_string(),
+                content: Some("be helpful".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }
+        );
+    }
 
     // Mistral's /v1/chat/completions request body: OpenAI-style shape,
     // reply nested under choices[0].message rather than a top-level
