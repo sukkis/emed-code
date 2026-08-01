@@ -83,6 +83,34 @@ an O(1) refcount bump giving the spawned thread an independent handle
 to the same value, where `Box`'s exclusive ownership could only ever
 hand the client to one thread, permanently.
 
+## System prompt
+
+Every request carries a system prompt built from three layers: a
+hardcoded base prompt, global user preferences, and project-specific
+preferences.
+
+Global preferences live in `AGENTS.md` in the user's config directory,
+outside the project. Project-specific preferences live in `AGENTS.md`
+in the project directory itself. Both files are optional — if neither
+exists, only the base prompt is sent.
+
+The three layers combine in that order, base first: general
+preferences before project-specific ones, ending closest to the actual
+conversation. If both `AGENTS.md` files exist, both are included —
+there's no need for one to override the other, since they're
+different kinds of information (personal style vs. project facts)
+rather than conflicting ones.
+
+Both `AGENTS.md` files are read once, when the session starts. They
+aren't re-read during a session, so editing either file has no effect
+until the next run.
+
+Whether each file was found is shown in the chat title for the whole
+session, the same way the active provider already is — printing it
+once at startup instead would go unseen, since entering the terminal
+UI switches to a different screen buffer that hides anything printed
+before it.
+
 ## Conversation history
 
 `Core` holds a `Vec<Message>` that grows for the whole session and is

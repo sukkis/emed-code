@@ -20,6 +20,11 @@ Mistral's cloud API without leaving your terminal or tmux session.
 - **Never writes blind.** It can create or edit files too, but always
   shows a colored diff and waits for your explicit approval first —
   nothing is written to disk without you seeing it.
+- **Learns your project's conventions.** Drop an `AGENTS.md` in your
+  project — and another at `~/.config/emed-code/AGENTS.md` for
+  preferences you want everywhere — and both are folded into every
+  request automatically. Whether either was found is always shown
+  right in the chat title, same as the active provider.
 - **Built for the terminal.** A scrollable chat log and keyboard-only
   controls, equally at home in a tmux pane next to your editor or in a
   plain terminal window.
@@ -47,7 +52,10 @@ Mistral's cloud API.
 
 Want to change which files it's willing to touch? Copy
 `settings.toml.example` to `~/.config/emed-code/settings.toml` and edit
-to your liking.
+to your liking. Want it to know your project's own conventions? Add an
+`AGENTS.md` at the project root; add one at
+`~/.config/emed-code/AGENTS.md` for preferences that should apply
+everywhere.
 
 Run `cargo run -- --help` for the full flag reference. Type a message
 and press Enter to send it; `Up`/`Down`/`PageUp`/`PageDown` scroll the
@@ -73,9 +81,6 @@ why.
 - An append/insert tool distinct from `write_file`'s whole-file
   replace, so adding a line doesn't depend on the model correctly
   reconstructing the entire file's contents
-- An "eagerness" setting that has the model explore the project
-  structure up front, rather than relying on it to reach for a listing
-  tool unprompted after an initial guess falls through
 - Token/context usage shown in the UI
 - Independent read/write file-access strictness settings
 - Syntax-highlighted diffs

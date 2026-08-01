@@ -155,6 +155,14 @@ fn extract_ollama_reply(json: &str) -> Result<LlmResponse, ChatError> {
     }
 }
 
+fn ollama_system_message(system: &str) -> OllamaMessage {
+    OllamaMessage {
+        role: "system".to_string(),
+        content: system.to_string(),
+        ..Default::default()
+    }
+}
+
 fn fetch_ollama_reply(
     model: &str,
     messages: Vec<OllamaMessage>,
@@ -190,10 +198,12 @@ impl OllamaClient {
 impl LlmClient for OllamaClient {
     fn send(
         &self,
+        system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ChatError> {
-        let ollama_messages = to_ollama_messages(messages);
+        let mut ollama_messages = vec![ollama_system_message(system)];
+        ollama_messages.extend(to_ollama_messages(messages));
         let ollama_tools = to_ollama_tools(tools);
         let body = fetch_ollama_reply(&self.model, ollama_messages, ollama_tools)?;
         extract_ollama_reply(&body)
@@ -203,6 +213,20 @@ impl LlmClient for OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The system-role wire-message prepended ahead of the mapped
+    // dialogue when a request is built — see docs/system-prompt.md.
+    #[test]
+    fn ollama_system_message_builds_the_expected_wire_shape() {
+        assert_eq!(
+            ollama_system_message("be helpful"),
+            OllamaMessage {
+                role: "system".to_string(),
+                content: "be helpful".to_string(),
+                ..Default::default()
+            }
+        );
+    }
 
     // Ollama's /api/chat request body: model name, chat history, and
     // stream: false so the response arrives as one JSON object rather

@@ -9,7 +9,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use crate::core::{ConfirmationChoice, Core, CoreEvent, DiffLine};
+use crate::core::{AgentsMdStatus, ConfirmationChoice, Core, CoreEvent, DiffLine};
 
 const SCROLL_STEP: usize = 1;
 const PAGE_SCROLL_STEP: usize = 5;
@@ -241,7 +241,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
 
-    let chat_title = format!("emed-code — AI: {}", app.provider_label().as_str());
+    let chat_title = format!(
+        "emed-code — AI: {} — {}",
+        app.provider_label().as_str(),
+        agents_md_title_suffix(app.agents_md_status())
+    );
     let chat_block = Block::bordered().title(chat_title);
     let chat_inner = chat_block.inner(chat_area);
 
@@ -332,11 +336,25 @@ impl ProviderLabel {
     }
 }
 
+// Kept terse deliberately: this codebase already hit real truncation
+// once (see the widened TestBackend width in this function's own
+// tests) from adding text to a title bar that's already tight in a
+// narrow tmux pane.
+fn agents_md_title_suffix(status: AgentsMdStatus) -> &'static str {
+    match (status.project_found, status.global_found) {
+        (false, false) => "no AGENTS.md",
+        (true, false) => "AGENTS.md (project)",
+        (false, true) => "AGENTS.md (global)",
+        (true, true) => "AGENTS.md (project+global)",
+    }
+}
+
 pub struct App {
     input: InputBox,
     log: Vec<LogEntry>,
     core: Core,
     provider_label: ProviderLabel,
+    agents_md_status: AgentsMdStatus,
     scroll_offset: usize,
     // True ceiling for scroll_offset, as of the last draw call. Stale by
     // at most one frame — see scroll_up's doc comment.
@@ -357,15 +375,27 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        Self::with_core(Core::new(), ProviderLabel::Ollama)
+        Self::with_core(
+            Core::new(),
+            ProviderLabel::Ollama,
+            AgentsMdStatus {
+                project_found: false,
+                global_found: false,
+            },
+        )
     }
 
-    pub fn with_core(core: Core, provider_label: ProviderLabel) -> Self {
+    pub fn with_core(
+        core: Core,
+        provider_label: ProviderLabel,
+        agents_md_status: AgentsMdStatus,
+    ) -> Self {
         Self {
             input: InputBox::new(),
             log: Vec::new(),
             core,
             provider_label,
+            agents_md_status,
             scroll_offset: 0,
             max_scroll: 0,
             pending_confirmation: None,
@@ -464,6 +494,10 @@ impl App {
         self.provider_label
     }
 
+    pub fn agents_md_status(&self) -> AgentsMdStatus {
+        self.agents_md_status
+    }
+
     pub fn input_buffer(&self) -> &str {
         self.input.buffer()
     }
@@ -534,10 +568,20 @@ mod tests {
     // than one hardcoded string that happens to say "ollama".
     #[test]
     fn draws_ollama_as_the_local_provider_in_the_chat_title() {
-        let backend = TestBackend::new(40, 6);
+        // Widened to 70, not 40 — Step 6's own history already hit
+        // silent truncation once at 40 for the provider label alone;
+        // the AGENTS.md suffix added here is longer still.
+        let backend = TestBackend::new(70, 6);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::with_core(Core::new(), ProviderLabel::Ollama);
+        let mut app = App::with_core(
+            Core::new(),
+            ProviderLabel::Ollama,
+            AgentsMdStatus {
+                project_found: true,
+                global_found: true,
+            },
+        );
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let content: String = terminal
@@ -552,14 +596,25 @@ mod tests {
             content.contains("local (ollama)"),
             "expected the active provider label to render: {content:?}"
         );
+        assert!(
+            content.contains("AGENTS.md (project+global)"),
+            "expected the AGENTS.md status to render: {content:?}"
+        );
     }
 
     #[test]
     fn draws_mistral_as_the_cloud_provider_in_the_chat_title() {
-        let backend = TestBackend::new(40, 6);
+        let backend = TestBackend::new(70, 6);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::with_core(Core::new(), ProviderLabel::Mistral);
+        let mut app = App::with_core(
+            Core::new(),
+            ProviderLabel::Mistral,
+            AgentsMdStatus {
+                project_found: false,
+                global_found: false,
+            },
+        );
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let content: String = terminal
@@ -573,6 +628,42 @@ mod tests {
         assert!(
             content.contains("cloud (mistral)"),
             "expected the active provider label to render: {content:?}"
+        );
+        assert!(
+            content.contains("no AGENTS.md"),
+            "expected the AGENTS.md status to render: {content:?}"
+        );
+    }
+
+    #[test]
+    fn agents_md_title_suffix_covers_all_four_combinations() {
+        assert_eq!(
+            agents_md_title_suffix(AgentsMdStatus {
+                project_found: false,
+                global_found: false
+            }),
+            "no AGENTS.md"
+        );
+        assert_eq!(
+            agents_md_title_suffix(AgentsMdStatus {
+                project_found: true,
+                global_found: false
+            }),
+            "AGENTS.md (project)"
+        );
+        assert_eq!(
+            agents_md_title_suffix(AgentsMdStatus {
+                project_found: false,
+                global_found: true
+            }),
+            "AGENTS.md (global)"
+        );
+        assert_eq!(
+            agents_md_title_suffix(AgentsMdStatus {
+                project_found: true,
+                global_found: true
+            }),
+            "AGENTS.md (project+global)"
         );
     }
 

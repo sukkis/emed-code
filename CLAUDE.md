@@ -32,7 +32,9 @@ belongs in `docs/<topic>.md` (gitignored), not in what ships.
   this is, fast: benefits, then quick advice to start using it. Not a
   tutorial (might add one separately later). Also holds the live
   roadmap (see "Suggested Rhythm" below) — forward-looking capabilities,
-  not a phase-tracking status list.
+  not a phase-tracking status list. Curated only — a stray idea doesn't
+  belong here just because it's forward-looking. An internal roadmap
+  for uncurated ideas can live under `docs/`.
 - **`ARCHITECTURE.md`** — maintainer-facing design decisions and their
   rationale (the *why*), for future me or a future contributor. Starts
   with a picture and a high-level overview; technical details fall
