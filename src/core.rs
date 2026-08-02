@@ -1,6 +1,16 @@
-// Conversation state, LLM round-trips, tool execution.
-// No ratatui/crossterm imports — tui-facing rendering/input state
-// lives in the tui module instead.
+//! Conversation state, provider round-trips, and tool execution.
+//!
+//! [`Core`] is the entry point: construct one, call
+//! [`Core::submit_user_message`], and drain [`Core::poll_events`] for
+//! whatever the model said or did in response — a reply, a tool call's
+//! result, or a write awaiting your confirmation via
+//! [`Core::respond_to_confirmation`]. Talking to a specific provider
+//! goes through the [`LlmClient`] trait, implemented by
+//! [`MistralClient`] and [`OllamaClient`].
+//!
+//! This module has no `ratatui`/`crossterm` imports — rendering and
+//! input live in [`crate::tui`] instead, which only ever talks to
+//! `Core` through the calls above.
 
 mod credentials;
 mod diff;
@@ -46,9 +56,15 @@ const MAX_TOOL_CALLS: usize = 40;
 // many extra round-trips on it.
 const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
 
+/// One thing that happened during an agent-loop round-trip, drained via
+/// [`Core::poll_events`]. A single [`Core::submit_user_message`] call
+/// can produce several of these, in the order they actually happened.
 #[derive(Debug, PartialEq)]
 pub enum CoreEvent {
+    /// The model's final answer for this turn — no more tool calls are
+    /// coming until the next `submit_user_message`.
     AssistantChunk(String),
+    /// One tool call's outcome.
     ToolCall {
         id: String,
         name: String,
@@ -60,37 +76,43 @@ pub enum CoreEvent {
         // actual (short, useful) message in full.
         result: Result<String, String>,
     },
-    // A write_file call awaiting user confirmation — the agent loop's
-    // background thread blocks right after sending this, until
-    // Core::respond_to_confirmation is called. No correlating id: the
-    // loop processes tool calls one at a time, so only one of these can
-    // ever be outstanding at once.
+    /// A `write_file` call awaiting your decision — pass it to
+    /// [`Core::respond_to_confirmation`] to apply or decline it. At
+    /// most one of these is ever outstanding at a time.
     WriteProposed {
         path: String,
         diff: Vec<DiffLine>,
     },
+    /// The exchange ended in an error — a connection failure, a
+    /// malformed provider response, or a safety cap (too many tool
+    /// calls, too many empty replies in a row) being hit.
     Error(String),
 }
 
-// The user's answer to a WriteProposed prompt. An enum, not a bool —
-// matches every other enum-of-kinds decision in this codebase, and
-// reads clearly at the call site (respond_to_confirmation(Apply), not
-// respond_to_confirmation(true)).
+/// Your answer to a [`CoreEvent::WriteProposed`] prompt, passed to
+/// [`Core::respond_to_confirmation`].
+// An enum, not a bool — matches every other enum-of-kinds decision in
+// this codebase, and reads clearly at the call site
+// (respond_to_confirmation(Apply), not respond_to_confirmation(true)).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConfirmationChoice {
     Apply,
     Decline,
 }
 
-// One entry in the conversation history. An enum, not a flat struct with
-// optional fields, so an invalid combination (e.g. a tool result with no
-// correlating id) isn't representable at all — matches every other enum
-// decision in this codebase (ChatError, CredentialSource, ProviderLabel).
+/// One entry in the conversation history that's resent, in full, with
+/// every request.
+// An enum, not a flat struct with optional fields, so an invalid
+// combination (e.g. a tool result with no correlating id) isn't
+// representable at all — matches every other enum decision in this
+// codebase (ChatError, CredentialSource, ProviderLabel).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
+    /// Something the user typed.
     User {
         content: String,
     },
+    /// A final answer the model previously gave.
     Assistant {
         content: String,
     },
@@ -100,6 +122,7 @@ pub enum Message {
     // assumption about whether the provider tolerates several separate
     // single-call turns as well as one multi-call turn; see
     // ARCHITECTURE.md's "Conversation history" section.
+    /// One requested tool invocation, from a previous turn.
     ToolCalls {
         calls: Vec<ToolCall>,
     },
@@ -108,6 +131,7 @@ pub enum Message {
     // requiring a provider to scan back through history for the
     // matching ToolCalls entry — Ollama's wire format correlates a
     // result to its request by name, not id, so it needs this directly.
+    /// The outcome of a previously-requested tool call.
     ToolResult {
         tool_call_id: String,
         name: String,
@@ -115,10 +139,11 @@ pub enum Message {
     },
 }
 
-// Describes one tool the model may call. `parameters` is a JSON schema
-// (Mistral's own tool-schema shape — see core::tools::tool_definitions
-// and core::mistral::to_mistral_tools), kept as serde_json::Value rather
-// than a typed struct since its shape varies per tool.
+/// Describes one tool the model may call, advertised on every request.
+// `parameters` is a JSON schema (Mistral's own tool-schema shape — see
+// core::tools::tool_definitions and core::mistral::to_mistral_tools),
+// kept as serde_json::Value rather than a typed struct since its shape
+// varies per tool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
@@ -126,9 +151,10 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-// One requested tool invocation. `arguments` stays a raw JSON string —
-// parsing it into typed arguments is each tool's own job, not something
-// LlmResponse itself should assume the shape of.
+/// One tool invocation the model requested.
+// `arguments` stays a raw JSON string — parsing it into typed
+// arguments is each tool's own job, not something LlmResponse itself
+// should assume the shape of.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub id: String,
@@ -136,15 +162,15 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// What a provider's [`LlmClient::send`] call produced: either a final
+/// answer, or one or more tool calls to dispatch before asking again.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmResponse {
     Text(String),
     ToolCalls(Vec<ToolCall>),
 }
 
-// Hand-written, not `thiserror` — per this project's Dependency
-// Discipline (parent CLAUDE.md), a handful of variants isn't worth a
-// dependency.
+/// Something that went wrong talking to a provider.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatError {
     Connection(String),
@@ -166,9 +192,13 @@ impl fmt::Display for ChatError {
 
 impl std::error::Error for ChatError {}
 
-// Implemented by each provider's client; Core talks to whichever one is
-// active only through this, never through a provider-specific type.
+/// Implemented by each provider's client — [`MistralClient`],
+/// [`OllamaClient`]. [`Core`] talks to whichever one is active only
+/// through this trait, never through a provider-specific type.
 pub trait LlmClient {
+    /// Sends one request: a system prompt, the conversation so far, and
+    /// the tools the model may call. Returns either a final answer or
+    /// one or more requested tool calls.
     fn send(
         &self,
         system: &str,
@@ -270,6 +300,10 @@ fn run_agent_loop(
     }
 }
 
+/// Conversation state, sandboxed root, and settings for one session.
+/// Construct with [`Core::new`] (local Ollama) or [`Core::with_client`]
+/// (any [`LlmClient`]), then drive it with [`Core::submit_user_message`]
+/// and [`Core::poll_events`].
 pub struct Core {
     client: Arc<dyn LlmClient + Send + Sync>,
     root: PathBuf,
@@ -300,10 +334,14 @@ impl Default for Core {
 }
 
 impl Core {
+    /// A session talking to local Ollama, sandboxed to the current
+    /// working directory.
     pub fn new() -> Self {
         Self::with_client(Arc::new(OllamaClient::new(OLLAMA_MODEL.to_string())))
     }
 
+    /// A session talking to any [`LlmClient`] — [`MistralClient`],
+    /// [`OllamaClient`], or a test double.
     pub fn with_client(client: Arc<dyn LlmClient + Send + Sync>) -> Self {
         let (tx, rx) = mpsc::channel();
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -322,6 +360,10 @@ impl Core {
         }
     }
 
+    /// Sends a user message and starts the agent loop on a background
+    /// thread so a slow provider round-trip never blocks the caller.
+    /// Returns immediately — drain [`Core::poll_events`] for whatever
+    /// comes back.
     pub fn submit_user_message(&mut self, text: String) {
         self.history.push(Message::User { content: text });
 
@@ -347,23 +389,27 @@ impl Core {
         });
     }
 
-    // Answers a pending WriteProposed prompt. A no-op if nothing is
-    // actually waiting (confirm_tx unset, or its receiving thread
-    // already gone) — sending into a channel nobody's listening to just
-    // errors silently, which is fine here.
+    /// Applies or declines a pending [`CoreEvent::WriteProposed`]
+    /// prompt. A no-op if nothing is actually waiting — sending into a
+    /// channel nobody's listening to just errors silently, which is
+    /// fine here.
     pub fn respond_to_confirmation(&mut self, choice: ConfirmationChoice) {
         if let Some(tx) = &self.confirm_tx {
             let _ = tx.send(choice);
         }
     }
 
-    // For main.rs to print a startup line right after construction —
-    // reads the status Core already computed, never re-reads either
-    // AGENTS.md file itself.
+    /// Whether a project-level and/or global `AGENTS.md` was found at
+    /// construction time — computed once, never re-read mid-session.
     pub fn agents_md_status(&self) -> AgentsMdStatus {
         self.agents_md_status
     }
 
+    /// Drains every [`CoreEvent`] produced since the last call. Never
+    /// blocks — `submit_user_message`'s agent loop runs on its own
+    /// thread, so a caller (the TUI's render loop, for one) can poll
+    /// this on every frame without stalling on network I/O while a
+    /// request is in flight.
     pub fn poll_events(&mut self) -> Vec<CoreEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {

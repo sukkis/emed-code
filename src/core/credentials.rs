@@ -3,6 +3,8 @@ use zeroize::Zeroizing;
 const MISTRAL_PASS_KEY: &str = "emed-code/mistral/api_key";
 const MISTRAL_API_KEY_ENV_VAR: &str = "MISTRAL_API_KEY";
 
+/// Where the resolved Mistral API key came from, for
+/// [`credential_log_message`]'s startup transparency line.
 #[derive(Debug, PartialEq)]
 pub enum CredentialSource {
     Pass,
@@ -32,9 +34,9 @@ pub fn credential_log_message(source: &CredentialSource) -> &'static str {
     }
 }
 
-// The real getfrompass/env var lookup. Not unit tested directly — same
-// as fetch_ollama_reply/fetch_mistral_reply — see resolve_mistral_api_key
-// for the tested decision logic this just feeds real values into.
+/// Resolves the Mistral API key: `getfrompass` first, falling back to
+/// the `MISTRAL_API_KEY` environment variable. `None` if neither has
+/// one.
 pub fn lookup_mistral_api_key() -> Option<(Zeroizing<String>, CredentialSource)> {
     let pass_value = getfrompass::try_get_from_pass(MISTRAL_PASS_KEY);
     let env_var_value = std::env::var(MISTRAL_API_KEY_ENV_VAR).ok();

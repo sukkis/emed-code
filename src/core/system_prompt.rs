@@ -90,6 +90,8 @@ pub(crate) fn load_system_prompt(root: &Path) -> (String, AgentsMdStatus) {
     combine_with_status(BASE_SYSTEM_PROMPT, global.as_deref(), project.as_deref())
 }
 
+/// Whether a project-level and/or global `AGENTS.md` was folded into
+/// the system prompt, shown in the chat title for the whole session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AgentsMdStatus {
     pub project_found: bool,
