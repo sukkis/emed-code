@@ -277,9 +277,9 @@ pub struct Core {
     // on every tool call (see run_agent_loop/submit_user_message) — see
     // settings.rs and SECURITY.md for what it currently blocks.
     settings: Settings,
-    // Computed once here, at construction — see system_prompt.rs and
-    // docs/system-prompt.md. Sent on every request via
-    // submit_user_message; never recomputed mid-session.
+    // Computed once here, at construction — see system_prompt.rs. Sent
+    // on every request via submit_user_message; never recomputed
+    // mid-session.
     system_prompt: String,
     agents_md_status: AgentsMdStatus,
     history: Vec<Message>,
@@ -502,9 +502,8 @@ mod tests {
     }
 
     // Proves Core actually sends the system_prompt it was constructed
-    // with — not the empty placeholder Step 2 left in — and that it's
-    // the same value on every call, not recomputed or dropped after the
-    // first. See docs/system-prompt.md.
+    // with, and that it's the same value on every call, not recomputed
+    // or dropped after the first.
     #[test]
     fn submit_user_message_sends_cores_system_prompt_on_every_call() {
         let root = TempDir::new();
@@ -568,9 +567,8 @@ mod tests {
             root,
             settings: Settings::default(),
             system_prompt,
-            // No existing test varies this — see docs/system-prompt.md
-            // for why Step 4's own tests cover the real found/not-found
-            // mapping at the system_prompt.rs level instead.
+            // No test here varies this — the real found/not-found
+            // mapping is covered at the system_prompt.rs level instead.
             agents_md_status: AgentsMdStatus {
                 project_found: false,
                 global_found: false,
@@ -774,10 +772,8 @@ mod tests {
         assert!(matches!(events.last(), Some(CoreEvent::Error(_))));
     }
 
-    // Direct coverage of the loop's plain-text path, replacing what
-    // to_core_event's own test used to check before that function was
-    // removed (its ToolCalls-is-unsupported branch became factually
-    // wrong once the loop actually dispatches tool calls).
+    // Direct coverage of the loop's plain-text path: a final answer
+    // with no tool calls involved reaches the caller unchanged.
     #[test]
     fn agent_loop_returns_assistant_chunk_for_a_plain_text_reply() {
         let root = TempDir::new();

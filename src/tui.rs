@@ -568,9 +568,9 @@ mod tests {
     // than one hardcoded string that happens to say "ollama".
     #[test]
     fn draws_ollama_as_the_local_provider_in_the_chat_title() {
-        // Widened to 70, not 40 — Step 6's own history already hit
-        // silent truncation once at 40 for the provider label alone;
-        // the AGENTS.md suffix added here is longer still.
+        // 70, not 40 — the title bar has to fit both the provider label
+        // and the AGENTS.md status suffix without truncating; 40 is
+        // already too narrow for the provider label by itself.
         let backend = TestBackend::new(70, 6);
         let mut terminal = Terminal::new(backend).unwrap();
 

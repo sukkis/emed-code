@@ -268,7 +268,7 @@ mod tests {
     use super::*;
 
     // The system-role wire-message prepended ahead of the mapped
-    // dialogue when a request is built — see docs/system-prompt.md.
+    // dialogue when a request is built.
     #[test]
     fn mistral_system_message_builds_the_expected_wire_shape() {
         assert_eq!(
