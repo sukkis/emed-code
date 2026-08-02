@@ -285,7 +285,10 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read the contents of a file within the project directory.".to_string(),
+            description: "Read the contents of a file within the project directory. If you \
+                aren't sure this exact path exists, confirm it first with \
+                list_files_recursive rather than guessing."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -301,7 +304,11 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
             name: "list_files".to_string(),
             description: "List files and directories within a directory in the project. Not \
                 recursive — a nested directory's contents won't appear. Use \
-                list_files_recursive if you need to search deeper than one level."
+                list_files_recursive if you need to search deeper than one level. Only call \
+                this with a path you've already confirmed exists, from prior tool output or an \
+                exact path the user gave you — if a request names a directory without a \
+                confirmed full path, call list_files_recursive at the project root (\".\") \
+                first instead of guessing this path."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -319,17 +326,26 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
             description: "Recursively list every file and directory nested under a directory \
                 in the project, not just its immediate children. Use this whenever you don't \
                 know exactly where a file or directory is located, instead of guessing a path \
-                or asking the user to clarify. Returned paths are always relative to the \
-                project root, ready to pass directly to read_file/write_file without \
-                modification. Directories end with a trailing \"/\"; build/VCS noise (target, \
-                .git, node_modules) is shown by name but not descended into."
+                or asking the user to clarify. If you're not yet familiar with this \
+                repository's layout, or a request references a file/directory without a \
+                confirmed path, run this at the project root (\".\") first rather than \
+                guessing. Returned paths are always relative to the project root, ready to \
+                pass directly to read_file/write_file without modification. Directories end \
+                with a trailing \"/\"; build/VCS noise (target, .git, node_modules) is shown \
+                by name but not descended into."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the directory, relative to the project root. Use \".\" for the project root."
+                        "description": "Path to the directory, relative to the project root. \
+                            Use \".\" for the project root. Treat a directory name mentioned \
+                            in a request as a fuzzy description, not a literal path — it could \
+                            exist somewhere else in the tree (e.g. \"core\" might really be \
+                            \"src/core\"). If you haven't already confirmed the exact path \
+                            from prior tool output, use \".\" here instead of guessing the \
+                            name directly."
                     }
                 },
                 "required": ["path"]
@@ -1070,6 +1086,97 @@ mod tests {
                 "list_files_recursive",
                 "write_file"
             ]
+        );
+    }
+
+    // Guards the specific behavioral addition from docs/tool-descriptions.md
+    // Step 1 (a model given an uncertain path should confirm it via
+    // list_files_recursive rather than guess) — not a full-text pin of
+    // read_file's description, which is a review concern, not a test one.
+    #[test]
+    fn read_file_description_points_to_list_files_recursive_for_an_uncertain_path() {
+        let definitions = tool_definitions();
+        let read_file_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "read_file")
+            .expect("read_file should be advertised");
+
+        assert!(
+            read_file_definition
+                .description
+                .contains("list_files_recursive"),
+            "expected read_file's description to point to list_files_recursive for an \
+             uncertain path, got: {:?}",
+            read_file_definition.description
+        );
+    }
+
+    // Guards docs/tool-descriptions.md Step 2's redirect: list_files
+    // itself should warn against guessing an unconfirmed path, not just
+    // rely on list_files_recursive's own "use this instead" framing,
+    // which a model considering list_files never sees.
+    #[test]
+    fn list_files_description_warns_against_an_unconfirmed_path() {
+        let definitions = tool_definitions();
+        let list_files_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "list_files")
+            .expect("list_files should be advertised");
+
+        assert!(
+            list_files_definition.description.contains("confirmed"),
+            "expected list_files's description to warn against calling it with an \
+             unconfirmed path, got: {:?}",
+            list_files_definition.description
+        );
+    }
+
+    // Guards docs/tool-descriptions.md Step 2's scoped addition:
+    // list_files_recursive should frame itself as the starting point for
+    // not-yet-familiar repo layouts, not only for a specific missing
+    // file/directory (the existing "guessing a path" sentence already
+    // covers that narrower case).
+    #[test]
+    fn list_files_recursive_description_covers_unfamiliar_repo_layout() {
+        let definitions = tool_definitions();
+        let list_files_recursive_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "list_files_recursive")
+            .expect("list_files_recursive should be advertised");
+
+        assert!(
+            list_files_recursive_definition
+                .description
+                .contains("familiar"),
+            "expected list_files_recursive's description to cover an unfamiliar repo \
+             layout, not just a single missing path, got: {:?}",
+            list_files_recursive_definition.description
+        );
+    }
+
+    // Guards docs/tool-descriptions.md's revised Step 2 scope: manual
+    // testing found the guess can survive at the parameter level even
+    // once the top-level description steers the model to the right
+    // tool — list_files_recursive gets called, but with a guessed path
+    // like "core" instead of ".". The tool-level description can't fix
+    // an argument choice; only the path parameter's own text can.
+    #[test]
+    fn list_files_recursive_path_parameter_prefers_root_over_guessing() {
+        let definitions = tool_definitions();
+        let list_files_recursive_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "list_files_recursive")
+            .expect("list_files_recursive should be advertised");
+
+        let path_description =
+            list_files_recursive_definition.parameters["properties"]["path"]["description"]
+                .as_str()
+                .expect("path parameter should have a string description");
+
+        assert!(
+            path_description.contains("guessing"),
+            "expected list_files_recursive's path parameter to steer toward the project root \
+             over guessing an uncertain nested path, got: {path_description:?}"
         );
     }
 }

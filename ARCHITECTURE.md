@@ -212,6 +212,16 @@ requiring it to then manually re-prepend a queried directory onto an
 already multi-segment path would reintroduce a smaller version of the
 same failure mode.
 
+The same guessing problem later showed up on `list_files` itself: a
+model would call it with a plausible-looking but wrong path (e.g.
+`"core"` when the real directory was `src/core`) instead of confirming
+the layout first. `list_files_recursive`'s own description already
+pointed models toward it as the fallback, but a model only weighs
+guidance written on a tool it's already considering calling — so
+`list_files` now carries its own warning against an unconfirmed path,
+redirecting to `list_files_recursive` before the guess happens rather
+than only after it fails.
+
 The walk uses `DirEntry::file_type()`, not `Path::metadata()`, to
 decide whether to recurse into an entry. This isn't just a style
 choice: `file_type()` reports a symlink's own type without following
