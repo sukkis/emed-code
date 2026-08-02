@@ -79,10 +79,7 @@ pub enum CoreEvent {
     /// A `write_file` call awaiting your decision — pass it to
     /// [`Core::respond_to_confirmation`] to apply or decline it. At
     /// most one of these is ever outstanding at a time.
-    WriteProposed {
-        path: String,
-        diff: Vec<DiffLine>,
-    },
+    WriteProposed { path: String, diff: Vec<DiffLine> },
     /// The exchange ended in an error — a connection failure, a
     /// malformed provider response, or a safety cap (too many tool
     /// calls, too many empty replies in a row) being hit.
@@ -109,13 +106,9 @@ pub enum ConfirmationChoice {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// Something the user typed.
-    User {
-        content: String,
-    },
+    User { content: String },
     /// A final answer the model previously gave.
-    Assistant {
-        content: String,
-    },
+    Assistant { content: String },
     // The assistant's turn requesting one or more tool invocations. One
     // entry per individual call, not one entry per LLM turn (which could
     // batch several) — a deliberate simplification with a real, unverified
@@ -123,9 +116,7 @@ pub enum Message {
     // single-call turns as well as one multi-call turn; see
     // ARCHITECTURE.md's "Conversation history" section.
     /// One requested tool invocation, from a previous turn.
-    ToolCalls {
-        calls: Vec<ToolCall>,
-    },
+    ToolCalls { calls: Vec<ToolCall> },
     // One tool's result, correlated back to its request via tool_call_id.
     // Also carries the tool's own name, self-contained rather than
     // requiring a provider to scan back through history for the

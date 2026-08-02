@@ -1,9 +1,12 @@
-// Command-line flag parsing. No conversation state (core) or
-// rendering/input state (tui) here — just turning argv into a resolved
-// provider + model choice for main.rs to act on.
+//! Command-line flag parsing.
+//!
+//! No conversation state ([`crate::core`]) or rendering/input state
+//! ([`crate::tui`]) here — just turning argv into a resolved provider
+//! and model choice for `main.rs` to act on.
 
 use clap::{Parser, ValueEnum};
 
+/// Which LLM backend to talk to.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum Provider {
     Ollama,
@@ -27,6 +30,8 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// The model to actually use: `--model` if given, otherwise a
+    /// sensible per-provider default.
     pub fn resolved_model(&self) -> String {
         self.model
             .clone()
