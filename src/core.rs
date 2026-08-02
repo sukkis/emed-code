@@ -38,6 +38,14 @@ use std::thread;
 // off legitimate work (e.g. reading a new project's ~15-20 files).
 const MAX_TOOL_CALLS: usize = 40;
 
+// An empty (or whitespace-only) reply looks like a transient glitch
+// rather than a real answer, so it gets a few blind retries — the same
+// request resent unchanged — before giving up. Small on purpose: this
+// is a bet on a one-off hiccup clearing, not an attempt to coax a
+// better answer out of the model, so there's little reason to spend
+// many extra round-trips on it.
+const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
+
 #[derive(Debug, PartialEq)]
 pub enum CoreEvent {
     AssistantChunk(String),
@@ -187,10 +195,22 @@ fn run_agent_loop(
 ) {
     let tool_defs = tool_definitions();
     let mut tool_call_count = 0usize;
+    let mut empty_response_count = 0usize;
 
     loop {
         match client.send(system, &history, &tool_defs) {
             Ok(LlmResponse::Text(text)) => {
+                if text.trim().is_empty() {
+                    empty_response_count += 1;
+                    if empty_response_count > MAX_EMPTY_RESPONSE_RETRIES {
+                        let _ = tx.send(CoreEvent::Error(format!(
+                            "the model returned an empty response after {} attempts",
+                            MAX_EMPTY_RESPONSE_RETRIES + 1
+                        )));
+                        return;
+                    }
+                    continue;
+                }
                 let _ = tx.send(CoreEvent::AssistantChunk(text));
                 return;
             }
@@ -786,6 +806,93 @@ mod tests {
         let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
 
         assert!(matches!(events[0], CoreEvent::Error(_)));
+    }
+
+    // An empty (or whitespace-only) reply is treated as a probably-
+    // transient glitch, not a real final answer, and gets blindly
+    // retried — the exact same history resent, nothing pushed for the
+    // empty attempts themselves. Asserting the three recorded calls are
+    // identical is the direct proof of "blind": no injected message, no
+    // mutation between attempts.
+    #[test]
+    fn agent_loop_retries_an_empty_response_then_succeeds() {
+        let root = TempDir::new();
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::Text("".to_string())),
+            Ok(LlmResponse::Text("   ".to_string())),
+            Ok(LlmResponse::Text("real answer".to_string())),
+        ]));
+
+        let mut core = core_with_root(client.clone(), root.path().to_path_buf(), String::new());
+        core.submit_user_message("hello".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        assert_eq!(
+            events[0],
+            CoreEvent::AssistantChunk("real answer".to_string())
+        );
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "expected exactly 3 attempts, got {calls:?}");
+        assert_eq!(
+            calls[0], calls[1],
+            "expected a blind retry: identical history resent, not mutated"
+        );
+        assert_eq!(
+            calls[1], calls[2],
+            "expected a blind retry: identical history resent, not mutated"
+        );
+    }
+
+    // The give-up path: after a fixed number of retries still empty,
+    // the loop stops with a clear error instead of returning the empty
+    // text as if it were a real answer — same pattern MAX_TOOL_CALLS
+    // already established for its own cap.
+    #[test]
+    fn agent_loop_gives_up_after_max_empty_response_retries() {
+        let root = TempDir::new();
+        // A single scripted response, repeated for every call (see
+        // ScriptedClient::send's index-clamping) — proves the loop
+        // stops via the retry cap instead of retrying forever.
+        let client = Arc::new(ScriptedClient::new(vec![Ok(LlmResponse::Text(
+            "".to_string(),
+        ))]));
+
+        let mut core = core_with_root(client.clone(), root.path().to_path_buf(), String::new());
+        core.submit_user_message("hello".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        match &events[0] {
+            CoreEvent::Error(message) => assert!(
+                message.contains("empty"),
+                "expected the error to identify an empty response, got: {message:?}"
+            ),
+            other => panic!("expected a CoreEvent::Error, got {other:?}"),
+        }
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "expected exactly 3 attempts, got {calls:?}");
+    }
+
+    // Regression guard: a real first response must not trigger any
+    // retry at all — proves the new empty-response logic only engages
+    // when it needs to, not on every text reply.
+    #[test]
+    fn agent_loop_does_not_retry_a_real_first_response() {
+        let root = TempDir::new();
+        let client = Arc::new(ScriptedClient::new(vec![Ok(LlmResponse::Text(
+            "real answer".to_string(),
+        ))]));
+
+        let mut core = core_with_root(client.clone(), root.path().to_path_buf(), String::new());
+        core.submit_user_message("hello".to_string());
+
+        poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected no retry, got {calls:?}");
     }
 
     // The real cross-thread blocking. Deliberately observes the file
