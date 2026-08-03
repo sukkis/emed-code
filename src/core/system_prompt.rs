@@ -1,13 +1,13 @@
 // Builds the system prompt sent on every request: a base prompt plus
 // optional AGENTS.md content from the user's global config and the
-// current project. See docs/system-prompt.md for the reasoning behind
-// the base prompt's wording and the combination order.
+// current project — see ARCHITECTURE.md's "System prompt" section for
+// the combination order and design rationale.
 
 use std::path::{Path, PathBuf};
 
 // "You have no way to run code, a build, or tests" is only true until
-// a run_command tool exists (see docs/harness-roadmap.md) — this line
-// needs rewriting the day that lands, not before.
+// a run_command tool exists — this line needs rewriting the day that
+// lands, not before.
 pub(crate) const BASE_SYSTEM_PROMPT: &str = "You are an AI coding assistant operating inside a terminal \
     session, working directly on the user's local project files through the \
     tools available to you.\n\n\
@@ -27,13 +27,14 @@ pub(crate) const BASE_SYSTEM_PROMPT: &str = "You are an AI coding assistant oper
 
 // Global before project (general before specific, ending closest to
 // the actual conversation) and straight concatenation, not an
-// override — see docs/system-prompt.md for why no precedence logic is
-// needed between the two sources. `base` is a parameter, not read
-// directly from BASE_SYSTEM_PROMPT here, so this function's
-// combination logic can be tested against a short fixture instead of
-// duplicating the real ~200-word prompt — its wording isn't separately
-// unit-tested, since it's plain content, not logic; matching
-// docs/system-prompt.md is a code-review concern, not a test one.
+// override — the two sources are complementary (personal style vs.
+// project facts), not conflicting, so neither needs to win over the
+// other. `base` is a parameter, not read directly from
+// BASE_SYSTEM_PROMPT here, so this function's combination logic can be
+// tested against a short fixture instead of duplicating the real
+// ~200-word prompt — its wording isn't separately unit-tested, since
+// it's plain content, not logic; matching the agreed wording is a
+// code-review concern, not a test one.
 pub(crate) fn build_system_prompt(
     base: &str,
     global: Option<&str>,
@@ -63,9 +64,8 @@ pub(crate) fn read_agents_md(path: &Path) -> Option<String> {
 }
 
 // AGENTS.md lives alongside the project's own code, inside the
-// sandboxed root — see docs/system-prompt.md for the self-modification
-// risk this implies and why it's accepted, and SECURITY.md for the
-// current-state note.
+// sandboxed root — see SECURITY.md's "AGENTS.md content trust" section
+// for the self-modification risk this implies and why it's accepted.
 pub(crate) fn project_agents_md_path(root: &Path) -> PathBuf {
     root.join("AGENTS.md")
 }
@@ -90,6 +90,8 @@ pub(crate) fn load_system_prompt(root: &Path) -> (String, AgentsMdStatus) {
     combine_with_status(BASE_SYSTEM_PROMPT, global.as_deref(), project.as_deref())
 }
 
+/// Whether a project-level and/or global `AGENTS.md` was folded into
+/// the system prompt, shown in the chat title for the whole session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AgentsMdStatus {
     pub project_found: bool,

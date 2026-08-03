@@ -1,5 +1,11 @@
-// ratatui rendering and crossterm input handling. Talks to `core` only
-// through Core::submit_user_message/poll_events.
+//! Terminal rendering ([`ratatui`]) and keyboard input
+//! ([`ratatui::crossterm`]).
+//!
+//! [`App`] holds everything the UI needs — the chat log, input buffer,
+//! scroll position — and drives [`crate::core::Core`] only through its
+//! public `submit_user_message`/`poll_events` calls, never touching its
+//! internals directly. [`draw`] renders one frame from an `&App`;
+//! [`App::handle_key`] and [`is_quit_key`] handle input.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -102,12 +108,11 @@ fn diff_line_with_annotation(
     }
 }
 
-// One entry in the chat log — an enum, not a plain String, specifically
-// so a proposed write's diff can carry real per-line color through to
-// rendering (Text's word-wrapping/plain-string treatment doesn't apply
-// to it the way it does to everything else). pub, matching every other
-// data type App::log() and friends expose (CoreEvent, Message, ...) —
-// App::log() is itself a pub fn, so its element type needs to be too.
+/// One entry in the chat log, returned by [`App::log`].
+// An enum, not a plain String, specifically so a proposed write's diff
+// can carry real per-line color through to rendering (Text's
+// word-wrapping/plain-string treatment doesn't apply to it the way it
+// does to everything else).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogEntry {
     Text(String),
@@ -231,12 +236,16 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// Whether this key press should quit the app — `Ctrl-C` or `Ctrl-Q`.
 pub fn is_quit_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
 }
 
+/// Renders one frame: the chat log (scrolled to `app`'s current
+/// position) and either the input box or, while a write awaits
+/// confirmation, a numbered apply/decline menu.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
@@ -282,6 +291,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The single-line text buffer backing the chat input box.
 #[derive(Debug, Default)]
 pub struct InputBox {
     buffer: String,
@@ -292,6 +302,8 @@ impl InputBox {
         Self::default()
     }
 
+    /// Applies one key press: typed characters are appended,
+    /// `Backspace` removes the last one, everything else is ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -306,6 +318,7 @@ impl InputBox {
         }
     }
 
+    /// The buffer's current contents.
     pub fn buffer(&self) -> &str {
         &self.buffer
     }
@@ -316,11 +329,12 @@ impl InputBox {
     }
 }
 
-// Static, startup-time label for which provider is active — not a live
-// switch (provider selection stays a one-time CLI choice). Its own enum
-// rather than reusing cli::Provider directly, so tui doesn't take on a
-// dependency on the cli module for what is, from tui's perspective,
-// just display text.
+/// Which provider is active, shown in the chat title for the whole
+/// session — a static, startup-time label, not a live switch (provider
+/// selection stays a one-time CLI choice).
+// Its own enum rather than reusing cli::Provider directly, so tui
+// doesn't take on a dependency on the cli module for what is, from
+// tui's perspective, just display text.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderLabel {
     Ollama,
@@ -349,6 +363,11 @@ fn agents_md_title_suffix(status: AgentsMdStatus) -> &'static str {
     }
 }
 
+/// All UI state for one session: the chat log, input buffer, scroll
+/// position, and the [`crate::core::Core`] it drives. Construct with
+/// [`App::new`] (local Ollama) or [`App::with_core`] (any `Core`),
+/// feed it key events via [`App::handle_key`], and render it with
+/// [`draw`].
 pub struct App {
     input: InputBox,
     log: Vec<LogEntry>,
@@ -374,6 +393,10 @@ impl Default for App {
 }
 
 impl App {
+    /// An app talking to local Ollama, with the chat title's
+    /// `AGENTS.md` status defaulted to "none found" — real callers
+    /// should use [`App::with_core`] with the status `Core` actually
+    /// computed.
     pub fn new() -> Self {
         Self::with_core(
             Core::new(),
@@ -385,6 +408,10 @@ impl App {
         )
     }
 
+    /// An app wrapping an already-constructed `Core` — `provider_label`
+    /// and `agents_md_status` are passed in explicitly, not derived
+    /// from `core`, so they can be set without depending on `Core`'s
+    /// own real construction (real file I/O, a real provider choice).
     pub fn with_core(
         core: Core,
         provider_label: ProviderLabel,
@@ -402,6 +429,9 @@ impl App {
         }
     }
 
+    /// Applies one key press: scrolling, the confirmation menu
+    /// (1/2/Enter) while a write is pending, `Enter` to submit a
+    /// message, or plain typing otherwise.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -454,6 +484,8 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    /// Drains `Core`'s pending events and appends them to the chat log
+    /// — call this on every UI tick.
     pub fn poll_core_events(&mut self) {
         let events = self.core.poll_events();
         self.apply_core_events(events);
@@ -482,30 +514,39 @@ impl App {
         }
     }
 
+    /// The chat log rendered so far, in order.
     pub fn log(&self) -> &[LogEntry] {
         &self.log
     }
 
+    /// The path of a `write_file` call awaiting apply/decline, if any.
     pub fn pending_confirmation(&self) -> Option<&str> {
         self.pending_confirmation.as_deref()
     }
 
+    /// The active provider, for the chat title.
     pub fn provider_label(&self) -> ProviderLabel {
         self.provider_label
     }
 
+    /// Whether an `AGENTS.md` was found, for the chat title.
     pub fn agents_md_status(&self) -> AgentsMdStatus {
         self.agents_md_status
     }
 
+    /// The chat input box's current contents.
     pub fn input_buffer(&self) -> &str {
         self.input.buffer()
     }
 
+    /// How many lines up from the bottom the chat log is scrolled.
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
 
+    /// Sets the scroll ceiling — called by [`draw`] once it knows how
+    /// many rendered lines actually exist, since that isn't known
+    /// until render time.
     pub fn set_max_scroll(&mut self, max_scroll: usize) {
         self.max_scroll = max_scroll;
     }
@@ -568,9 +609,9 @@ mod tests {
     // than one hardcoded string that happens to say "ollama".
     #[test]
     fn draws_ollama_as_the_local_provider_in_the_chat_title() {
-        // Widened to 70, not 40 — Step 6's own history already hit
-        // silent truncation once at 40 for the provider label alone;
-        // the AGENTS.md suffix added here is longer still.
+        // 70, not 40 — the title bar has to fit both the provider label
+        // and the AGENTS.md status suffix without truncating; 40 is
+        // already too narrow for the provider label by itself.
         let backend = TestBackend::new(70, 6);
         let mut terminal = Terminal::new(backend).unwrap();
 

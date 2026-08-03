@@ -1,6 +1,16 @@
-// Conversation state, LLM round-trips, tool execution.
-// No ratatui/crossterm imports — tui-facing rendering/input state
-// lives in the tui module instead.
+//! Conversation state, provider round-trips, and tool execution.
+//!
+//! [`Core`] is the entry point: construct one, call
+//! [`Core::submit_user_message`], and drain [`Core::poll_events`] for
+//! whatever the model said or did in response — a reply, a tool call's
+//! result, or a write awaiting your confirmation via
+//! [`Core::respond_to_confirmation`]. Talking to a specific provider
+//! goes through the [`LlmClient`] trait, implemented by
+//! [`MistralClient`] and [`OllamaClient`].
+//!
+//! This module has no `ratatui`/`crossterm` imports — rendering and
+//! input live in [`crate::tui`] instead, which only ever talks to
+//! `Core` through the calls above.
 
 mod credentials;
 mod diff;
@@ -38,9 +48,23 @@ use std::thread;
 // off legitimate work (e.g. reading a new project's ~15-20 files).
 const MAX_TOOL_CALLS: usize = 40;
 
+// An empty (or whitespace-only) reply looks like a transient glitch
+// rather than a real answer, so it gets a few blind retries — the same
+// request resent unchanged — before giving up. Small on purpose: this
+// is a bet on a one-off hiccup clearing, not an attempt to coax a
+// better answer out of the model, so there's little reason to spend
+// many extra round-trips on it.
+const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
+
+/// One thing that happened during an agent-loop round-trip, drained via
+/// [`Core::poll_events`]. A single [`Core::submit_user_message`] call
+/// can produce several of these, in the order they actually happened.
 #[derive(Debug, PartialEq)]
 pub enum CoreEvent {
+    /// The model's final answer for this turn — no more tool calls are
+    /// coming until the next `submit_user_message`.
     AssistantChunk(String),
+    /// One tool call's outcome.
     ToolCall {
         id: String,
         name: String,
@@ -52,54 +76,53 @@ pub enum CoreEvent {
         // actual (short, useful) message in full.
         result: Result<String, String>,
     },
-    // A write_file call awaiting user confirmation — the agent loop's
-    // background thread blocks right after sending this, until
-    // Core::respond_to_confirmation is called. No correlating id: the
-    // loop processes tool calls one at a time, so only one of these can
-    // ever be outstanding at once.
-    WriteProposed {
-        path: String,
-        diff: Vec<DiffLine>,
-    },
+    /// A `write_file` call awaiting your decision — pass it to
+    /// [`Core::respond_to_confirmation`] to apply or decline it. At
+    /// most one of these is ever outstanding at a time.
+    WriteProposed { path: String, diff: Vec<DiffLine> },
+    /// The exchange ended in an error — a connection failure, a
+    /// malformed provider response, or a safety cap (too many tool
+    /// calls, too many empty replies in a row) being hit.
     Error(String),
 }
 
-// The user's answer to a WriteProposed prompt. An enum, not a bool —
-// matches every other enum-of-kinds decision in this codebase, and
-// reads clearly at the call site (respond_to_confirmation(Apply), not
-// respond_to_confirmation(true)).
+/// Your answer to a [`CoreEvent::WriteProposed`] prompt, passed to
+/// [`Core::respond_to_confirmation`].
+// An enum, not a bool — matches every other enum-of-kinds decision in
+// this codebase, and reads clearly at the call site
+// (respond_to_confirmation(Apply), not respond_to_confirmation(true)).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConfirmationChoice {
     Apply,
     Decline,
 }
 
-// One entry in the conversation history. An enum, not a flat struct with
-// optional fields, so an invalid combination (e.g. a tool result with no
-// correlating id) isn't representable at all — matches every other enum
-// decision in this codebase (ChatError, CredentialSource, ProviderLabel).
+/// One entry in the conversation history that's resent, in full, with
+/// every request.
+// An enum, not a flat struct with optional fields, so an invalid
+// combination (e.g. a tool result with no correlating id) isn't
+// representable at all — matches every other enum decision in this
+// codebase (ChatError, CredentialSource, ProviderLabel).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    User {
-        content: String,
-    },
-    Assistant {
-        content: String,
-    },
+    /// Something the user typed.
+    User { content: String },
+    /// A final answer the model previously gave.
+    Assistant { content: String },
     // The assistant's turn requesting one or more tool invocations. One
     // entry per individual call, not one entry per LLM turn (which could
     // batch several) — a deliberate simplification with a real, unverified
     // assumption about whether the provider tolerates several separate
     // single-call turns as well as one multi-call turn; see
     // ARCHITECTURE.md's "Conversation history" section.
-    ToolCalls {
-        calls: Vec<ToolCall>,
-    },
+    /// One requested tool invocation, from a previous turn.
+    ToolCalls { calls: Vec<ToolCall> },
     // One tool's result, correlated back to its request via tool_call_id.
     // Also carries the tool's own name, self-contained rather than
     // requiring a provider to scan back through history for the
     // matching ToolCalls entry — Ollama's wire format correlates a
     // result to its request by name, not id, so it needs this directly.
+    /// The outcome of a previously-requested tool call.
     ToolResult {
         tool_call_id: String,
         name: String,
@@ -107,10 +130,11 @@ pub enum Message {
     },
 }
 
-// Describes one tool the model may call. `parameters` is a JSON schema
-// (Mistral's own tool-schema shape — see core::tools::tool_definitions
-// and core::mistral::to_mistral_tools), kept as serde_json::Value rather
-// than a typed struct since its shape varies per tool.
+/// Describes one tool the model may call, advertised on every request.
+// `parameters` is a JSON schema (Mistral's own tool-schema shape — see
+// core::tools::tool_definitions and core::mistral::to_mistral_tools),
+// kept as serde_json::Value rather than a typed struct since its shape
+// varies per tool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
@@ -118,9 +142,10 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-// One requested tool invocation. `arguments` stays a raw JSON string —
-// parsing it into typed arguments is each tool's own job, not something
-// LlmResponse itself should assume the shape of.
+/// One tool invocation the model requested.
+// `arguments` stays a raw JSON string — parsing it into typed
+// arguments is each tool's own job, not something LlmResponse itself
+// should assume the shape of.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub id: String,
@@ -128,15 +153,15 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// What a provider's [`LlmClient::send`] call produced: either a final
+/// answer, or one or more tool calls to dispatch before asking again.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmResponse {
     Text(String),
     ToolCalls(Vec<ToolCall>),
 }
 
-// Hand-written, not `thiserror` — per this project's Dependency
-// Discipline (parent CLAUDE.md), a handful of variants isn't worth a
-// dependency.
+/// Something that went wrong talking to a provider.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatError {
     Connection(String),
@@ -158,9 +183,13 @@ impl fmt::Display for ChatError {
 
 impl std::error::Error for ChatError {}
 
-// Implemented by each provider's client; Core talks to whichever one is
-// active only through this, never through a provider-specific type.
+/// Implemented by each provider's client — [`MistralClient`],
+/// [`OllamaClient`]. [`Core`] talks to whichever one is active only
+/// through this trait, never through a provider-specific type.
 pub trait LlmClient {
+    /// Sends one request: a system prompt, the conversation so far, and
+    /// the tools the model may call. Returns either a final answer or
+    /// one or more requested tool calls.
     fn send(
         &self,
         system: &str,
@@ -187,10 +216,22 @@ fn run_agent_loop(
 ) {
     let tool_defs = tool_definitions();
     let mut tool_call_count = 0usize;
+    let mut empty_response_count = 0usize;
 
     loop {
         match client.send(system, &history, &tool_defs) {
             Ok(LlmResponse::Text(text)) => {
+                if text.trim().is_empty() {
+                    empty_response_count += 1;
+                    if empty_response_count > MAX_EMPTY_RESPONSE_RETRIES {
+                        let _ = tx.send(CoreEvent::Error(format!(
+                            "the model returned an empty response after {} attempts",
+                            MAX_EMPTY_RESPONSE_RETRIES + 1
+                        )));
+                        return;
+                    }
+                    continue;
+                }
                 let _ = tx.send(CoreEvent::AssistantChunk(text));
                 return;
             }
@@ -250,6 +291,10 @@ fn run_agent_loop(
     }
 }
 
+/// Conversation state, sandboxed root, and settings for one session.
+/// Construct with [`Core::new`] (local Ollama) or [`Core::with_client`]
+/// (any [`LlmClient`]), then drive it with [`Core::submit_user_message`]
+/// and [`Core::poll_events`].
 pub struct Core {
     client: Arc<dyn LlmClient + Send + Sync>,
     root: PathBuf,
@@ -257,9 +302,9 @@ pub struct Core {
     // on every tool call (see run_agent_loop/submit_user_message) — see
     // settings.rs and SECURITY.md for what it currently blocks.
     settings: Settings,
-    // Computed once here, at construction — see system_prompt.rs and
-    // docs/system-prompt.md. Sent on every request via
-    // submit_user_message; never recomputed mid-session.
+    // Computed once here, at construction — see system_prompt.rs. Sent
+    // on every request via submit_user_message; never recomputed
+    // mid-session.
     system_prompt: String,
     agents_md_status: AgentsMdStatus,
     history: Vec<Message>,
@@ -280,10 +325,14 @@ impl Default for Core {
 }
 
 impl Core {
+    /// A session talking to local Ollama, sandboxed to the current
+    /// working directory.
     pub fn new() -> Self {
         Self::with_client(Arc::new(OllamaClient::new(OLLAMA_MODEL.to_string())))
     }
 
+    /// A session talking to any [`LlmClient`] — [`MistralClient`],
+    /// [`OllamaClient`], or a test double.
     pub fn with_client(client: Arc<dyn LlmClient + Send + Sync>) -> Self {
         let (tx, rx) = mpsc::channel();
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -302,6 +351,10 @@ impl Core {
         }
     }
 
+    /// Sends a user message and starts the agent loop on a background
+    /// thread so a slow provider round-trip never blocks the caller.
+    /// Returns immediately — drain [`Core::poll_events`] for whatever
+    /// comes back.
     pub fn submit_user_message(&mut self, text: String) {
         self.history.push(Message::User { content: text });
 
@@ -327,23 +380,27 @@ impl Core {
         });
     }
 
-    // Answers a pending WriteProposed prompt. A no-op if nothing is
-    // actually waiting (confirm_tx unset, or its receiving thread
-    // already gone) — sending into a channel nobody's listening to just
-    // errors silently, which is fine here.
+    /// Applies or declines a pending [`CoreEvent::WriteProposed`]
+    /// prompt. A no-op if nothing is actually waiting — sending into a
+    /// channel nobody's listening to just errors silently, which is
+    /// fine here.
     pub fn respond_to_confirmation(&mut self, choice: ConfirmationChoice) {
         if let Some(tx) = &self.confirm_tx {
             let _ = tx.send(choice);
         }
     }
 
-    // For main.rs to print a startup line right after construction —
-    // reads the status Core already computed, never re-reads either
-    // AGENTS.md file itself.
+    /// Whether a project-level and/or global `AGENTS.md` was found at
+    /// construction time — computed once, never re-read mid-session.
     pub fn agents_md_status(&self) -> AgentsMdStatus {
         self.agents_md_status
     }
 
+    /// Drains every [`CoreEvent`] produced since the last call. Never
+    /// blocks — `submit_user_message`'s agent loop runs on its own
+    /// thread, so a caller (the TUI's render loop, for one) can poll
+    /// this on every frame without stalling on network I/O while a
+    /// request is in flight.
     pub fn poll_events(&mut self) -> Vec<CoreEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
@@ -482,9 +539,8 @@ mod tests {
     }
 
     // Proves Core actually sends the system_prompt it was constructed
-    // with — not the empty placeholder Step 2 left in — and that it's
-    // the same value on every call, not recomputed or dropped after the
-    // first. See docs/system-prompt.md.
+    // with, and that it's the same value on every call, not recomputed
+    // or dropped after the first.
     #[test]
     fn submit_user_message_sends_cores_system_prompt_on_every_call() {
         let root = TempDir::new();
@@ -548,9 +604,8 @@ mod tests {
             root,
             settings: Settings::default(),
             system_prompt,
-            // No existing test varies this — see docs/system-prompt.md
-            // for why Step 4's own tests cover the real found/not-found
-            // mapping at the system_prompt.rs level instead.
+            // No test here varies this — the real found/not-found
+            // mapping is covered at the system_prompt.rs level instead.
             agents_md_status: AgentsMdStatus {
                 project_found: false,
                 global_found: false,
@@ -754,10 +809,8 @@ mod tests {
         assert!(matches!(events.last(), Some(CoreEvent::Error(_))));
     }
 
-    // Direct coverage of the loop's plain-text path, replacing what
-    // to_core_event's own test used to check before that function was
-    // removed (its ToolCalls-is-unsupported branch became factually
-    // wrong once the loop actually dispatches tool calls).
+    // Direct coverage of the loop's plain-text path: a final answer
+    // with no tool calls involved reaches the caller unchanged.
     #[test]
     fn agent_loop_returns_assistant_chunk_for_a_plain_text_reply() {
         let root = TempDir::new();
@@ -786,6 +839,93 @@ mod tests {
         let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
 
         assert!(matches!(events[0], CoreEvent::Error(_)));
+    }
+
+    // An empty (or whitespace-only) reply is treated as a probably-
+    // transient glitch, not a real final answer, and gets blindly
+    // retried — the exact same history resent, nothing pushed for the
+    // empty attempts themselves. Asserting the three recorded calls are
+    // identical is the direct proof of "blind": no injected message, no
+    // mutation between attempts.
+    #[test]
+    fn agent_loop_retries_an_empty_response_then_succeeds() {
+        let root = TempDir::new();
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::Text("".to_string())),
+            Ok(LlmResponse::Text("   ".to_string())),
+            Ok(LlmResponse::Text("real answer".to_string())),
+        ]));
+
+        let mut core = core_with_root(client.clone(), root.path().to_path_buf(), String::new());
+        core.submit_user_message("hello".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        assert_eq!(
+            events[0],
+            CoreEvent::AssistantChunk("real answer".to_string())
+        );
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "expected exactly 3 attempts, got {calls:?}");
+        assert_eq!(
+            calls[0], calls[1],
+            "expected a blind retry: identical history resent, not mutated"
+        );
+        assert_eq!(
+            calls[1], calls[2],
+            "expected a blind retry: identical history resent, not mutated"
+        );
+    }
+
+    // The give-up path: after a fixed number of retries still empty,
+    // the loop stops with a clear error instead of returning the empty
+    // text as if it were a real answer — same pattern MAX_TOOL_CALLS
+    // already established for its own cap.
+    #[test]
+    fn agent_loop_gives_up_after_max_empty_response_retries() {
+        let root = TempDir::new();
+        // A single scripted response, repeated for every call (see
+        // ScriptedClient::send's index-clamping) — proves the loop
+        // stops via the retry cap instead of retrying forever.
+        let client = Arc::new(ScriptedClient::new(vec![Ok(LlmResponse::Text(
+            "".to_string(),
+        ))]));
+
+        let mut core = core_with_root(client.clone(), root.path().to_path_buf(), String::new());
+        core.submit_user_message("hello".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        match &events[0] {
+            CoreEvent::Error(message) => assert!(
+                message.contains("empty"),
+                "expected the error to identify an empty response, got: {message:?}"
+            ),
+            other => panic!("expected a CoreEvent::Error, got {other:?}"),
+        }
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "expected exactly 3 attempts, got {calls:?}");
+    }
+
+    // Regression guard: a real first response must not trigger any
+    // retry at all — proves the new empty-response logic only engages
+    // when it needs to, not on every text reply.
+    #[test]
+    fn agent_loop_does_not_retry_a_real_first_response() {
+        let root = TempDir::new();
+        let client = Arc::new(ScriptedClient::new(vec![Ok(LlmResponse::Text(
+            "real answer".to_string(),
+        ))]));
+
+        let mut core = core_with_root(client.clone(), root.path().to_path_buf(), String::new());
+        core.submit_user_message("hello".to_string());
+
+        poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected no retry, got {calls:?}");
     }
 
     // The real cross-thread blocking. Deliberately observes the file

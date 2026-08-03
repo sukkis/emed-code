@@ -1,8 +1,7 @@
-// Structured, per-line diff data — not a pre-formatted string —
-// specifically so the TUI can render Added/Removed with real color
-// rather than relying on a text convention like unified diff's +/-
-// prefixes. pub, not pub(crate): it appears in CoreEvent::WriteProposed
-// and tui::LogEntry::Diff, both public types.
+/// One line of a diff between a file's old and new contents, shown to
+/// the user before a write happens.
+// pub, not pub(crate): it appears in CoreEvent::WriteProposed and
+// tui::LogEntry::Diff, both public types.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffLine {
     Added(DiffLineText),
@@ -10,12 +9,9 @@ pub enum DiffLine {
     Unchanged(DiffLineText),
 }
 
-// One line's text, plus whether it's missing a trailing newline in the
-// file it came from. A missing final newline is a real difference in
-// what's on disk, not a cosmetic one — git's own diff shows this
-// explicitly ("\ No newline at end of file") rather than hiding it, and
-// this project's diff should stay just as truthful about what
-// write_file is actually about to put on disk.
+/// One line's text, plus whether it's missing a trailing newline in the
+/// file it came from — a real difference in what's on disk, not a
+/// cosmetic one.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DiffLineText {
     pub text: String,

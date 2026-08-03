@@ -144,6 +144,12 @@ round-based cap could be sailed through by a model batching many calls
 into one round). Exceeding it ends the exchange with a clear error
 rather than looping unboundedly.
 
+A separate, independently-bounded mechanism caps retries of an empty
+model response at a fixed small number of attempts before ending the
+exchange with a clear error. This doesn't compound with the tool-call
+cap above — an empty response never produces a tool call, so the two
+counters never add to each other's cost.
+
 ## Out of scope
 
 emed-code has no plaintext secrets files, `.env` parsing, or

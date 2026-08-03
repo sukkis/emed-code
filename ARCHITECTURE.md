@@ -387,6 +387,33 @@ today — nothing needs to distinguish them yet. It would need to become
 its own small enum the day retry-vs-fail-fast logic needs to tell those
 cases apart; not worth building ahead of that actual need.
 
+## Empty-response retries
+
+An empty (or whitespace-only) reply is treated as a probably-transient
+glitch rather than a genuine final answer, and gets a small, fixed
+number of blind retries — the identical request resent, nothing about
+the empty attempt itself recorded anywhere — before the exchange ends
+with a clear error instead of silently showing the user nothing.
+
+This is deliberately narrower than it might first sound. An earlier
+idea considered a general "stop after N repeated failures on a
+sub-task" mechanism, modeled on repeated *tool-call* failures. Checked
+against what's actually been observed in practice first: every real
+failure has ended the exchange within a single round, never as a
+repeated loop, and several of them (an empty response, or the model
+asking a question instead of calling a tool) never produce a tool call
+to begin with. A counter built to catch repeated tool-call failures
+wouldn't have caught any of them. This narrower fix targets the one
+failure shape that's both actually been observed and cheaply,
+unambiguously detectable — literal emptiness — rather than guessing at
+a broader mechanism ahead of evidence it's needed.
+
+The retry is blind on purpose, not an injected corrective message: the
+working theory is a transient hiccup, not a reasoning error, so there's
+nothing to correct. If that theory is ever wrong for a given case, a
+blind retry is a harmless no-op bounded at a fixed number of attempts
+either way.
+
 ## Credentials
 
 `MistralClient::new` takes an already-resolved API key rather than
