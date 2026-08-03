@@ -175,14 +175,16 @@ fn submit_user_message_avoids_guessing_at_a_nested_directorys_location_via_local
 
     let events = poll_until_final(&mut core, Duration::from_secs(60));
 
-    let failed_listing_calls = events.iter().filter(|event| {
-        matches!(
-            event,
-            CoreEvent::ToolCall { name, result: Err(_), .. }
-                if name == "list_files" || name == "list_files_recursive"
-        )
-    })
-    .count();
+    let failed_listing_calls = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                CoreEvent::ToolCall { name, result: Err(_), .. }
+                    if name == "list_files" || name == "list_files_recursive"
+            )
+        })
+        .count();
     assert_eq!(
         failed_listing_calls, 0,
         "expected no failed list_files/list_files_recursive guess before finding the real \
