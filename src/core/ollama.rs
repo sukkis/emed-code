@@ -1,3 +1,6 @@
+//! [`OllamaClient`], an [`LlmClient`] implementation talking to a local
+//! Ollama instance.
+
 use serde::{Deserialize, Serialize};
 
 use super::{ChatError, LlmClient, LlmResponse, Message, ToolCall, ToolDefinition};
@@ -185,6 +188,10 @@ fn fetch_ollama_reply(
         .map_err(|e| ChatError::Connection(e.to_string()))
 }
 
+/// Talks to a local Ollama instance at `http://localhost:11434`.
+/// Construct with [`OllamaClient::new`], then use it wherever an
+/// [`LlmClient`] is needed — [`crate::core::Core::with_client`], for
+/// one.
 pub struct OllamaClient {
     model: String,
 }

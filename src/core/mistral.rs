@@ -1,3 +1,6 @@
+//! [`MistralClient`], an [`LlmClient`] implementation talking to
+//! Mistral's cloud API.
+
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -236,12 +239,17 @@ fn fetch_mistral_reply(
         .map_err(|e| ChatError::Connection(e.to_string()))
 }
 
+/// Talks to Mistral's cloud API. Construct with
+/// [`MistralClient::new`], then use it wherever an [`LlmClient`] is
+/// needed — [`crate::core::Core::with_client`], for one.
 pub struct MistralClient {
     api_key: Zeroizing<String>,
     model: String,
 }
 
 impl MistralClient {
+    /// `api_key` is expected to already be resolved — see
+    /// [`crate::core::lookup_mistral_api_key`].
     pub fn new(api_key: Zeroizing<String>, model: String) -> Self {
         MistralClient { api_key, model }
     }
