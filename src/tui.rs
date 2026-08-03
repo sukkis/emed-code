@@ -83,6 +83,13 @@ fn render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>> {
                 None,
                 line_text.no_trailing_newline,
             ),
+            // Bare-minimum arm so this match stays exhaustive now that
+            // DiffLine::Elided exists (see docs/edit-file.md Step 1) —
+            // real styling/wording/tests for this arm are Step 2's job,
+            // not yet done here.
+            DiffLine::Elided(count) => {
+                vec![Line::from(format!("⋯ {count} unchanged lines ⋯"))]
+            }
         })
         .collect()
 }
