@@ -480,7 +480,10 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 directory. Call this directly to propose the change — the system automatically \
                 shows the user a diff and requires their approval before anything is written, \
                 so do not ask the user for confirmation yourself first. Do not assume the write \
-                has happened until a result confirms it; the user may decline."
+                has happened until a result confirms it; the user may decline. For a small, \
+                targeted change to part of an existing file, prefer edit_file instead — \
+                reconstructing and resending the entire file here risks silently losing content \
+                you didn't mean to touch."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -508,7 +511,9 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 it isn't found, or matches more than once without replace_all, you'll get an \
                 error telling you which; add more surrounding context to `old` to make it \
                 unique, or set replace_all to true to change every occurrence. Do not assume \
-                the edit has happened until a result confirms it; the user may decline."
+                the edit has happened until a result confirms it; the user may decline. Prefer \
+                this over write_file whenever the change is local to part of the file, not the \
+                whole thing."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -1537,6 +1542,47 @@ mod tests {
             path_description.contains("guessing"),
             "expected list_files_recursive's path parameter to steer toward the project root \
              over guessing an uncertain nested path, got: {path_description:?}"
+        );
+    }
+
+    // docs/tool-descriptions.md deliberately deferred this exact change
+    // until edit_file existed with a concrete alternative to point at.
+    // Same lesson as list_files/list_files_recursive's own cross-pointing
+    // (see ARCHITECTURE.md): a model only weighs guidance written on a
+    // tool it's already considering, so the warning has to live on
+    // write_file's own description, not only on edit_file's.
+    #[test]
+    fn write_file_description_steers_toward_edit_file_for_a_targeted_change() {
+        let definitions = tool_definitions();
+        let write_file_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "write_file")
+            .expect("write_file should be advertised");
+
+        assert!(
+            write_file_definition.description.contains("edit_file"),
+            "expected write_file's description to steer toward edit_file for a targeted \
+             change, got: {:?}",
+            write_file_definition.description
+        );
+    }
+
+    // The other direction of the same cross-pointing: edit_file's own
+    // description should also name write_file, not rely solely on
+    // write_file's side carrying the whole signal.
+    #[test]
+    fn edit_file_description_steers_over_write_file_for_a_local_change() {
+        let definitions = tool_definitions();
+        let edit_file_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "edit_file")
+            .expect("edit_file should be advertised");
+
+        assert!(
+            edit_file_definition.description.contains("write_file"),
+            "expected edit_file's description to steer over write_file for a local change, \
+             got: {:?}",
+            edit_file_definition.description
         );
     }
 }

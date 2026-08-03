@@ -255,14 +255,27 @@ directory (anywhere in the path, not just at the root), `.git/config`
 specifically, and `*.pem`/`*.key`. `read_file`, `list_files`,
 `write_file`, and `edit_file` all check this — only in `strict` mode,
 `loose` skips it entirely — before touching the filesystem, refusing
-with
-`ToolError::AccessDenied`. `list_files` still shows a blocked entry's
-*name* in its parent listing (existence isn't hidden) but refuses to
-enumerate into a blocked directory or read anything inside one.
-`list_files_recursive` applies the identical rule at *every* level of
-the walk, not just the one level `list_files` ever had to consider — a
-restricted directory encountered mid-tree is still listed by name, but
-the walk never descends into it.
+with `ToolError::AccessDenied`. `list_files` still shows a blocked
+entry's *name* in its parent listing (existence isn't hidden) but
+refuses to enumerate into a blocked directory or read anything inside
+one. `list_files_recursive` applies the identical rule at *every*
+level of the walk, not just the one level `list_files` ever had to
+consider — a restricted directory encountered mid-tree is still listed
+by name, but the walk never descends into it.
+
+### Tool-selection steering
+
+`write_file` and `edit_file` can both make the same eventual change to
+an existing file, so which one a model reaches for is a real choice,
+not just an implementation detail — using `write_file` for a small,
+local change risks losing content if the model doesn't reconstruct the
+entire file correctly, exactly the failure mode `edit_file` exists to
+avoid. Both descriptions carry an explicit pointer to the other,
+rather than only `edit_file`'s side explaining when it's the better
+choice: the same lesson `list_files`/`list_files_recursive` already
+established above (a model only weighs guidance written on a tool it's
+already considering calling) applies just as much to a tool it might
+call in error as to one it should call but doesn't.
 
 ## Settings
 

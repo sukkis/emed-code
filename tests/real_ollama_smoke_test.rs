@@ -7,7 +7,7 @@
 // (`ollama list` to check).
 #![cfg(feature = "local")]
 
-use emed_code::core::{Core, CoreEvent};
+use emed_code::core::{ConfirmationChoice, Core, CoreEvent};
 use std::time::{Duration, Instant};
 
 // poll_events() is non-blocking, so it can race a reply that hasn't
@@ -189,5 +189,75 @@ fn submit_user_message_avoids_guessing_at_a_nested_directorys_location_via_local
         failed_listing_calls, 0,
         "expected no failed list_files/list_files_recursive guess before finding the real \
          path, got {failed_listing_calls}: {events:?}"
+    );
+}
+
+// Like poll_until_final, but also stops the moment a write is proposed —
+// see the identical helper's comment in real_mistral_smoke_test.rs;
+// duplicated rather than shared per this codebase's existing convention
+// for these two files.
+fn poll_until_write_proposed_or_final(core: &mut Core, timeout: Duration) -> Vec<CoreEvent> {
+    let deadline = Instant::now() + timeout;
+    let mut events = Vec::new();
+    loop {
+        events.extend(core.poll_events());
+        if matches!(
+            events.last(),
+            Some(CoreEvent::WriteProposed { .. })
+                | Some(CoreEvent::AssistantChunk(_))
+                | Some(CoreEvent::Error(_))
+        ) {
+            return events;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for a write proposal or a final reply, got so far: {events:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// Ollama/mistral-nemo equivalent of real_mistral_smoke_test.rs's
+// edit_file-vs-write_file test — see its comment for the full
+// reasoning, including why this loops declining rather than handling
+// one proposal (real testing against Mistral found a retry-after-decline
+// happens in practice). mistral-nemo's documented flakiness elsewhere in
+// this file (see
+// submit_user_message_finds_a_nested_directory_from_an_ambiguous_request_via_local_ollama's
+// comment) means this one may turn out flaky too — not assumed here,
+// left for real observation to confirm or rule out.
+#[test]
+fn submit_user_message_prefers_edit_file_over_write_file_for_a_targeted_change_via_local_ollama() {
+    let mut core = Core::new();
+
+    core.submit_user_message(
+        "In Cargo.toml, change the package version to \"0.1.1\" — just that one line, don't \
+         touch anything else in the file."
+            .to_string(),
+    );
+
+    let mut all_events = Vec::new();
+    loop {
+        let events = poll_until_write_proposed_or_final(&mut core, Duration::from_secs(60));
+        let proposed = matches!(events.last(), Some(CoreEvent::WriteProposed { .. }));
+        all_events.extend(events);
+        if !proposed {
+            break;
+        }
+        core.respond_to_confirmation(ConfirmationChoice::Decline);
+    }
+
+    let write_file_attempted = all_events
+        .iter()
+        .any(|event| matches!(event, CoreEvent::ToolCall { name, .. } if name == "write_file"));
+    let edit_file_attempted = all_events
+        .iter()
+        .any(|event| matches!(event, CoreEvent::ToolCall { name, .. } if name == "edit_file"));
+
+    assert!(
+        edit_file_attempted && !write_file_attempted,
+        "expected edit_file to be used and write_file never attempted for a targeted change, \
+         got: {all_events:?}"
     );
 }
