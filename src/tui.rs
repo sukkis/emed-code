@@ -83,6 +83,17 @@ fn render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>> {
                 None,
                 line_text.no_trailing_newline,
             ),
+            // Dimmed rather than background-colored like Added/Removed —
+            // this isn't real file content, so it doesn't need the
+            // background channel content lines reserve for future
+            // syntax highlighting.
+            DiffLine::Elided(count) => {
+                let noun = if *count == 1 { "line" } else { "lines" };
+                vec![Line::styled(
+                    format!("⋯ {count} unchanged {noun} ⋯"),
+                    Style::new().fg(Color::DarkGray),
+                )]
+            }
         })
         .collect()
 }
@@ -1091,6 +1102,46 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
         assert_eq!(texts, vec!["-old", "\\ No newline at end of file"]);
+    }
+
+    // A run of N context-skipped lines renders as a single marker line,
+    // distinct from any real diff content — "line"/"lines" is
+    // pluralized on the actual count, not hardcoded, since a windowed
+    // diff's smallest possible elision is exactly one line.
+    #[test]
+    fn render_diff_lines_shows_an_elided_marker_pluralized_by_count() {
+        let diff = vec![DiffLine::Elided(1), DiffLine::Elided(3)];
+
+        let lines = render_diff_lines(&diff);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert_eq!(texts, vec!["⋯ 1 unchanged line ⋯", "⋯ 3 unchanged lines ⋯"]);
+    }
+
+    // Dimmed, not background-colored like Added/Removed — an elided
+    // marker isn't real file content (nothing about it will ever be
+    // syntax-highlighted), so it doesn't need the background channel
+    // content lines reserve for that; a muted foreground is enough to
+    // read as "not a real line."
+    #[test]
+    fn render_diff_lines_dims_an_elided_marker_instead_of_coloring_its_background() {
+        use ratatui::style::Color;
+
+        let diff = vec![DiffLine::Elided(2)];
+
+        let lines = render_diff_lines(&diff);
+
+        let backend = TestBackend::new(30, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines.clone()), frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 0)].fg, Color::DarkGray);
     }
 
     #[test]

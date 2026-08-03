@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use super::{
-    ConfirmationChoice, CoreEvent, FileAccessSecurity, SandboxError, SandboxPath, ToolCall,
-    ToolDefinition,
+    ConfirmationChoice, CoreEvent, DiffLine, FileAccessSecurity, SandboxError, SandboxPath,
+    ToolCall, ToolDefinition,
 };
 
 #[derive(Debug, PartialEq)]
@@ -30,6 +30,16 @@ pub(crate) enum ToolError {
     // it; the TUI's "error: " prefix reads fine for "this didn't
     // happen because you said no."
     WriteDeclined,
+    // edit_file's `old` wasn't found anywhere in the file. Like
+    // WriteDeclined, not a technical failure — an actionable outcome
+    // the model should see and retry from (e.g. its `old` text doesn't
+    // match verbatim), not a bug in emed-code itself.
+    NoMatch,
+    // edit_file's `old` matched more than once with replace_all: false.
+    // Carries the match count so the error message can tell the model
+    // exactly how ambiguous the match was, letting it choose between
+    // narrowing `old` with more context or setting replace_all: true.
+    AmbiguousMatch(usize),
 }
 
 impl fmt::Display for ToolError {
@@ -43,6 +53,12 @@ impl fmt::Display for ToolError {
                 write!(f, "access to this path is restricted by security policy")
             }
             ToolError::WriteDeclined => write!(f, "user declined this write"),
+            ToolError::NoMatch => write!(f, "the given `old` text was not found in the file"),
+            ToolError::AmbiguousMatch(count) => write!(
+                f,
+                "the given `old` text matched {count} times; narrow it with more \
+                 surrounding context, or set replace_all to change every occurrence"
+            ),
         }
     }
 }
@@ -209,6 +225,29 @@ fn walk_recursive(
     Ok(())
 }
 
+// Pure string logic, no I/O — edit_file_with_confirmation (Step 4)
+// reads old_content from disk and hands it here, same split as
+// generate_windowed_diff's own pure-function step. replace_all: false
+// requires old to match exactly once, mirroring Claude Code's own Edit
+// tool; replace_all: true changes every occurrence and only cares that
+// at least one exists.
+fn apply_edit(
+    old_content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, ToolError> {
+    let match_count = old_content.matches(old).count();
+
+    if match_count == 0 {
+        return Err(ToolError::NoMatch);
+    }
+    if match_count > 1 && !replace_all {
+        return Err(ToolError::AmbiguousMatch(match_count));
+    }
+    Ok(old_content.replace(old, new))
+}
+
 // pub(crate): called both by write_file_with_confirmation below (after
 // a user has already approved the write) and, eventually, tests. Same
 // sandboxing + blocklist checks as read_file/list_files, plus the
@@ -230,15 +269,47 @@ pub(crate) fn write_file(
     std::fs::write(sandbox_path.as_path(), content).map_err(|_| ToolError::IoFailure)
 }
 
+// Shared by write_file_with_confirmation and edit_file_with_confirmation
+// below: both end the same way once they've each computed their own
+// new_content and diff — send WriteProposed, block for an answer, then
+// delegate the actual write back to write_file above (a deliberate,
+// cheap redundant re-validation in exchange for one source of truth on
+// sandboxing/blocklist logic, rather than duplicating it inline here).
+fn propose_and_apply_write(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+    diff: Vec<DiffLine>,
+    new_content: &str,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    // requested was built from the same string CoreEvent::WriteProposed
+    // and the "wrote {path}" message need to show — no reason to also
+    // thread a separate display-string argument alongside it.
+    let display_path = requested.to_string_lossy();
+
+    let _ = tx.send(CoreEvent::WriteProposed {
+        path: display_path.to_string(),
+        diff,
+    });
+
+    // A dropped/errored receive (e.g. the app exiting mid-confirmation)
+    // fails safe to Decline — never a silent apply just because no
+    // real answer arrived.
+    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
+        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
+        ConfirmationChoice::Apply => write_file(root, requested, new_content, file_access_security)
+            .map(|()| format!("wrote {display_path}")),
+    }
+}
+
 // The confirmation-gated entry point the agent loop calls for a
 // "write_file" tool call — exercised end-to-end by core.rs's
 // agent-loop tests via a scripted client. Validates first (so a
-// forbidden path never even shows a confirmation prompt), then
-// proposes the change and blocks for an answer, then delegates the
-// actual write back to write_file above — a deliberate, cheap
-// redundant re-validation in exchange for one
-// source of truth on sandboxing/blocklist logic, rather than
-// duplicating it inline here.
+// forbidden path never even shows a confirmation prompt), then hands
+// off to propose_and_apply_write for the shared propose/confirm/apply
+// tail.
 pub(crate) fn write_file_with_confirmation(
     root: &Path,
     file_access_security: FileAccessSecurity,
@@ -261,21 +332,73 @@ pub(crate) fn write_file_with_confirmation(
     let old_content = std::fs::read_to_string(sandbox_path.as_path()).unwrap_or_default();
     let diff = super::generate_diff(&old_content, &args.content);
 
-    let _ = tx.send(CoreEvent::WriteProposed {
-        path: args.path.clone(),
+    propose_and_apply_write(
+        root,
+        requested,
+        file_access_security,
         diff,
-    });
+        &args.content,
+        tx,
+        confirm_rx,
+    )
+}
 
-    // A dropped/errored receive (e.g. the app exiting mid-confirmation)
-    // fails safe to Decline — never a silent apply just because no
-    // real answer arrived.
-    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
-        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
-        ConfirmationChoice::Apply => {
-            write_file(root, requested, &args.content, file_access_security)
-                .map(|()| format!("wrote {}", args.path))
-        }
+#[derive(Deserialize)]
+struct EditArgs {
+    path: String,
+    old: String,
+    new: String,
+    // Absent in a tool call means "no", not malformed input — most
+    // edits target exactly one match, so requiring the model to spell
+    // this out every time would be pure noise.
+    #[serde(default)]
+    replace_all: bool,
+}
+
+// git diff's own default context radius — familiar to anyone who's read
+// a unified diff, no reason to pick a different number.
+const EDIT_DIFF_CONTEXT_LINES: usize = 3;
+
+// The confirmation-gated entry point the agent loop calls for an
+// "edit_file" tool call, mirroring write_file_with_confirmation's
+// shape. Two differences from write_file: SandboxPath::new (not
+// new_for_write), since a find/replace target must already exist; and
+// apply_edit's own NoMatch/AmbiguousMatch errors are checked before
+// ever proposing a diff, same "validate first" principle as the
+// sandbox/blocklist check — there's nothing real to confirm until
+// apply_edit actually produces a new_content.
+pub(crate) fn edit_file_with_confirmation(
+    root: &Path,
+    file_access_security: FileAccessSecurity,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    let args: EditArgs =
+        serde_json::from_str(&tool_call.arguments).map_err(|_| ToolError::MalformedArguments)?;
+    let requested = Path::new(&args.path);
+
+    let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
     }
+
+    let old_content =
+        std::fs::read_to_string(sandbox_path.as_path()).map_err(|_| ToolError::IoFailure)?;
+    let new_content = apply_edit(&old_content, &args.old, &args.new, args.replace_all)?;
+    let diff = super::generate_windowed_diff(&old_content, &new_content, EDIT_DIFF_CONTEXT_LINES);
+
+    propose_and_apply_write(
+        root,
+        requested,
+        file_access_security,
+        diff,
+        &new_content,
+        tx,
+        confirm_rx,
+    )
 }
 
 // The list of tools actually advertised to a provider. Kept next to
@@ -357,7 +480,10 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 directory. Call this directly to propose the change — the system automatically \
                 shows the user a diff and requires their approval before anything is written, \
                 so do not ask the user for confirmation yourself first. Do not assume the write \
-                has happened until a result confirms it; the user may decline."
+                has happened until a result confirms it; the user may decline. For a small, \
+                targeted change to part of an existing file, prefer edit_file instead — \
+                reconstructing and resending the entire file here risks silently losing content \
+                you didn't mean to touch."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -372,6 +498,47 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["path", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "Replace an exact snippet of text within an existing file, without \
+                resending the rest of the file's contents. Call this directly to propose the \
+                change — the system automatically shows the user a diff and requires their \
+                approval before anything is written, so do not ask the user for confirmation \
+                yourself first. `old` must match the file's current content exactly, including \
+                whitespace, and must be unique within the file unless replace_all is set — if \
+                it isn't found, or matches more than once without replace_all, you'll get an \
+                error telling you which; add more surrounding context to `old` to make it \
+                unique, or set replace_all to true to change every occurrence. Do not assume \
+                the edit has happened until a result confirms it; the user may decline. Prefer \
+                this over write_file whenever the change is local to part of the file, not the \
+                whole thing."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file, relative to the project root. The \
+                            file must already exist."
+                    },
+                    "old": {
+                        "type": "string",
+                        "description": "The exact existing text to replace, including \
+                            whitespace — must match the file's current content verbatim."
+                    },
+                    "new": {
+                        "type": "string",
+                        "description": "The text to replace it with."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Set to true to replace every occurrence of `old` \
+                            instead of requiring exactly one match. Defaults to false."
+                    }
+                },
+                "required": ["path", "old", "new"]
             }),
         },
     ]
@@ -854,6 +1021,48 @@ mod tests {
         assert_eq!(result, Err(ToolError::AccessDenied));
     }
 
+    // apply_edit is pure string logic, no I/O — the future
+    // edit_file_with_confirmation reads old_content from disk and
+    // hands it here, same split as generate_windowed_diff's own
+    // pure-function step.
+    #[test]
+    fn apply_edit_replaces_a_single_exact_match() {
+        let result = apply_edit("one\ntwo\nthree\n", "two", "TWO", false);
+
+        assert_eq!(result, Ok("one\nTWO\nthree\n".to_string()));
+    }
+
+    #[test]
+    fn apply_edit_replaces_every_occurrence_when_replace_all_is_true() {
+        let result = apply_edit("a b a c a", "a", "X", true);
+
+        assert_eq!(result, Ok("X b X c X".to_string()));
+    }
+
+    #[test]
+    fn apply_edit_rejects_old_text_not_found_in_the_file() {
+        let result = apply_edit("one\ntwo\nthree\n", "missing", "new", false);
+
+        assert_eq!(result, Err(ToolError::NoMatch));
+    }
+
+    // Zero matches is still an error with replace_all: true — there is
+    // nothing to replace either way, replace_all only changes what
+    // happens when old is found more than once.
+    #[test]
+    fn apply_edit_rejects_old_text_not_found_even_with_replace_all() {
+        let result = apply_edit("one\ntwo\nthree\n", "missing", "new", true);
+
+        assert_eq!(result, Err(ToolError::NoMatch));
+    }
+
+    #[test]
+    fn apply_edit_rejects_an_ambiguous_match_without_replace_all() {
+        let result = apply_edit("a b a c a", "a", "X", false);
+
+        assert_eq!(result, Err(ToolError::AmbiguousMatch(3)));
+    }
+
     // write_file isn't added to tool_definitions()/dispatch — it's
     // routed around dispatch by name (see write_file_with_confirmation
     // below), so it's tested directly here instead.
@@ -1064,14 +1273,169 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    // Pins down exactly what's advertised to the model. write_file is
-    // included here even though dispatch() itself never routes it —
-    // it's handled separately by write_file_with_confirmation (see
+    // Same confirmation-gated shape as write_file_with_confirmation's
+    // own tests above, but the diff is windowed (generate_windowed_diff)
+    // rather than full-file — here the whole 3-line file fits within
+    // the context window, so no DiffLine::Elided appears; a file large
+    // enough to actually elide something isn't this step's concern (see
+    // diff.rs's own generate_windowed_diff tests for that).
+    #[test]
+    fn edit_file_with_confirmation_applies_the_edit_when_confirmed() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Apply).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "two", "new": "TWO"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("wrote notes.txt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        match rx.try_recv().unwrap() {
+            CoreEvent::WriteProposed { path, diff } => {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(
+                    diff,
+                    vec![
+                        DiffLine::Unchanged(DiffLineText {
+                            text: "one".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Removed(DiffLineText {
+                            text: "two".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Added(DiffLineText {
+                            text: "TWO".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Unchanged(DiffLineText {
+                            text: "three".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                    ]
+                );
+            }
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_file_with_confirmation_declines_without_writing() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Decline).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "two", "new": "TWO"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::WriteDeclined));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    // Same principle as write_file_with_confirmation's own blocked-path
+    // test: an invalid path must be rejected before ever asking for
+    // confirmation. confirm_rx never receives anything here, so if the
+    // implementation asked for confirmation first, this test would hang.
+    #[test]
+    fn edit_file_with_confirmation_rejects_a_blocked_path_without_asking() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": ".env", "old": "SECRET=1", "new": "SECRET=2"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(".env")).unwrap(),
+            "SECRET=1"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    // An edit that can't even be computed (old matches more than once,
+    // replace_all not set) has no real diff to propose — same
+    // validate-before-confirming principle as the blocked-path test
+    // above, just for apply_edit's own ambiguity check instead of the
+    // sandbox/blocklist gate.
+    #[test]
+    fn edit_file_with_confirmation_rejects_an_ambiguous_match_without_asking() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "old old old\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "old", "new": "new"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AmbiguousMatch(3)));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "old old old\n"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Pins down exactly what's advertised to the model. write_file and
+    // edit_file are both included here even though dispatch() itself
+    // never routes either — they're handled separately by
+    // write_file_with_confirmation/edit_file_with_confirmation (see
     // run_agent_loop) — so this only guards tool_definitions() itself,
     // not a dispatch/definitions correspondence that no longer holds
-    // for all four tools.
+    // for all five tools.
     #[test]
-    fn tool_definitions_advertises_all_four_tools() {
+    fn tool_definitions_advertises_all_five_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1084,7 +1448,8 @@ mod tests {
                 "read_file",
                 "list_files",
                 "list_files_recursive",
-                "write_file"
+                "write_file",
+                "edit_file"
             ]
         );
     }
@@ -1177,6 +1542,47 @@ mod tests {
             path_description.contains("guessing"),
             "expected list_files_recursive's path parameter to steer toward the project root \
              over guessing an uncertain nested path, got: {path_description:?}"
+        );
+    }
+
+    // docs/tool-descriptions.md deliberately deferred this exact change
+    // until edit_file existed with a concrete alternative to point at.
+    // Same lesson as list_files/list_files_recursive's own cross-pointing
+    // (see ARCHITECTURE.md): a model only weighs guidance written on a
+    // tool it's already considering, so the warning has to live on
+    // write_file's own description, not only on edit_file's.
+    #[test]
+    fn write_file_description_steers_toward_edit_file_for_a_targeted_change() {
+        let definitions = tool_definitions();
+        let write_file_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "write_file")
+            .expect("write_file should be advertised");
+
+        assert!(
+            write_file_definition.description.contains("edit_file"),
+            "expected write_file's description to steer toward edit_file for a targeted \
+             change, got: {:?}",
+            write_file_definition.description
+        );
+    }
+
+    // The other direction of the same cross-pointing: edit_file's own
+    // description should also name write_file, not rely solely on
+    // write_file's side carrying the whole signal.
+    #[test]
+    fn edit_file_description_steers_over_write_file_for_a_local_change() {
+        let definitions = tool_definitions();
+        let edit_file_definition = definitions
+            .iter()
+            .find(|definition| definition.name == "edit_file")
+            .expect("edit_file should be advertised");
+
+        assert!(
+            edit_file_definition.description.contains("write_file"),
+            "expected edit_file's description to steer over write_file for a local change, \
+             got: {:?}",
+            edit_file_definition.description
         );
     }
 }

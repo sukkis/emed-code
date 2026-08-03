@@ -6,7 +6,7 @@
 // (emed-code/mistral/api_key) or the MISTRAL_API_KEY env var.
 #![cfg(feature = "local")]
 
-use emed_code::core::{Core, CoreEvent, MistralClient, lookup_mistral_api_key};
+use emed_code::core::{ConfirmationChoice, Core, CoreEvent, MistralClient, lookup_mistral_api_key};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -231,5 +231,86 @@ fn submit_user_message_avoids_guessing_at_a_nested_directorys_location() {
         failed_listing_calls, 0,
         "expected no failed list_files/list_files_recursive guess before finding the real \
          path, got {failed_listing_calls}: {events:?}"
+    );
+}
+
+// Like poll_until_final, but also stops the moment a write is proposed —
+// used by the edit_file-vs-write_file test below, which needs to decline
+// the proposal before the round can reach a final reply at all.
+fn poll_until_write_proposed_or_final(core: &mut Core, timeout: Duration) -> Vec<CoreEvent> {
+    let deadline = Instant::now() + timeout;
+    let mut events = Vec::new();
+    loop {
+        events.extend(core.poll_events());
+        if matches!(
+            events.last(),
+            Some(CoreEvent::WriteProposed { .. })
+                | Some(CoreEvent::AssistantChunk(_))
+                | Some(CoreEvent::Error(_))
+        ) {
+            return events;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for a write proposal or a final reply, got so far: {events:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// The point of docs/edit-file.md Step 6: given a small, targeted change
+// to an existing file, does a real model actually reach for edit_file,
+// or default to write_file just because it's the tool it already knew
+// about? Declines every proposed write rather than applying any of
+// them — this test is about which tool got chosen, not about actually
+// mutating Cargo.toml in this repo.
+//
+// Loops declining rather than handling a single proposal: real testing
+// (2026-08-03, mistral-medium-latest) found the model retries with
+// another edit_file proposal immediately after a decline rather than
+// giving up, so a fixed single round isn't enough to reach a final
+// reply at all. The property that actually matters survives any number
+// of retries — edit_file gets used and write_file never does, across
+// the whole exchange — so that's what's asserted, not "the first
+// attempt" specifically.
+#[test]
+fn submit_user_message_prefers_edit_file_over_write_file_for_a_targeted_change() {
+    let (api_key, _source) = lookup_mistral_api_key().expect(
+        "no Mistral API key found via getfrompass (emed-code/mistral/api_key) or MISTRAL_API_KEY",
+    );
+    let mut core = Core::with_client(Arc::new(MistralClient::new(
+        api_key,
+        "mistral-medium-latest".to_string(),
+    )));
+
+    core.submit_user_message(
+        "In Cargo.toml, change the package version to \"0.1.1\" — just that one line, don't \
+         touch anything else in the file."
+            .to_string(),
+    );
+
+    let mut all_events = Vec::new();
+    loop {
+        let events = poll_until_write_proposed_or_final(&mut core, Duration::from_secs(60));
+        let proposed = matches!(events.last(), Some(CoreEvent::WriteProposed { .. }));
+        all_events.extend(events);
+        if !proposed {
+            break;
+        }
+        core.respond_to_confirmation(ConfirmationChoice::Decline);
+    }
+
+    let write_file_attempted = all_events
+        .iter()
+        .any(|event| matches!(event, CoreEvent::ToolCall { name, .. } if name == "write_file"));
+    let edit_file_attempted = all_events
+        .iter()
+        .any(|event| matches!(event, CoreEvent::ToolCall { name, .. } if name == "edit_file"));
+
+    assert!(
+        edit_file_attempted && !write_file_attempted,
+        "expected edit_file to be used and write_file never attempted for a targeted change, \
+         got: {all_events:?}"
     );
 }

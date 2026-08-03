@@ -17,7 +17,7 @@ flowchart LR
         CoreStruct["Core"]
         Loop["agent loop"]
         Dispatch["dispatch()"]
-        Tools["read_file / list_files / write_file"]
+        Tools["read_file / list_files / write_file / edit_file"]
         Sandbox[["SandboxPath"]]
     end
 
@@ -192,13 +192,14 @@ a new tool means one match arm plus one function. `tool_definitions()`
 `dispatch`'s match arms specifically so the two can't silently drift
 apart — a test asserts the names match.
 
-`write_file` is routed *around* `dispatch`, by name, to
-`write_file_with_confirmation` instead. It doesn't fit `dispatch`'s
-contract — a pure computation that takes inputs and returns a result —
-because it needs to pause mid-call and wait for a human decision (see
-"The confirmation gate" below). `dispatch` remains the router for every
-tool that doesn't need that; `write_file` is a deliberate exception,
-not a sign the abstraction is leaking.
+`write_file` and `edit_file` are both routed *around* `dispatch`, by
+name, to `write_file_with_confirmation`/`edit_file_with_confirmation`
+instead. Neither fits `dispatch`'s contract — a pure computation that
+takes inputs and returns a result — because both need to pause mid-call
+and wait for a human decision (see "The confirmation gate" below).
+`dispatch` remains the router for every tool that doesn't need that;
+the two confirmation-gated tools are a deliberate exception, not a sign
+the abstraction is leaking.
 
 ### Recursive listing
 
@@ -251,16 +252,30 @@ path (not the raw requested string, so a symlink with an innocuous name
 pointing at a blocked file can't bypass it) against a small,
 intentionally non-exhaustive list: `.env`/`.env.*`, the `.ssh`
 directory (anywhere in the path, not just at the root), `.git/config`
-specifically, and `*.pem`/`*.key`. `read_file`, `list_files`, and
-`write_file` all check this — only in `strict` mode, `loose` skips it
-entirely — before touching the filesystem, refusing with
-`ToolError::AccessDenied`. `list_files` still shows a blocked entry's
-*name* in its parent listing (existence isn't hidden) but refuses to
-enumerate into a blocked directory or read anything inside one.
-`list_files_recursive` applies the identical rule at *every* level of
-the walk, not just the one level `list_files` ever had to consider — a
-restricted directory encountered mid-tree is still listed by name, but
-the walk never descends into it.
+specifically, and `*.pem`/`*.key`. `read_file`, `list_files`,
+`write_file`, and `edit_file` all check this — only in `strict` mode,
+`loose` skips it entirely — before touching the filesystem, refusing
+with `ToolError::AccessDenied`. `list_files` still shows a blocked
+entry's *name* in its parent listing (existence isn't hidden) but
+refuses to enumerate into a blocked directory or read anything inside
+one. `list_files_recursive` applies the identical rule at *every*
+level of the walk, not just the one level `list_files` ever had to
+consider — a restricted directory encountered mid-tree is still listed
+by name, but the walk never descends into it.
+
+### Tool-selection steering
+
+`write_file` and `edit_file` can both make the same eventual change to
+an existing file, so which one a model reaches for is a real choice,
+not just an implementation detail — using `write_file` for a small,
+local change risks losing content if the model doesn't reconstruct the
+entire file correctly, exactly the failure mode `edit_file` exists to
+avoid. Both descriptions carry an explicit pointer to the other,
+rather than only `edit_file`'s side explaining when it's the better
+choice: the same lesson `list_files`/`list_files_recursive` already
+established above (a model only weighs guidance written on a tool it's
+already considering calling) applies just as much to a tool it might
+call in error as to one it should call but doesn't.
 
 ## Settings
 
@@ -324,13 +339,35 @@ text width, not a full edge-to-edge band — that needs the real render
 width, which isn't available at this stage; a future pass can pad to
 width once there's a concrete reason to.
 
+`generate_windowed_diff(old: &str, new: &str, context_lines: usize) ->
+Vec<DiffLine>` serves `edit_file` specifically, showing only
+`context_lines` of unchanged context around each change — `git
+diff`-style hunks — rather than `generate_diff`'s full file. The two
+functions deliberately stay separate rather than sharing one
+configurable diff generator: `write_file` replaces the *entire* file,
+so showing the whole thing is the correct preview of what's about to
+happen, not a limitation; `edit_file`'s change is inherently local, so
+a windowed view correctly scopes the confirmation to what actually
+changed, which matters once the file being edited is larger than
+`write_file`'s usual new-or-small-file case. Long unchanged runs
+between or around hunks collapse into a single `DiffLine::Elided(n)`
+marker instead of being listed line by line — built on
+`similar::TextDiff::grouped_ops`, which already isolates change
+clusters this same way for its own unified-diff output, so this is a
+different mapping of an existing capability, not new diffing logic.
+`render_diff_lines` renders `Elided` with a dimmed foreground rather
+than `Added`/`Removed`'s background convention, since it isn't real
+file content — nothing about a marker line will ever need the
+background channel `write_file`'s content lines reserve for future
+syntax highlighting.
+
 ## The confirmation gate
 
 Every other `Core`↔`App` interaction is one-directional — the
-background thread only ever *sends* `CoreEvent`s. `write_file` needs
-the opposite: the loop must pause mid-call, let the user see a diff,
-and only then know whether to write and what tool result to hand back
-to the model.
+background thread only ever *sends* `CoreEvent`s. `write_file` and
+`edit_file` need the opposite: the loop must pause mid-call, let the
+user see a diff, and only then know whether to write and what tool
+result to hand back to the model.
 
 A fresh `mpsc` channel is created on every `submit_user_message` call,
 mirroring the fresh thread spawned each time (a single long-lived
@@ -339,18 +376,29 @@ could only ever move into the first spawned thread). `Core` keeps the
 `Sender` half; `respond_to_confirmation` sends through whichever one is
 currently stored, a no-op if nothing is actually waiting.
 
-`write_file_with_confirmation` validates the path — sandbox containment
-and the content-sensitivity blocklist, identical to `write_file` itself
-— *before* ever proposing anything, so a forbidden path is rejected
-immediately with no confirmation dialog shown at all; there's nothing
-to confirm about a request that was never going to be allowed. Only a
-validated write generates a diff, sends `CoreEvent::WriteProposed`, and
-blocks on the answer. A dropped or errored receive (e.g. the app
+Both `write_file_with_confirmation` and `edit_file_with_confirmation`
+validate first — sandbox containment and the content-sensitivity
+blocklist, identical to `write_file` itself — *before* ever proposing
+anything, so a forbidden path is rejected immediately with no
+confirmation dialog shown at all; there's nothing to confirm about a
+request that was never going to be allowed. `edit_file_with_confirmation`
+has a second pre-confirmation check with the same shape: `apply_edit`'s
+`old` text must match the file's current content exactly once (unless
+`replace_all` is set), or it fails with `ToolError::NoMatch`/
+`AmbiguousMatch` before a diff is ever generated — there's nothing real
+to confirm until `apply_edit` has actually produced a `new_content`.
+
+Once validated, both tools converge on `propose_and_apply_write` — each
+computes its own diff (`generate_diff` for `write_file`,
+`generate_windowed_diff` for `edit_file`) and `new_content`, then hands
+both to this shared function, which sends `CoreEvent::WriteProposed`
+and blocks on the answer. A dropped or errored receive (e.g. the app
 exiting mid-confirmation) resolves to declining the write, never to a
 silent apply. On approval, it delegates the actual write back to
-`write_file` — a deliberate, cheap re-validation in exchange for
-keeping sandboxing/blocklist logic in exactly one place rather than
-duplicating it. A decline flows through the same `Result<String,
+`write_file` (the plain, unconfirmed function) regardless of which tool
+proposed it — a deliberate, cheap re-validation in exchange for keeping
+sandboxing/blocklist logic in exactly one place rather than duplicating
+it per tool. A decline flows through the same `Result<String,
 ToolError>` shape every other tool result already uses (a
 `ToolError::WriteDeclined` variant), so nothing downstream needs a
 separate code path for it.
