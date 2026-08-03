@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use super::{
-    ConfirmationChoice, CoreEvent, FileAccessSecurity, SandboxError, SandboxPath, ToolCall,
-    ToolDefinition,
+    ConfirmationChoice, CoreEvent, DiffLine, FileAccessSecurity, SandboxError, SandboxPath,
+    ToolCall, ToolDefinition,
 };
 
 #[derive(Debug, PartialEq)]
@@ -269,15 +269,47 @@ pub(crate) fn write_file(
     std::fs::write(sandbox_path.as_path(), content).map_err(|_| ToolError::IoFailure)
 }
 
+// Shared by write_file_with_confirmation and edit_file_with_confirmation
+// below: both end the same way once they've each computed their own
+// new_content and diff — send WriteProposed, block for an answer, then
+// delegate the actual write back to write_file above (a deliberate,
+// cheap redundant re-validation in exchange for one source of truth on
+// sandboxing/blocklist logic, rather than duplicating it inline here).
+fn propose_and_apply_write(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+    diff: Vec<DiffLine>,
+    new_content: &str,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    // requested was built from the same string CoreEvent::WriteProposed
+    // and the "wrote {path}" message need to show — no reason to also
+    // thread a separate display-string argument alongside it.
+    let display_path = requested.to_string_lossy();
+
+    let _ = tx.send(CoreEvent::WriteProposed {
+        path: display_path.to_string(),
+        diff,
+    });
+
+    // A dropped/errored receive (e.g. the app exiting mid-confirmation)
+    // fails safe to Decline — never a silent apply just because no
+    // real answer arrived.
+    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
+        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
+        ConfirmationChoice::Apply => write_file(root, requested, new_content, file_access_security)
+            .map(|()| format!("wrote {display_path}")),
+    }
+}
+
 // The confirmation-gated entry point the agent loop calls for a
 // "write_file" tool call — exercised end-to-end by core.rs's
 // agent-loop tests via a scripted client. Validates first (so a
-// forbidden path never even shows a confirmation prompt), then
-// proposes the change and blocks for an answer, then delegates the
-// actual write back to write_file above — a deliberate, cheap
-// redundant re-validation in exchange for one
-// source of truth on sandboxing/blocklist logic, rather than
-// duplicating it inline here.
+// forbidden path never even shows a confirmation prompt), then hands
+// off to propose_and_apply_write for the shared propose/confirm/apply
+// tail.
 pub(crate) fn write_file_with_confirmation(
     root: &Path,
     file_access_security: FileAccessSecurity,
@@ -300,21 +332,73 @@ pub(crate) fn write_file_with_confirmation(
     let old_content = std::fs::read_to_string(sandbox_path.as_path()).unwrap_or_default();
     let diff = super::generate_diff(&old_content, &args.content);
 
-    let _ = tx.send(CoreEvent::WriteProposed {
-        path: args.path.clone(),
+    propose_and_apply_write(
+        root,
+        requested,
+        file_access_security,
         diff,
-    });
+        &args.content,
+        tx,
+        confirm_rx,
+    )
+}
 
-    // A dropped/errored receive (e.g. the app exiting mid-confirmation)
-    // fails safe to Decline — never a silent apply just because no
-    // real answer arrived.
-    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
-        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
-        ConfirmationChoice::Apply => {
-            write_file(root, requested, &args.content, file_access_security)
-                .map(|()| format!("wrote {}", args.path))
-        }
+#[derive(Deserialize)]
+struct EditArgs {
+    path: String,
+    old: String,
+    new: String,
+    // Absent in a tool call means "no", not malformed input — most
+    // edits target exactly one match, so requiring the model to spell
+    // this out every time would be pure noise.
+    #[serde(default)]
+    replace_all: bool,
+}
+
+// git diff's own default context radius — familiar to anyone who's read
+// a unified diff, no reason to pick a different number.
+const EDIT_DIFF_CONTEXT_LINES: usize = 3;
+
+// The confirmation-gated entry point the agent loop calls for an
+// "edit_file" tool call, mirroring write_file_with_confirmation's
+// shape. Two differences from write_file: SandboxPath::new (not
+// new_for_write), since a find/replace target must already exist; and
+// apply_edit's own NoMatch/AmbiguousMatch errors are checked before
+// ever proposing a diff, same "validate first" principle as the
+// sandbox/blocklist check — there's nothing real to confirm until
+// apply_edit actually produces a new_content.
+pub(crate) fn edit_file_with_confirmation(
+    root: &Path,
+    file_access_security: FileAccessSecurity,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    let args: EditArgs =
+        serde_json::from_str(&tool_call.arguments).map_err(|_| ToolError::MalformedArguments)?;
+    let requested = Path::new(&args.path);
+
+    let sandbox_path = SandboxPath::new(root, requested).map_err(ToolError::InvalidPath)?;
+    if file_access_security == FileAccessSecurity::Strict
+        && is_content_restricted(sandbox_path.relative_path())
+    {
+        return Err(ToolError::AccessDenied);
     }
+
+    let old_content =
+        std::fs::read_to_string(sandbox_path.as_path()).map_err(|_| ToolError::IoFailure)?;
+    let new_content = apply_edit(&old_content, &args.old, &args.new, args.replace_all)?;
+    let diff = super::generate_windowed_diff(&old_content, &new_content, EDIT_DIFF_CONTEXT_LINES);
+
+    propose_and_apply_write(
+        root,
+        requested,
+        file_access_security,
+        diff,
+        &new_content,
+        tx,
+        confirm_rx,
+    )
 }
 
 // The list of tools actually advertised to a provider. Kept next to
@@ -1142,6 +1226,160 @@ mod tests {
 
         assert_eq!(result, Err(ToolError::AccessDenied));
         assert!(!root.path().join(".env").exists());
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Same confirmation-gated shape as write_file_with_confirmation's
+    // own tests above, but the diff is windowed (generate_windowed_diff)
+    // rather than full-file — here the whole 3-line file fits within
+    // the context window, so no DiffLine::Elided appears; a file large
+    // enough to actually elide something isn't this step's concern (see
+    // diff.rs's own generate_windowed_diff tests for that).
+    #[test]
+    fn edit_file_with_confirmation_applies_the_edit_when_confirmed() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Apply).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "two", "new": "TWO"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("wrote notes.txt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        match rx.try_recv().unwrap() {
+            CoreEvent::WriteProposed { path, diff } => {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(
+                    diff,
+                    vec![
+                        DiffLine::Unchanged(DiffLineText {
+                            text: "one".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Removed(DiffLineText {
+                            text: "two".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Added(DiffLineText {
+                            text: "TWO".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Unchanged(DiffLineText {
+                            text: "three".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                    ]
+                );
+            }
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_file_with_confirmation_declines_without_writing() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Decline).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "two", "new": "TWO"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::WriteDeclined));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    // Same principle as write_file_with_confirmation's own blocked-path
+    // test: an invalid path must be rejected before ever asking for
+    // confirmation. confirm_rx never receives anything here, so if the
+    // implementation asked for confirmation first, this test would hang.
+    #[test]
+    fn edit_file_with_confirmation_rejects_a_blocked_path_without_asking() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": ".env", "old": "SECRET=1", "new": "SECRET=2"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(".env")).unwrap(),
+            "SECRET=1"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    // An edit that can't even be computed (old matches more than once,
+    // replace_all not set) has no real diff to propose — same
+    // validate-before-confirming principle as the blocked-path test
+    // above, just for apply_edit's own ambiguity check instead of the
+    // sandbox/blocklist gate.
+    #[test]
+    fn edit_file_with_confirmation_rejects_an_ambiguous_match_without_asking() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "old old old\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "old", "new": "new"}"#.to_string(),
+        };
+
+        let result = edit_file_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AmbiguousMatch(3)));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "old old old\n"
+        );
         assert!(rx.try_recv().is_err());
     }
 

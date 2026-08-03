@@ -26,7 +26,7 @@ pub use diff::{DiffLine, DiffLineText};
 pub use mistral::MistralClient;
 pub use ollama::OllamaClient;
 
-pub(crate) use diff::generate_diff;
+pub(crate) use diff::{generate_diff, generate_windowed_diff};
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
