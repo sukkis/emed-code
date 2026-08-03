@@ -102,3 +102,92 @@ fn submit_user_message_can_call_list_files_via_local_ollama() {
         other => panic!("expected a final assistant reply, got: {other:?}"),
     }
 }
+
+// The known list of real files under src/core/ — see the identical
+// constant in real_mistral_smoke_test.rs; duplicated rather than shared
+// per this codebase's existing convention for test fixtures in these
+// two files (see poll_until_final's own comment above).
+const KNOWN_CORE_FILES: [&str; 8] = [
+    "credentials.rs",
+    "diff.rs",
+    "mistral.rs",
+    "ollama.rs",
+    "sandbox_path.rs",
+    "settings.rs",
+    "system_prompt.rs",
+    "tools.rs",
+];
+
+// Ollama/mistral-nemo equivalents of
+// real_mistral_smoke_test.rs's ambiguous-directory pair
+// (docs/tool-descriptions.md Step 2). Manual testing (2026-08-02) found
+// mistral-nemo already reaches zero-guess success on this exact prompt,
+// both quoted and unquoted — these codify that as a regression guard,
+// not to drive new implementation (no code change accompanies them; the
+// tool descriptions are provider-agnostic, see tool_definitions()).
+//
+// Known flaky (2026-08-02): 5 runs, 3 passed, 2 failed — once with an
+// empty AssistantChunk and no tool call at all (looks like an
+// inference-level glitch, not specific to this prompt: the unrelated
+// submit_user_message_can_call_list_files_via_local_ollama test hit the
+// same empty-response shape once), once with the model correctly
+// reasoning the real path was likely under src/ but asking the user to
+// confirm instead of calling list_files_recursive itself — a real
+// instruction-following miss (violates both the base system prompt's
+// "don't pause to ask, proceed on your best assumption" and this
+// tool's own "instead of asking the user to clarify"), not something
+// more description wording is expected to fix — see
+// docs/tool-descriptions.md's status for why this is being left as
+// documented, known flakiness rather than chased further here.
+#[test]
+fn submit_user_message_finds_a_nested_directory_from_an_ambiguous_request_via_local_ollama() {
+    let mut core = Core::new();
+
+    core.submit_user_message("What files are under the core directory?".to_string());
+
+    let events = poll_until_final(&mut core, Duration::from_secs(60));
+
+    let used_list_files_recursive = events.iter().any(
+        |event| matches!(event, CoreEvent::ToolCall { name, .. } if name == "list_files_recursive"),
+    );
+    assert!(
+        used_list_files_recursive,
+        "expected at least one list_files_recursive call, got: {events:?}"
+    );
+
+    match events.last() {
+        Some(CoreEvent::AssistantChunk(text)) => assert!(
+            KNOWN_CORE_FILES.iter().any(|file| text.contains(file)),
+            "expected the reply to name real src/core/ files, got: {text:?}"
+        ),
+        other => panic!("expected a final assistant reply, got: {other:?}"),
+    }
+}
+
+// See submit_user_message_avoids_guessing_at_a_nested_directorys_location
+// in real_mistral_smoke_test.rs for why this is a separate test from
+// task success above, not folded into one assertion.
+#[test]
+fn submit_user_message_avoids_guessing_at_a_nested_directorys_location_via_local_ollama() {
+    let mut core = Core::new();
+
+    core.submit_user_message("What files are under the core directory?".to_string());
+
+    let events = poll_until_final(&mut core, Duration::from_secs(60));
+
+    let failed_listing_calls = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                CoreEvent::ToolCall { name, result: Err(_), .. }
+                    if name == "list_files" || name == "list_files_recursive"
+            )
+        })
+        .count();
+    assert_eq!(
+        failed_listing_calls, 0,
+        "expected no failed list_files/list_files_recursive guess before finding the real \
+         path, got {failed_listing_calls}: {events:?}"
+    );
+}
