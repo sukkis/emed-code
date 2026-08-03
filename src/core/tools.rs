@@ -497,6 +497,45 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "content"]
             }),
         },
+        ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "Replace an exact snippet of text within an existing file, without \
+                resending the rest of the file's contents. Call this directly to propose the \
+                change — the system automatically shows the user a diff and requires their \
+                approval before anything is written, so do not ask the user for confirmation \
+                yourself first. `old` must match the file's current content exactly, including \
+                whitespace, and must be unique within the file unless replace_all is set — if \
+                it isn't found, or matches more than once without replace_all, you'll get an \
+                error telling you which; add more surrounding context to `old` to make it \
+                unique, or set replace_all to true to change every occurrence. Do not assume \
+                the edit has happened until a result confirms it; the user may decline."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file, relative to the project root. The \
+                            file must already exist."
+                    },
+                    "old": {
+                        "type": "string",
+                        "description": "The exact existing text to replace, including \
+                            whitespace — must match the file's current content verbatim."
+                    },
+                    "new": {
+                        "type": "string",
+                        "description": "The text to replace it with."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Set to true to replace every occurrence of `old` \
+                            instead of requiring exactly one match. Defaults to false."
+                    }
+                },
+                "required": ["path", "old", "new"]
+            }),
+        },
     ]
 }
 
@@ -1383,14 +1422,15 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    // Pins down exactly what's advertised to the model. write_file is
-    // included here even though dispatch() itself never routes it —
-    // it's handled separately by write_file_with_confirmation (see
+    // Pins down exactly what's advertised to the model. write_file and
+    // edit_file are both included here even though dispatch() itself
+    // never routes either — they're handled separately by
+    // write_file_with_confirmation/edit_file_with_confirmation (see
     // run_agent_loop) — so this only guards tool_definitions() itself,
     // not a dispatch/definitions correspondence that no longer holds
-    // for all four tools.
+    // for all five tools.
     #[test]
-    fn tool_definitions_advertises_all_four_tools() {
+    fn tool_definitions_advertises_all_five_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1403,7 +1443,8 @@ mod tests {
                 "read_file",
                 "list_files",
                 "list_files_recursive",
-                "write_file"
+                "write_file",
+                "edit_file"
             ]
         );
     }

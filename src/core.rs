@@ -33,7 +33,9 @@ pub(crate) use sandbox_path::{SandboxError, SandboxPath};
 pub(crate) use settings::{FileAccessSecurity, Settings};
 pub use system_prompt::AgentsMdStatus;
 use system_prompt::load_system_prompt;
-use tools::{dispatch, tool_definitions, write_file_with_confirmation};
+use tools::{
+    dispatch, edit_file_with_confirmation, tool_definitions, write_file_with_confirmation,
+};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -76,9 +78,9 @@ pub enum CoreEvent {
         // actual (short, useful) message in full.
         result: Result<String, String>,
     },
-    /// A `write_file` call awaiting your decision — pass it to
-    /// [`Core::respond_to_confirmation`] to apply or decline it. At
-    /// most one of these is ever outstanding at a time.
+    /// A `write_file` or `edit_file` call awaiting your decision — pass
+    /// it to [`Core::respond_to_confirmation`] to apply or decline it.
+    /// At most one of these is ever outstanding at a time.
     WriteProposed { path: String, diff: Vec<DiffLine> },
     /// The exchange ended in an error — a connection failure, a
     /// malformed provider response, or a safety cap (too many tool
@@ -251,11 +253,20 @@ fn run_agent_loop(
                     // The model needs the full content either way (what
                     // was read, or why it failed) — only the CoreEvent
                     // sent to the TUI distinguishes Ok from Err.
-                    // write_file needs the confirmation channel dispatch
-                    // doesn't have, so it's routed separately rather
-                    // than folded into dispatch's uniform signature.
+                    // write_file and edit_file both need the confirmation
+                    // channel dispatch doesn't have, so they're routed
+                    // separately rather than folded into dispatch's
+                    // uniform signature.
                     let dispatch_result = if call.name == "write_file" {
                         write_file_with_confirmation(
+                            root,
+                            file_access_security,
+                            &call,
+                            tx,
+                            confirm_rx,
+                        )
+                    } else if call.name == "edit_file" {
+                        edit_file_with_confirmation(
                             root,
                             file_access_security,
                             &call,
@@ -998,5 +1009,87 @@ mod tests {
             other => panic!("expected a declined ToolCall error, got {other:?}"),
         }
         assert!(!root.path().join("new.txt").exists());
+    }
+
+    // Same shape as agent_loop_blocks_on_write_confirmation_then_applies_it
+    // above, proving edit_file is routed the same way — through the
+    // confirmation channel, not dispatch — rather than only exercising
+    // edit_file_with_confirmation directly the way tools.rs's own tests do.
+    #[test]
+    fn agent_loop_blocks_on_edit_confirmation_then_applies_it() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "two", "new": "TWO"}"#.to_string(),
+        };
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("edited it".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
+        core.submit_user_message("edit a file".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+        match &events[0] {
+            CoreEvent::WriteProposed { path, .. } => assert_eq!(path, "notes.txt"),
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+
+        core.respond_to_confirmation(ConfirmationChoice::Apply);
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+        assert!(matches!(
+            events[0],
+            CoreEvent::ToolCall { result: Ok(_), .. }
+        ));
+        assert_eq!(
+            events[1],
+            CoreEvent::AssistantChunk("edited it".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn agent_loop_produces_a_declined_tool_result_when_edit_is_declined() {
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path": "notes.txt", "old": "two", "new": "TWO"}"#.to_string(),
+        };
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("ok, not editing".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
+        core.submit_user_message("edit a file".to_string());
+
+        poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+        core.respond_to_confirmation(ConfirmationChoice::Decline);
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+        match &events[0] {
+            CoreEvent::ToolCall {
+                result: Err(message),
+                ..
+            } => assert!(message.contains("declined")),
+            other => panic!("expected a declined ToolCall error, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
     }
 }

@@ -78,9 +78,6 @@ why.
 
 - A directory-creation tool, with its own confirmation and security
   posture
-- An append/insert tool distinct from `write_file`'s whole-file
-  replace, so adding a line doesn't depend on the model correctly
-  reconstructing the entire file's contents
 - Token/context usage shown in the UI
 - Independent read/write file-access strictness settings
 - Syntax-highlighted diffs
