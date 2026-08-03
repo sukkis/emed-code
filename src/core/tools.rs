@@ -30,6 +30,16 @@ pub(crate) enum ToolError {
     // it; the TUI's "error: " prefix reads fine for "this didn't
     // happen because you said no."
     WriteDeclined,
+    // edit_file's `old` wasn't found anywhere in the file. Like
+    // WriteDeclined, not a technical failure — an actionable outcome
+    // the model should see and retry from (e.g. its `old` text doesn't
+    // match verbatim), not a bug in emed-code itself.
+    NoMatch,
+    // edit_file's `old` matched more than once with replace_all: false.
+    // Carries the match count so the error message can tell the model
+    // exactly how ambiguous the match was, letting it choose between
+    // narrowing `old` with more context or setting replace_all: true.
+    AmbiguousMatch(usize),
 }
 
 impl fmt::Display for ToolError {
@@ -43,6 +53,12 @@ impl fmt::Display for ToolError {
                 write!(f, "access to this path is restricted by security policy")
             }
             ToolError::WriteDeclined => write!(f, "user declined this write"),
+            ToolError::NoMatch => write!(f, "the given `old` text was not found in the file"),
+            ToolError::AmbiguousMatch(count) => write!(
+                f,
+                "the given `old` text matched {count} times; narrow it with more \
+                 surrounding context, or set replace_all to change every occurrence"
+            ),
         }
     }
 }
@@ -207,6 +223,29 @@ fn walk_recursive(
     }
 
     Ok(())
+}
+
+// Pure string logic, no I/O — edit_file_with_confirmation (Step 4)
+// reads old_content from disk and hands it here, same split as
+// generate_windowed_diff's own pure-function step. replace_all: false
+// requires old to match exactly once, mirroring Claude Code's own Edit
+// tool; replace_all: true changes every occurrence and only cares that
+// at least one exists.
+fn apply_edit(
+    old_content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, ToolError> {
+    let match_count = old_content.matches(old).count();
+
+    if match_count == 0 {
+        return Err(ToolError::NoMatch);
+    }
+    if match_count > 1 && !replace_all {
+        return Err(ToolError::AmbiguousMatch(match_count));
+    }
+    Ok(old_content.replace(old, new))
 }
 
 // pub(crate): called both by write_file_with_confirmation below (after
@@ -852,6 +891,48 @@ mod tests {
         let result = dispatch(root.path(), FileAccessSecurity::Strict, &tool_call);
 
         assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    // apply_edit is pure string logic, no I/O — the future
+    // edit_file_with_confirmation reads old_content from disk and
+    // hands it here, same split as generate_windowed_diff's own
+    // pure-function step.
+    #[test]
+    fn apply_edit_replaces_a_single_exact_match() {
+        let result = apply_edit("one\ntwo\nthree\n", "two", "TWO", false);
+
+        assert_eq!(result, Ok("one\nTWO\nthree\n".to_string()));
+    }
+
+    #[test]
+    fn apply_edit_replaces_every_occurrence_when_replace_all_is_true() {
+        let result = apply_edit("a b a c a", "a", "X", true);
+
+        assert_eq!(result, Ok("X b X c X".to_string()));
+    }
+
+    #[test]
+    fn apply_edit_rejects_old_text_not_found_in_the_file() {
+        let result = apply_edit("one\ntwo\nthree\n", "missing", "new", false);
+
+        assert_eq!(result, Err(ToolError::NoMatch));
+    }
+
+    // Zero matches is still an error with replace_all: true — there is
+    // nothing to replace either way, replace_all only changes what
+    // happens when old is found more than once.
+    #[test]
+    fn apply_edit_rejects_old_text_not_found_even_with_replace_all() {
+        let result = apply_edit("one\ntwo\nthree\n", "missing", "new", true);
+
+        assert_eq!(result, Err(ToolError::NoMatch));
+    }
+
+    #[test]
+    fn apply_edit_rejects_an_ambiguous_match_without_replace_all() {
+        let result = apply_edit("a b a c a", "a", "X", false);
+
+        assert_eq!(result, Err(ToolError::AmbiguousMatch(3)));
     }
 
     // write_file isn't added to tool_definitions()/dispatch — it's
