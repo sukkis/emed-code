@@ -400,6 +400,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 #[derive(Debug, Default)]
 pub struct InputBox {
     buffer: String,
+    // A char index (buffer.chars().count() range), not a byte index —
+    // required for correctness on multi-byte UTF-8 text. Only
+    // converted to a byte offset (via byte_index_for, char_indices()
+    // based) at the point of actually mutating buffer.
+    cursor: usize,
 }
 
 impl InputBox {
@@ -407,18 +412,19 @@ impl InputBox {
         Self::default()
     }
 
-    /// Applies one key press: typed characters are appended,
-    /// `Backspace` removes the last one, everything else is ignored.
+    /// Applies one key press: typed characters are inserted, and
+    /// `Backspace` removes one, both at the cursor position — not
+    /// always the end, now that the cursor can move (see `move_left`/
+    /// `move_right`/`move_home`/`move_end`). Everything else is
+    /// ignored here; navigation keys aren't routed to this yet.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
 
         match key.code {
-            KeyCode::Char(c) => self.buffer.push(c),
-            KeyCode::Backspace => {
-                self.buffer.pop();
-            }
+            KeyCode::Char(c) => self.insert(c),
+            KeyCode::Backspace => self.backspace(),
             _ => {}
         }
     }
@@ -428,9 +434,70 @@ impl InputBox {
         &self.buffer
     }
 
-    // Leaves an empty buffer in place, returning what it held.
+    /// The cursor's current position, as a char index into `buffer`.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    // Leaves an empty buffer in place, returning what it held. Resets
+    // the cursor too — otherwise it'd be left pointing past the end of
+    // the now-empty buffer, a stale value nothing else here produces.
     fn take(&mut self) -> String {
+        self.cursor = 0;
         std::mem::take(&mut self.buffer)
+    }
+
+    fn insert(&mut self, c: char) {
+        let byte_index = self.byte_index_for(self.cursor);
+        self.buffer.insert(byte_index, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        let Some(remove_at) = self.cursor.checked_sub(1) else {
+            return;
+        };
+        self.buffer.remove(self.byte_index_for(remove_at));
+        self.cursor = remove_at;
+    }
+
+    // Removes the character *after* the cursor — the cursor itself
+    // doesn't move, unlike backspace.
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.buffer.chars().count() {
+            return;
+        }
+        self.buffer.remove(self.byte_index_for(self.cursor));
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.buffer.chars().count());
+    }
+
+    // Absolute start of the buffer, not the current wrapped row — this
+    // is one logical line that soft-wraps, not a multi-line editor
+    // with real line breaks, so there's no per-row "start" to speak of.
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.buffer.chars().count();
+    }
+
+    // Out-of-range char_index (only possible if cursor were ever left
+    // stale, which take()'s explicit reset above prevents) falls back
+    // to the buffer's end rather than panicking.
+    fn byte_index_for(&self, char_index: usize) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(char_index)
+            .map(|(byte_index, _)| byte_index)
+            .unwrap_or(self.buffer.len())
     }
 }
 
@@ -1050,6 +1117,147 @@ mod tests {
         ));
 
         assert_eq!(input.buffer(), "");
+    }
+
+    // move_left/move_right/move_home/move_end/delete_forward aren't
+    // routed from handle_key yet (that's the next step) — called
+    // directly here, same as apply_edit was tested before edit_file
+    // wired it in.
+
+    #[test]
+    fn moving_left_moves_the_cursor_back_one_position() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+
+        input.move_left();
+
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn moving_left_past_the_start_does_nothing() {
+        let mut input = InputBox::new();
+
+        input.move_left();
+
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn moving_right_past_the_end_does_nothing() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+
+        input.move_right();
+
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn inserting_after_moving_left_places_the_character_before_the_end() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('c')));
+        input.move_left();
+
+        input.handle_key(press(KeyCode::Char('b')));
+
+        assert_eq!(input.buffer(), "abc");
+        assert_eq!(input.cursor(), 2);
+    }
+
+    #[test]
+    fn backspace_removes_the_character_before_the_cursor_not_always_the_last() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.handle_key(press(KeyCode::Char('c')));
+        input.move_left();
+
+        input.handle_key(press(KeyCode::Backspace));
+
+        assert_eq!(input.buffer(), "ac");
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn delete_forward_removes_the_character_after_the_cursor() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.handle_key(press(KeyCode::Char('c')));
+        input.move_left();
+        input.move_left();
+
+        input.delete_forward();
+
+        assert_eq!(input.buffer(), "ac");
+        // Unlike backspace, delete_forward doesn't move the cursor —
+        // it's still the position the removed character used to start
+        // at.
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn delete_forward_at_the_end_of_the_buffer_does_nothing() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+
+        input.delete_forward();
+
+        assert_eq!(input.buffer(), "a");
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn move_home_moves_the_cursor_to_the_start() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+
+        input.move_home();
+
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn move_end_moves_the_cursor_to_the_end() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.move_home();
+
+        input.move_end();
+
+        assert_eq!(input.cursor(), 2);
+    }
+
+    #[test]
+    fn submitting_resets_the_cursor_to_the_start() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.input.cursor(), 0);
+    }
+
+    // char_indices()-based cursor math must operate on chars, not
+    // bytes — a byte-offset cursor would panic or corrupt multi-byte
+    // UTF-8 text (inserting/removing mid-character). 'é' is 2 bytes,
+    // 1 char.
+    #[test]
+    fn cursor_math_operates_on_characters_not_bytes() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('é')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.move_left();
+
+        input.handle_key(press(KeyCode::Char('x')));
+
+        assert_eq!(input.buffer(), "éxb");
     }
 
     // These only check App's own observable state (log content, input
