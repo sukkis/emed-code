@@ -20,6 +20,12 @@ use crate::core::{AgentsMdStatus, ConfirmationChoice, Core, CoreEvent, DiffLine}
 const SCROLL_STEP: usize = 1;
 const PAGE_SCROLL_STEP: usize = 5;
 
+// The input box grows by one row per wrapped line as you type, up to
+// this many content rows (plus its 2 border rows) — a fixed cap
+// rather than a terminal-relative fraction, so a huge paste can't
+// squeeze the chat log down to nothing.
+const MAX_INPUT_ROWS: usize = 6;
+
 // Above this many characters, a JSON string value in a tool call's
 // arguments is hidden behind a placeholder rather than shown in full —
 // see truncate_long_argument_values.
@@ -318,7 +324,16 @@ pub fn is_quit_key(key: &KeyEvent) -> bool {
 /// position) and either the input box or, while a write awaits
 /// confirmation, a numbered apply/decline menu.
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
+    // Border columns take 2 of the terminal's width either way —
+    // Layout::vertical only ever splits height, so the input box's
+    // usable width (and thus how many rows its current text wraps to)
+    // is already known before that split happens below.
+    let input_inner_width = frame.area().width.saturating_sub(2) as usize;
+    let input_wrapped_lines = wrap_text(app.input_buffer(), input_inner_width);
+    let input_content_rows = input_wrapped_lines.len().clamp(1, MAX_INPUT_ROWS) as u16;
+    let input_area_height = input_content_rows + 2; // top/bottom border
+
+    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(input_area_height)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
 
     let chat_title = format!(
@@ -354,7 +369,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         let input_block = Block::bordered().title("input");
         let input_inner = input_block.inner(input_area);
-        let input = Paragraph::new(app.input_buffer()).block(input_block);
+        // Only the most recently wrapped rows are shown once there are
+        // more than MAX_INPUT_ROWS of them — the tail is where the
+        // cursor is (always at the end of the buffer, still), so
+        // that's what needs to stay visible, matching how typing past
+        // the edge of a normal terminal input behaves.
+        let visible_start = input_wrapped_lines.len().saturating_sub(MAX_INPUT_ROWS);
+        let input_text = input_wrapped_lines[visible_start..].join("\n");
+        let input = Paragraph::new(input_text).block(input_block);
         frame.render_widget(input, input_area);
 
         let cursor_x = input_inner.x + app.input_buffer().chars().count() as u16;
@@ -905,6 +927,46 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         terminal.backend_mut().assert_cursor_position((3, 4));
+    }
+
+    // Input area grows from its fixed 3 rows once the typed text needs
+    // more than one wrapped row — proves both the height computation
+    // and the Paragraph actually wrapping (rather than clipping) text
+    // that used to run off the right edge. No spaces in the typed
+    // text, so wrap_line hard-breaks exactly at the inner width (18,
+    // for a 20-wide backend minus 2 border columns) rather than
+    // backing up to a word boundary — keeps the expected wrap point
+    // exact rather than dependent on where a space happens to fall.
+    #[test]
+    fn input_area_grows_and_wraps_once_text_exceeds_one_row() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        let typed = "abcdefghijklmnopqrst"; // 20 chars: wraps to 18 + 2
+        for c in typed.chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (1u16..19)
+                .map(|x| buffer.content()[y as usize * 20 + x as usize].symbol())
+                .collect()
+        };
+
+        assert_eq!(
+            row(3).trim_end(),
+            "abcdefghijklmnopqr",
+            "expected the first wrapped row to fill the input area's inner width"
+        );
+        assert_eq!(
+            row(4).trim_end(),
+            "st",
+            "expected the text that used to be clipped to now wrap onto a second row"
+        );
     }
 
     #[test]
