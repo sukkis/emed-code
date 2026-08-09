@@ -82,3 +82,7 @@ why.
 - Independent read/write file-access strictness settings
 - Syntax-highlighted diffs
 - Shell command execution
+
+## License
+
+Licensed under GPL-3.0-or-later.
