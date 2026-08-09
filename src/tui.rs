@@ -20,6 +20,12 @@ use crate::core::{AgentsMdStatus, ConfirmationChoice, Core, CoreEvent, DiffLine}
 const SCROLL_STEP: usize = 1;
 const PAGE_SCROLL_STEP: usize = 5;
 
+// The input box grows by one row per wrapped line as you type, up to
+// this many content rows (plus its 2 border rows) — a fixed cap
+// rather than a terminal-relative fraction, so a huge paste can't
+// squeeze the chat log down to nothing.
+const MAX_INPUT_ROWS: usize = 6;
+
 // Above this many characters, a JSON string value in a tool call's
 // arguments is hidden behind a placeholder rather than shown in full —
 // see truncate_long_argument_values.
@@ -307,6 +313,45 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+// Maps a char offset into the unwrapped buffer to a (row, col) within
+// its wrapped lines (concatenating `lines` reproduces the original
+// buffer exactly, so this is a walk over cumulative char counts, not a
+// re-wrap). An offset exactly on a wrap boundary belongs to the START
+// of the next row, not the end of the current one — rendering it at
+// the end of a full row would put the cursor one column past that
+// row's own visible width.
+fn cursor_row_and_col(lines: &[String], char_offset: usize) -> (usize, usize) {
+    let mut remaining = char_offset;
+    let last_row = lines.len().saturating_sub(1);
+
+    for (row, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        if remaining < len || row == last_row {
+            return (row, remaining.min(len));
+        }
+        remaining -= len;
+    }
+
+    (0, 0)
+}
+
+// Which wrapped row the visible window (at most max_rows tall) should
+// start at, given where the cursor currently is. Reduces to "always
+// show the tail" when the cursor is at/near the last row — the only
+// case that existed before cursor navigation — but scrolls the window
+// up just enough to keep an earlier cursor position in view too,
+// rather than staying pinned to the tail regardless of where the
+// cursor actually is.
+fn visible_window_start(total_rows: usize, cursor_row: usize, max_rows: usize) -> usize {
+    if total_rows <= max_rows {
+        return 0;
+    }
+
+    let tail_start = total_rows - max_rows;
+    let earliest_start_showing_cursor = cursor_row.saturating_sub(max_rows - 1);
+    earliest_start_showing_cursor.min(tail_start)
+}
+
 /// Whether this key press should quit the app — `Ctrl-C` or `Ctrl-Q`.
 pub fn is_quit_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
@@ -318,7 +363,16 @@ pub fn is_quit_key(key: &KeyEvent) -> bool {
 /// position) and either the input box or, while a write awaits
 /// confirmation, a numbered apply/decline menu.
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]);
+    // Border columns take 2 of the terminal's width either way —
+    // Layout::vertical only ever splits height, so the input box's
+    // usable width (and thus how many rows its current text wraps to)
+    // is already known before that split happens below.
+    let input_inner_width = frame.area().width.saturating_sub(2) as usize;
+    let input_wrapped_lines = wrap_text(app.input_buffer(), input_inner_width);
+    let input_content_rows = input_wrapped_lines.len().clamp(1, MAX_INPUT_ROWS) as u16;
+    let input_area_height = input_content_rows + 2; // top/bottom border
+
+    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(input_area_height)]);
     let [chat_area, input_area] = frame.area().layout(&layout);
 
     let chat_title = format!(
@@ -354,11 +408,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         let input_block = Block::bordered().title("input");
         let input_inner = input_block.inner(input_area);
-        let input = Paragraph::new(app.input_buffer()).block(input_block);
+
+        // The visible window (which wrapped rows are actually shown)
+        // and the cursor's on-screen row are computed from the same
+        // cursor position, so they can't disagree about which rows
+        // are "the current view" — one is a slice of the other, not
+        // two independent calculations.
+        let (cursor_row, cursor_col) = cursor_row_and_col(&input_wrapped_lines, app.input_cursor());
+        let visible_start =
+            visible_window_start(input_wrapped_lines.len(), cursor_row, MAX_INPUT_ROWS);
+
+        let input_text = input_wrapped_lines[visible_start..].join("\n");
+        let input = Paragraph::new(input_text).block(input_block);
         frame.render_widget(input, input_area);
 
-        let cursor_x = input_inner.x + app.input_buffer().chars().count() as u16;
-        frame.set_cursor_position((cursor_x, input_inner.y));
+        let cursor_x = input_inner.x + cursor_col as u16;
+        let cursor_y = input_inner.y + (cursor_row - visible_start) as u16;
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -366,6 +432,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 #[derive(Debug, Default)]
 pub struct InputBox {
     buffer: String,
+    // A char index (buffer.chars().count() range), not a byte index —
+    // required for correctness on multi-byte UTF-8 text. Only
+    // converted to a byte offset (via byte_index_for, char_indices()
+    // based) at the point of actually mutating buffer.
+    cursor: usize,
 }
 
 impl InputBox {
@@ -373,18 +444,24 @@ impl InputBox {
         Self::default()
     }
 
-    /// Applies one key press: typed characters are appended,
-    /// `Backspace` removes the last one, everything else is ignored.
+    /// Applies one key press: typed characters are inserted, and
+    /// `Backspace`/`Delete` remove the character before/after the
+    /// cursor, both at the cursor position — not always the end.
+    /// `Left`/`Right`/`Home`/`End` move the cursor. Everything else is
+    /// ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
 
         match key.code {
-            KeyCode::Char(c) => self.buffer.push(c),
-            KeyCode::Backspace => {
-                self.buffer.pop();
-            }
+            KeyCode::Char(c) => self.insert(c),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_home(),
+            KeyCode::End => self.move_end(),
             _ => {}
         }
     }
@@ -394,9 +471,70 @@ impl InputBox {
         &self.buffer
     }
 
-    // Leaves an empty buffer in place, returning what it held.
+    /// The cursor's current position, as a char index into `buffer`.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    // Leaves an empty buffer in place, returning what it held. Resets
+    // the cursor too — otherwise it'd be left pointing past the end of
+    // the now-empty buffer, a stale value nothing else here produces.
     fn take(&mut self) -> String {
+        self.cursor = 0;
         std::mem::take(&mut self.buffer)
+    }
+
+    fn insert(&mut self, c: char) {
+        let byte_index = self.byte_index_for(self.cursor);
+        self.buffer.insert(byte_index, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        let Some(remove_at) = self.cursor.checked_sub(1) else {
+            return;
+        };
+        self.buffer.remove(self.byte_index_for(remove_at));
+        self.cursor = remove_at;
+    }
+
+    // Removes the character *after* the cursor — the cursor itself
+    // doesn't move, unlike backspace.
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.buffer.chars().count() {
+            return;
+        }
+        self.buffer.remove(self.byte_index_for(self.cursor));
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.buffer.chars().count());
+    }
+
+    // Absolute start of the buffer, not the current wrapped row — this
+    // is one logical line that soft-wraps, not a multi-line editor
+    // with real line breaks, so there's no per-row "start" to speak of.
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.buffer.chars().count();
+    }
+
+    // Out-of-range char_index (only possible if cursor were ever left
+    // stale, which take()'s explicit reset above prevents) falls back
+    // to the buffer's end rather than panicking.
+    fn byte_index_for(&self, char_index: usize) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(char_index)
+            .map(|(byte_index, _)| byte_index)
+            .unwrap_or(self.buffer.len())
     }
 }
 
@@ -608,6 +746,12 @@ impl App {
     /// The chat input box's current contents.
     pub fn input_buffer(&self) -> &str {
         self.input.buffer()
+    }
+
+    /// The chat input box's cursor position, as a char index into
+    /// `input_buffer`.
+    pub fn input_cursor(&self) -> usize {
+        self.input.cursor()
     }
 
     /// How many lines up from the bottom the chat log is scrolled.
@@ -907,6 +1051,71 @@ mod tests {
         terminal.backend_mut().assert_cursor_position((3, 4));
     }
 
+    // Input area grows from its fixed 3 rows once the typed text needs
+    // more than one wrapped row — proves both the height computation
+    // and the Paragraph actually wrapping (rather than clipping) text
+    // that used to run off the right edge. No spaces in the typed
+    // text, so wrap_line hard-breaks exactly at the inner width (18,
+    // for a 20-wide backend minus 2 border columns) rather than
+    // backing up to a word boundary — keeps the expected wrap point
+    // exact rather than dependent on where a space happens to fall.
+    #[test]
+    fn input_area_grows_and_wraps_once_text_exceeds_one_row() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        let typed = "abcdefghijklmnopqrst"; // 20 chars: wraps to 18 + 2
+        for c in typed.chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (1u16..19)
+                .map(|x| buffer.content()[y as usize * 20 + x as usize].symbol())
+                .collect()
+        };
+
+        assert_eq!(
+            row(3).trim_end(),
+            "abcdefghijklmnopqr",
+            "expected the first wrapped row to fill the input area's inner width"
+        );
+        assert_eq!(
+            row(4).trim_end(),
+            "st",
+            "expected the text that used to be clipped to now wrap onto a second row"
+        );
+    }
+
+    // The cursor is still conceptually "at the end of the buffer"
+    // (InputBox is append/backspace-only, unchanged) — this only fixes
+    // how that position renders once the buffer wraps to more than one
+    // row. Same 20-char/18+2-wrap setup as
+    // input_area_grows_and_wraps_once_text_exceeds_one_row: the second
+    // wrapped row ("st") lands on the input area's second inner row
+    // (y=4), so the cursor should land right after it there — not
+    // still pinned to the first row, and not walked off using the
+    // whole buffer's raw character count (the old formula's bug).
+    #[test]
+    fn cursor_lands_on_the_last_wrapped_row_once_input_wraps() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        let typed = "abcdefghijklmnopqrst"; // wraps to "abcdefghijklmnopqr" + "st"
+        for c in typed.chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
+    }
+
     #[test]
     fn typing_appends_characters() {
         let mut input = InputBox::new();
@@ -951,6 +1160,147 @@ mod tests {
         ));
 
         assert_eq!(input.buffer(), "");
+    }
+
+    // move_left/move_right/move_home/move_end/delete_forward aren't
+    // routed from handle_key yet (that's the next step) — called
+    // directly here, same as apply_edit was tested before edit_file
+    // wired it in.
+
+    #[test]
+    fn moving_left_moves_the_cursor_back_one_position() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+
+        input.move_left();
+
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn moving_left_past_the_start_does_nothing() {
+        let mut input = InputBox::new();
+
+        input.move_left();
+
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn moving_right_past_the_end_does_nothing() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+
+        input.move_right();
+
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn inserting_after_moving_left_places_the_character_before_the_end() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('c')));
+        input.move_left();
+
+        input.handle_key(press(KeyCode::Char('b')));
+
+        assert_eq!(input.buffer(), "abc");
+        assert_eq!(input.cursor(), 2);
+    }
+
+    #[test]
+    fn backspace_removes_the_character_before_the_cursor_not_always_the_last() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.handle_key(press(KeyCode::Char('c')));
+        input.move_left();
+
+        input.handle_key(press(KeyCode::Backspace));
+
+        assert_eq!(input.buffer(), "ac");
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn delete_forward_removes_the_character_after_the_cursor() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.handle_key(press(KeyCode::Char('c')));
+        input.move_left();
+        input.move_left();
+
+        input.delete_forward();
+
+        assert_eq!(input.buffer(), "ac");
+        // Unlike backspace, delete_forward doesn't move the cursor —
+        // it's still the position the removed character used to start
+        // at.
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn delete_forward_at_the_end_of_the_buffer_does_nothing() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+
+        input.delete_forward();
+
+        assert_eq!(input.buffer(), "a");
+        assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn move_home_moves_the_cursor_to_the_start() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+
+        input.move_home();
+
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn move_end_moves_the_cursor_to_the_end() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('a')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.move_home();
+
+        input.move_end();
+
+        assert_eq!(input.cursor(), 2);
+    }
+
+    #[test]
+    fn submitting_resets_the_cursor_to_the_start() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.input.cursor(), 0);
+    }
+
+    // char_indices()-based cursor math must operate on chars, not
+    // bytes — a byte-offset cursor would panic or corrupt multi-byte
+    // UTF-8 text (inserting/removing mid-character). 'é' is 2 bytes,
+    // 1 char.
+    #[test]
+    fn cursor_math_operates_on_characters_not_bytes() {
+        let mut input = InputBox::new();
+        input.handle_key(press(KeyCode::Char('é')));
+        input.handle_key(press(KeyCode::Char('b')));
+        input.move_left();
+
+        input.handle_key(press(KeyCode::Char('x')));
+
+        assert_eq!(input.buffer(), "éxb");
     }
 
     // These only check App's own observable state (log content, input
@@ -1572,5 +1922,169 @@ mod tests {
     #[test]
     fn wrap_text_of_an_empty_string_returns_one_empty_chunk() {
         assert_eq!(wrap_text("", 10), vec![String::new()]);
+    }
+
+    // cursor_row_and_col: maps a char offset into the unwrapped buffer
+    // to a (row, col) within its wrapped lines.
+
+    #[test]
+    fn cursor_row_and_col_finds_the_row_containing_a_mid_row_offset() {
+        let lines = vec!["abc".to_string(), "def".to_string()];
+        assert_eq!(cursor_row_and_col(&lines, 1), (0, 1));
+    }
+
+    // A char offset that falls exactly on a wrap boundary belongs to
+    // the START of the next row, not the end of the current one —
+    // rendering it at the end of a full row would put the cursor one
+    // column past that row's own visible width.
+    #[test]
+    fn cursor_row_and_col_prefers_the_start_of_the_next_row_at_a_wrap_boundary() {
+        let lines = vec!["abc".to_string(), "def".to_string()];
+        assert_eq!(cursor_row_and_col(&lines, 3), (1, 0));
+    }
+
+    #[test]
+    fn cursor_row_and_col_lands_at_the_end_of_the_last_row_for_the_final_offset() {
+        let lines = vec!["abc".to_string(), "def".to_string()];
+        assert_eq!(cursor_row_and_col(&lines, 6), (1, 3));
+    }
+
+    // visible_window_start: which wrapped row the visible window
+    // should start at, given where the cursor currently is.
+
+    #[test]
+    fn visible_window_start_shows_everything_when_it_all_fits() {
+        assert_eq!(visible_window_start(4, 2, 6), 0);
+    }
+
+    // Reproduces the growth increment's original "always show the
+    // tail" behavior as this function's special case — the cursor is
+    // at the last row, same as before cursor navigation existed.
+    #[test]
+    fn visible_window_start_shows_the_tail_when_the_cursor_is_at_the_end() {
+        assert_eq!(visible_window_start(8, 7, 6), 2);
+    }
+
+    // The new case navigation introduces: the cursor has moved above
+    // the tail window, so the window must scroll up just enough to
+    // keep it in view — not stay pinned to the tail regardless.
+    #[test]
+    fn visible_window_start_scrolls_up_just_enough_to_keep_an_earlier_cursor_visible() {
+        assert_eq!(visible_window_start(8, 0, 6), 0);
+        assert_eq!(visible_window_start(10, 7, 6), 2);
+    }
+
+    #[test]
+    fn pressing_left_moves_the_rendered_cursor_back_one_column() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Left));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((2, 4));
+    }
+
+    #[test]
+    fn pressing_right_after_left_returns_the_cursor_to_the_end() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+        app.handle_key(press(KeyCode::Left));
+
+        app.handle_key(press(KeyCode::Right));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
+    }
+
+    #[test]
+    fn delete_key_removes_the_character_after_the_cursor() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('a')));
+        app.handle_key(press(KeyCode::Char('b')));
+        app.handle_key(press(KeyCode::Char('c')));
+        app.handle_key(press(KeyCode::Left));
+        app.handle_key(press(KeyCode::Left));
+
+        app.handle_key(press(KeyCode::Delete));
+
+        assert_eq!(app.input_buffer(), "ac");
+    }
+
+    // Proves draw actually uses a cursor-aware window for BOTH the
+    // rendered text and the cursor's on-screen row — not just the
+    // cursor's position within a window that's still anchored to the
+    // tail. Narrow backend (width 5, inner width 3) so this only takes
+    // 19 typed characters to reach 7 wrapped rows (one over the 6-row
+    // cap: "abc"/"def"/"ghi"/"jkl"/"mno"/"pqr"/"s"), then 18 Left
+    // presses walk the cursor from the end back to row 0, col 1 (into
+    // "abc", between 'a' and 'b') — well above the tail window
+    // ([1, 7)) that showed before navigating.
+    #[test]
+    fn moving_the_cursor_above_the_visible_cap_scrolls_the_window_to_keep_it_in_view() {
+        let backend = TestBackend::new(5, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        for c in "abcdefghijklmnopqrs".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        for _ in 0..18 {
+            app.handle_key(press(KeyCode::Left));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((2, 2));
+    }
+
+    #[test]
+    fn home_key_moves_the_cursor_to_the_start() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Home));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((1, 4));
+    }
+
+    #[test]
+    fn end_key_moves_the_cursor_to_the_end() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+        // Left (already wired) moves the cursor off the end — End is
+        // what's actually under test here, not Home, so it shouldn't
+        // depend on Home also being wired to set up a non-end cursor.
+        app.handle_key(press(KeyCode::Left));
+
+        app.handle_key(press(KeyCode::End));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
+    }
+
+    #[test]
+    fn inserting_after_home_places_the_character_at_the_start() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('b')));
+        app.handle_key(press(KeyCode::Char('c')));
+        app.handle_key(press(KeyCode::Home));
+
+        app.handle_key(press(KeyCode::Char('a')));
+
+        assert_eq!(app.input_buffer(), "abc");
     }
 }
