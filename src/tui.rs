@@ -379,8 +379,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let input = Paragraph::new(input_text).block(input_block);
         frame.render_widget(input, input_area);
 
-        let cursor_x = input_inner.x + app.input_buffer().chars().count() as u16;
-        frame.set_cursor_position((cursor_x, input_inner.y));
+        // The cursor is always at the end of the buffer (InputBox is
+        // append/backspace-only) — so it's always on the last wrapped
+        // row, at that row's own character count, not the whole
+        // buffer's. input_content_rows already accounts for the same
+        // tail-slicing the rendered text above uses, so "last row" is
+        // always the last *visible* row too, even once wrapping
+        // exceeds MAX_INPUT_ROWS.
+        let last_line_chars = input_wrapped_lines
+            .last()
+            .map(|line| line.chars().count())
+            .unwrap_or(0);
+        let cursor_x = input_inner.x + last_line_chars as u16;
+        let cursor_y = input_inner.y + input_content_rows.saturating_sub(1);
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -967,6 +979,31 @@ mod tests {
             "st",
             "expected the text that used to be clipped to now wrap onto a second row"
         );
+    }
+
+    // The cursor is still conceptually "at the end of the buffer"
+    // (InputBox is append/backspace-only, unchanged) — this only fixes
+    // how that position renders once the buffer wraps to more than one
+    // row. Same 20-char/18+2-wrap setup as
+    // input_area_grows_and_wraps_once_text_exceeds_one_row: the second
+    // wrapped row ("st") lands on the input area's second inner row
+    // (y=4), so the cursor should land right after it there — not
+    // still pinned to the first row, and not walked off using the
+    // whole buffer's raw character count (the old formula's bug).
+    #[test]
+    fn cursor_lands_on_the_last_wrapped_row_once_input_wraps() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        let typed = "abcdefghijklmnopqrst"; // wraps to "abcdefghijklmnopqr" + "st"
+        for c in typed.chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
     }
 
     #[test]

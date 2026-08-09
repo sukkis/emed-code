@@ -537,6 +537,22 @@ against the true ceiling (total lines minus visible height); staying at
 `0` doubles as "the user is following along," so new content arriving
 doesn't yank a manually-scrolled-up user back to the bottom.
 
+The input box grows with what's typed rather than clipping text past
+the edge, using the same `wrap_text` the chat log uses (not
+`Paragraph`'s own wrapping, for the identical reason: one wrapped-row
+count driving both sizing and rendering, rather than two mechanisms
+that could disagree). Height is capped at `MAX_INPUT_ROWS` (6) content
+rows — a fixed constant rather than a terminal-relative fraction, so a
+large paste can't squeeze the chat log down to nothing. Past that cap,
+only the most recently wrapped rows are shown (a plain slice recomputed
+every frame, not stored scroll state — the input box has no notion of
+a user manually scrolling within their own in-progress message, unlike
+the chat log). The cursor — still always at the end of the buffer,
+`InputBox` remains append/backspace-only — is positioned from that same
+wrapped-row data: the last (visible) row, at that row's own character
+count, rather than the whole buffer's, so it can't end up out of sync
+with what's actually rendered.
+
 A tool call's logged line (`format_core_event`) never echoes large
 content back into the chat: a successful result shows only `ok` (a
 `read_file` result could be an entire file), and any JSON string value
