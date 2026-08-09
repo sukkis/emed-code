@@ -313,6 +313,45 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+// Maps a char offset into the unwrapped buffer to a (row, col) within
+// its wrapped lines (concatenating `lines` reproduces the original
+// buffer exactly, so this is a walk over cumulative char counts, not a
+// re-wrap). An offset exactly on a wrap boundary belongs to the START
+// of the next row, not the end of the current one — rendering it at
+// the end of a full row would put the cursor one column past that
+// row's own visible width.
+fn cursor_row_and_col(lines: &[String], char_offset: usize) -> (usize, usize) {
+    let mut remaining = char_offset;
+    let last_row = lines.len().saturating_sub(1);
+
+    for (row, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        if remaining < len || row == last_row {
+            return (row, remaining.min(len));
+        }
+        remaining -= len;
+    }
+
+    (0, 0)
+}
+
+// Which wrapped row the visible window (at most max_rows tall) should
+// start at, given where the cursor currently is. Reduces to "always
+// show the tail" when the cursor is at/near the last row — the only
+// case that existed before cursor navigation — but scrolls the window
+// up just enough to keep an earlier cursor position in view too,
+// rather than staying pinned to the tail regardless of where the
+// cursor actually is.
+fn visible_window_start(total_rows: usize, cursor_row: usize, max_rows: usize) -> usize {
+    if total_rows <= max_rows {
+        return 0;
+    }
+
+    let tail_start = total_rows - max_rows;
+    let earliest_start_showing_cursor = cursor_row.saturating_sub(max_rows - 1);
+    earliest_start_showing_cursor.min(tail_start)
+}
+
 /// Whether this key press should quit the app — `Ctrl-C` or `Ctrl-Q`.
 pub fn is_quit_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
@@ -369,29 +408,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         let input_block = Block::bordered().title("input");
         let input_inner = input_block.inner(input_area);
-        // Only the most recently wrapped rows are shown once there are
-        // more than MAX_INPUT_ROWS of them — the tail is where the
-        // cursor is (always at the end of the buffer, still), so
-        // that's what needs to stay visible, matching how typing past
-        // the edge of a normal terminal input behaves.
-        let visible_start = input_wrapped_lines.len().saturating_sub(MAX_INPUT_ROWS);
+
+        // The visible window (which wrapped rows are actually shown)
+        // and the cursor's on-screen row are computed from the same
+        // cursor position, so they can't disagree about which rows
+        // are "the current view" — one is a slice of the other, not
+        // two independent calculations.
+        let (cursor_row, cursor_col) = cursor_row_and_col(&input_wrapped_lines, app.input_cursor());
+        let visible_start =
+            visible_window_start(input_wrapped_lines.len(), cursor_row, MAX_INPUT_ROWS);
+
         let input_text = input_wrapped_lines[visible_start..].join("\n");
         let input = Paragraph::new(input_text).block(input_block);
         frame.render_widget(input, input_area);
 
-        // The cursor is always at the end of the buffer (InputBox is
-        // append/backspace-only) — so it's always on the last wrapped
-        // row, at that row's own character count, not the whole
-        // buffer's. input_content_rows already accounts for the same
-        // tail-slicing the rendered text above uses, so "last row" is
-        // always the last *visible* row too, even once wrapping
-        // exceeds MAX_INPUT_ROWS.
-        let last_line_chars = input_wrapped_lines
-            .last()
-            .map(|line| line.chars().count())
-            .unwrap_or(0);
-        let cursor_x = input_inner.x + last_line_chars as u16;
-        let cursor_y = input_inner.y + input_content_rows.saturating_sub(1);
+        let cursor_x = input_inner.x + cursor_col as u16;
+        let cursor_y = input_inner.y + (cursor_row - visible_start) as u16;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -413,10 +445,10 @@ impl InputBox {
     }
 
     /// Applies one key press: typed characters are inserted, and
-    /// `Backspace` removes one, both at the cursor position — not
-    /// always the end, now that the cursor can move (see `move_left`/
-    /// `move_right`/`move_home`/`move_end`). Everything else is
-    /// ignored here; navigation keys aren't routed to this yet.
+    /// `Backspace`/`Delete` remove the character before/after the
+    /// cursor, both at the cursor position — not always the end, now
+    /// that `Left`/`Right` can move it. `Home`/`End` aren't routed
+    /// here yet. Everything else is ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -425,6 +457,9 @@ impl InputBox {
         match key.code {
             KeyCode::Char(c) => self.insert(c),
             KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
             _ => {}
         }
     }
@@ -709,6 +744,12 @@ impl App {
     /// The chat input box's current contents.
     pub fn input_buffer(&self) -> &str {
         self.input.buffer()
+    }
+
+    /// The chat input box's cursor position, as a char index into
+    /// `input_buffer`.
+    pub fn input_cursor(&self) -> usize {
+        self.input.cursor()
     }
 
     /// How many lines up from the bottom the chat log is scrolled.
@@ -1879,5 +1920,125 @@ mod tests {
     #[test]
     fn wrap_text_of_an_empty_string_returns_one_empty_chunk() {
         assert_eq!(wrap_text("", 10), vec![String::new()]);
+    }
+
+    // cursor_row_and_col: maps a char offset into the unwrapped buffer
+    // to a (row, col) within its wrapped lines.
+
+    #[test]
+    fn cursor_row_and_col_finds_the_row_containing_a_mid_row_offset() {
+        let lines = vec!["abc".to_string(), "def".to_string()];
+        assert_eq!(cursor_row_and_col(&lines, 1), (0, 1));
+    }
+
+    // A char offset that falls exactly on a wrap boundary belongs to
+    // the START of the next row, not the end of the current one —
+    // rendering it at the end of a full row would put the cursor one
+    // column past that row's own visible width.
+    #[test]
+    fn cursor_row_and_col_prefers_the_start_of_the_next_row_at_a_wrap_boundary() {
+        let lines = vec!["abc".to_string(), "def".to_string()];
+        assert_eq!(cursor_row_and_col(&lines, 3), (1, 0));
+    }
+
+    #[test]
+    fn cursor_row_and_col_lands_at_the_end_of_the_last_row_for_the_final_offset() {
+        let lines = vec!["abc".to_string(), "def".to_string()];
+        assert_eq!(cursor_row_and_col(&lines, 6), (1, 3));
+    }
+
+    // visible_window_start: which wrapped row the visible window
+    // should start at, given where the cursor currently is.
+
+    #[test]
+    fn visible_window_start_shows_everything_when_it_all_fits() {
+        assert_eq!(visible_window_start(4, 2, 6), 0);
+    }
+
+    // Reproduces the growth increment's original "always show the
+    // tail" behavior as this function's special case — the cursor is
+    // at the last row, same as before cursor navigation existed.
+    #[test]
+    fn visible_window_start_shows_the_tail_when_the_cursor_is_at_the_end() {
+        assert_eq!(visible_window_start(8, 7, 6), 2);
+    }
+
+    // The new case navigation introduces: the cursor has moved above
+    // the tail window, so the window must scroll up just enough to
+    // keep it in view — not stay pinned to the tail regardless.
+    #[test]
+    fn visible_window_start_scrolls_up_just_enough_to_keep_an_earlier_cursor_visible() {
+        assert_eq!(visible_window_start(8, 0, 6), 0);
+        assert_eq!(visible_window_start(10, 7, 6), 2);
+    }
+
+    #[test]
+    fn pressing_left_moves_the_rendered_cursor_back_one_column() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Left));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((2, 4));
+    }
+
+    #[test]
+    fn pressing_right_after_left_returns_the_cursor_to_the_end() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+        app.handle_key(press(KeyCode::Left));
+
+        app.handle_key(press(KeyCode::Right));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
+    }
+
+    #[test]
+    fn delete_key_removes_the_character_after_the_cursor() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('a')));
+        app.handle_key(press(KeyCode::Char('b')));
+        app.handle_key(press(KeyCode::Char('c')));
+        app.handle_key(press(KeyCode::Left));
+        app.handle_key(press(KeyCode::Left));
+
+        app.handle_key(press(KeyCode::Delete));
+
+        assert_eq!(app.input_buffer(), "ac");
+    }
+
+    // Proves draw actually uses a cursor-aware window for BOTH the
+    // rendered text and the cursor's on-screen row — not just the
+    // cursor's position within a window that's still anchored to the
+    // tail. Narrow backend (width 5, inner width 3) so this only takes
+    // 19 typed characters to reach 7 wrapped rows (one over the 6-row
+    // cap: "abc"/"def"/"ghi"/"jkl"/"mno"/"pqr"/"s"), then 18 Left
+    // presses walk the cursor from the end back to row 0, col 1 (into
+    // "abc", between 'a' and 'b') — well above the tail window
+    // ([1, 7)) that showed before navigating.
+    #[test]
+    fn moving_the_cursor_above_the_visible_cap_scrolls_the_window_to_keep_it_in_view() {
+        let backend = TestBackend::new(5, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+
+        for c in "abcdefghijklmnopqrs".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        for _ in 0..18 {
+            app.handle_key(press(KeyCode::Left));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((2, 2));
     }
 }
