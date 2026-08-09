@@ -446,9 +446,9 @@ impl InputBox {
 
     /// Applies one key press: typed characters are inserted, and
     /// `Backspace`/`Delete` remove the character before/after the
-    /// cursor, both at the cursor position — not always the end, now
-    /// that `Left`/`Right` can move it. `Home`/`End` aren't routed
-    /// here yet. Everything else is ignored.
+    /// cursor, both at the cursor position — not always the end.
+    /// `Left`/`Right`/`Home`/`End` move the cursor. Everything else is
+    /// ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -460,6 +460,8 @@ impl InputBox {
             KeyCode::Delete => self.delete_forward(),
             KeyCode::Left => self.move_left(),
             KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_home(),
+            KeyCode::End => self.move_end(),
             _ => {}
         }
     }
@@ -2040,5 +2042,49 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         terminal.backend_mut().assert_cursor_position((2, 2));
+    }
+
+    #[test]
+    fn home_key_moves_the_cursor_to_the_start() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+
+        app.handle_key(press(KeyCode::Home));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((1, 4));
+    }
+
+    #[test]
+    fn end_key_moves_the_cursor_to_the_end() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('h')));
+        app.handle_key(press(KeyCode::Char('i')));
+        // Left (already wired) moves the cursor off the end — End is
+        // what's actually under test here, not Home, so it shouldn't
+        // depend on Home also being wired to set up a non-end cursor.
+        app.handle_key(press(KeyCode::Left));
+
+        app.handle_key(press(KeyCode::End));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        terminal.backend_mut().assert_cursor_position((3, 4));
+    }
+
+    #[test]
+    fn inserting_after_home_places_the_character_at_the_start() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('b')));
+        app.handle_key(press(KeyCode::Char('c')));
+        app.handle_key(press(KeyCode::Home));
+
+        app.handle_key(press(KeyCode::Char('a')));
+
+        assert_eq!(app.input_buffer(), "abc");
     }
 }

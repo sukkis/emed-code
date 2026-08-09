@@ -543,15 +543,41 @@ the edge, using the same `wrap_text` the chat log uses (not
 count driving both sizing and rendering, rather than two mechanisms
 that could disagree). Height is capped at `MAX_INPUT_ROWS` (6) content
 rows — a fixed constant rather than a terminal-relative fraction, so a
-large paste can't squeeze the chat log down to nothing. Past that cap,
-only the most recently wrapped rows are shown (a plain slice recomputed
-every frame, not stored scroll state — the input box has no notion of
-a user manually scrolling within their own in-progress message, unlike
-the chat log). The cursor — still always at the end of the buffer,
-`InputBox` remains append/backspace-only — is positioned from that same
-wrapped-row data: the last (visible) row, at that row's own character
-count, rather than the whole buffer's, so it can't end up out of sync
-with what's actually rendered.
+large paste can't squeeze the chat log down to nothing.
+
+`InputBox` tracks a real cursor position — a char index into the
+buffer, not a byte index (required for multi-byte UTF-8 correctness;
+only converted to a byte offset, via `char_indices()`, at the point of
+actually mutating the `String`). `Left`/`Right` move it, `Home`/`End`
+jump to the absolute start/end of the buffer (not the current wrapped
+row — there's no real newline here, one logical line that soft-wraps,
+so there's no per-row "start" to speak of), and typing/`Backspace`/
+`Delete` all act at the cursor rather than always at the end. `Up`/
+`Down` are deliberately not repurposed for this — already claimed
+globally for chat-log scrolling, and `Left`/`Right` alone already
+reach every position since the buffer has no real line breaks yet;
+revisit once newline insertion gives it some.
+
+Two pure functions keep rendering honest once the cursor can be
+anywhere, not just the end: `cursor_row_and_col` maps a cursor offset
+to a (row, col) within the wrapped lines (an offset exactly on a wrap
+boundary belongs to the *start* of the next row, not the end of the
+current one — otherwise the cursor would render one column past a
+full row's visible width), and `visible_window_start` decides which
+wrapped rows are actually shown, given where the cursor is — reducing
+to "always show the tail" when the cursor's at the end (the only case
+that existed before navigation), but scrolling the window up just
+enough to keep an earlier cursor position in view otherwise. `draw`
+computes both from the same cursor position and reuses the same
+`visible_start` for the rendered text and the cursor's on-screen row,
+so the two can't disagree about which rows are currently in view.
+
+One known, minor gap: if the buffer's length is an exact multiple of
+the wrap width and the cursor sits at the very end, it renders one
+column past that row's visible width — `wrap_text` doesn't produce a
+trailing empty row for that case. Cosmetic only (no crash, no wrong
+text), left as-is rather than changing `wrap_text`'s behavior against
+its own already-pinned tests for a rare combination.
 
 A tool call's logged line (`format_core_event`) never echoes large
 content back into the chat: a successful result shows only `ok` (a
