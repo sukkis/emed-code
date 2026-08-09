@@ -2,6 +2,21 @@
 name = "emed-code"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A keyboard-driven terminal AI coding assistant, pairing with a local Ollama model or Mistral's cloud API."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sukkis/emed-code"
+readme = "README.md"
+authors = ["sukkis <rust.stuck095@passmail.net>"]
+keywords = ["ai", "llm", "tui", "ollama", "coding-assistant"]
+categories = ["command-line-utilities", "artificial-intelligence"]
+include = [
+    "src/**/*.rs",
+    "tests/*.rs",
+    "README.md",
+    "Cargo.toml",
+    "LICENSE",
+]
 
 [features]
 # Gates tests that hit a real local Ollama instance — never enabled in
@@ -20,5 +35,5 @@ anyhow = "1.0.104"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 basic-toml = "0.1.10"
-dirs = "=6.0.0"
+dirs = "6.0.0"
 similar = "3.1.1"

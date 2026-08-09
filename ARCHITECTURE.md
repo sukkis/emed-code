@@ -536,3 +536,18 @@ how many lines exist is what causes a stuck or unresponsive scrollbar.
 against the true ceiling (total lines minus visible height); staying at
 `0` doubles as "the user is following along," so new content arriving
 doesn't yank a manually-scrolled-up user back to the bottom.
+
+A tool call's logged line (`format_core_event`) never echoes large
+content back into the chat: a successful result shows only `ok` (a
+`read_file` result could be an entire file), and any JSON string value
+in the *arguments* over 80 characters is replaced with a `<N chars>`
+placeholder (`write_file`'s `content`, `edit_file`'s `old`/`new`).
+`truncate_long_argument_values` is deliberately tool-name-blind — one
+length rule applied to every value regardless of which tool or field it
+came from — rather than a per-tool-name match. A per-tool match was
+considered and rejected: it would need a new match arm remembered for
+every future large-argument tool, silently reverting to a raw dump for
+any tool nobody thought to add; the generic rule instead covers every
+tool, present or future, by construction. It leaves an unchanged
+argument string exactly as sent (not reparsed and reserialized), so a
+short-argument call's formatting never shifts.

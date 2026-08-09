@@ -150,6 +150,13 @@ exchange with a clear error. This doesn't compound with the tool-call
 cap above — an empty response never produces a tool call, so the two
 counters never add to each other's cost.
 
+## Dependency vulnerability scanning
+
+CI runs `cargo audit` against `Cargo.lock` on every push or pull request
+that touches `Cargo.toml`/`Cargo.lock`, checking every dependency
+against the RustSec advisory database. A known vulnerability fails the
+build; informational advisories don't.
+
 ## Out of scope
 
 emed-code has no plaintext secrets files, `.env` parsing, or
