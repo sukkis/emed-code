@@ -20,6 +20,60 @@ use crate::core::{AgentsMdStatus, ConfirmationChoice, Core, CoreEvent, DiffLine}
 const SCROLL_STEP: usize = 1;
 const PAGE_SCROLL_STEP: usize = 5;
 
+// Above this many characters, a JSON string value in a tool call's
+// arguments is hidden behind a placeholder rather than shown in full —
+// see truncate_long_argument_values.
+const ARGUMENT_VALUE_TRUNCATION_THRESHOLD: usize = 80;
+
+// A tool call's arguments can carry an entire file (write_file's
+// `content`) or a large snippet (edit_file's `old`/`new`) — showing
+// those raw would make the chat log line unreadable, the same problem
+// format_core_event already avoids for `result` on success. This is
+// deliberately tool-name-blind: any JSON string value over the
+// threshold is replaced with a placeholder reporting its original
+// length, regardless of which tool or field it came from, rather than
+// special-casing write_file/edit_file by name.
+//
+// When nothing needs truncating, the original string is returned
+// unchanged, byte-for-byte, rather than being reparsed and
+// reserialized — so a short-argument call's formatting never shifts
+// just because this function ran.
+fn truncate_long_argument_values(arguments: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(arguments)
+    else {
+        // Not a JSON object at all (malformed JSON, or valid JSON that
+        // isn't an object) — apply the same short/long rule to the
+        // whole raw string as one blob.
+        return if arguments.chars().count() > ARGUMENT_VALUE_TRUNCATION_THRESHOLD {
+            format!("<{} chars>", arguments.chars().count())
+        } else {
+            arguments.to_string()
+        };
+    };
+
+    let mut truncated_any = false;
+    let mut new_map = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        let value = match &value {
+            serde_json::Value::String(s)
+                if s.chars().count() > ARGUMENT_VALUE_TRUNCATION_THRESHOLD =>
+            {
+                truncated_any = true;
+                serde_json::Value::String(format!("<{} chars>", s.chars().count()))
+            }
+            _ => value,
+        };
+        new_map.insert(key, value);
+    }
+
+    if truncated_any {
+        serde_json::to_string(&serde_json::Value::Object(new_map))
+            .unwrap_or_else(|_| arguments.to_string())
+    } else {
+        arguments.to_string()
+    }
+}
+
 fn format_core_event(event: CoreEvent) -> String {
     match event {
         CoreEvent::AssistantChunk(text) => format!("emed-code: {text}"),
@@ -29,15 +83,21 @@ fn format_core_event(event: CoreEvent) -> String {
         // an entire file's contents) is for the model, not something the
         // chat log echoes back at the user. On failure, the error
         // message itself is short and useful, so it's shown in full.
+        // Arguments go through truncate_long_argument_values first, for
+        // the same reason — a write_file/edit_file call's arguments can
+        // themselves carry huge content.
         CoreEvent::ToolCall {
             name,
             arguments,
             result,
             ..
-        } => match result {
-            Ok(_) => format!("tool: {name}({arguments}) -> ok"),
-            Err(error) => format!("tool: {name}({arguments}) -> error: {error}"),
-        },
+        } => {
+            let arguments = truncate_long_argument_values(&arguments);
+            match result {
+                Ok(_) => format!("tool: {name}({arguments}) -> ok"),
+                Err(error) => format!("tool: {name}({arguments}) -> error: {error}"),
+            }
+        }
         // Kept only for this match's exhaustiveness — App::apply_core_events
         // intercepts CoreEvent::WriteProposed before it ever reaches
         // format_core_event in the real app, since it needs the real
@@ -1010,6 +1070,41 @@ mod tests {
                 result: Err("invalid path: path escapes the sandboxed directory".to_string()),
             }),
             r#"tool: read_file({"path": "../secret.txt"}) -> error: invalid path: path escapes the sandboxed directory"#
+        );
+    }
+
+    // A write_file call's `content` argument can be an entire file —
+    // dumping it raw into the chat log makes the line unreadable (this
+    // is the actual bug: found manually testing edit_file, triggered by
+    // asking a real model to write a long ARCHITECTURE.md). The short
+    // `path` value stays exactly as sent; only the long `content` value
+    // is replaced, with a placeholder that still reports how long it
+    // was — not a per-tool rule, just "any JSON string value over 80
+    // chars gets hidden," so this applies identically no matter which
+    // tool sent it.
+    #[test]
+    fn formats_a_tool_call_by_truncating_long_argument_values_only() {
+        let long_content = "x".repeat(500);
+        let arguments = format!(r#"{{"path":"big.txt","content":"{long_content}"}}"#);
+
+        let formatted = format_core_event(CoreEvent::ToolCall {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments,
+            result: Ok("wrote big.txt".to_string()),
+        });
+
+        assert!(
+            formatted.contains(r#""path":"big.txt""#),
+            "short values should still be shown as-is: {formatted}"
+        );
+        assert!(
+            formatted.contains("<500 chars>"),
+            "a long value should be replaced with a length placeholder: {formatted}"
+        );
+        assert!(
+            !formatted.contains(&long_content),
+            "the actual long content must never reach the log: {formatted}"
         );
     }
 
