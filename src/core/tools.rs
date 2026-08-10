@@ -105,6 +105,33 @@ fn is_content_restricted(relative_path: &Path) -> bool {
     }
 }
 
+// For create_directory: layers is_content_restricted over
+// SandboxPath::plan_directory_creation's output, checking every level
+// that would actually get created — not just the deepest one. A
+// single check against only the final requested path would miss a
+// restricted name at an intermediate level (e.g. "something.pem/real"
+// — is_content_restricted's .env/.pem/.key checks only look at a
+// path's own file name, so only the true leaf of a single checked path
+// would ever be caught; checking each planned level closes that gap).
+fn plan_and_validate_directory_creation(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+) -> Result<Vec<SandboxPath>, ToolError> {
+    let plan =
+        SandboxPath::plan_directory_creation(root, requested).map_err(ToolError::InvalidPath)?;
+
+    if file_access_security == FileAccessSecurity::Strict {
+        for level in &plan {
+            if is_content_restricted(level.relative_path()) {
+                return Err(ToolError::AccessDenied);
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
 fn read_file(
     root: &Path,
     requested: &Path,
@@ -605,6 +632,90 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // plan_and_validate_directory_creation: layers is_content_restricted
+    // over SandboxPath::plan_directory_creation's output.
+
+    #[test]
+    fn plan_and_validate_directory_creation_allows_an_unrestricted_nested_path() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new("a/b/c"),
+            FileAccessSecurity::Strict,
+        );
+
+        let relative_paths: Vec<PathBuf> = result
+            .unwrap()
+            .iter()
+            .map(|p| p.relative_path().to_path_buf())
+            .collect();
+        assert_eq!(
+            relative_paths,
+            vec![
+                PathBuf::from("a"),
+                PathBuf::from("a/b"),
+                PathBuf::from("a/b/c")
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_and_validate_directory_creation_blocks_a_restricted_leaf() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new("a/.ssh"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    // The gap a single leaf-only check would miss: .ssh appears in the
+    // MIDDLE of the requested path, not at the end.
+    #[test]
+    fn plan_and_validate_directory_creation_blocks_a_restricted_intermediate_level() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new(".ssh/b"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn plan_and_validate_directory_creation_skips_the_content_check_in_loose_mode() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new(".ssh/b"),
+            FileAccessSecurity::Loose,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn plan_and_validate_directory_creation_maps_a_sandbox_error() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+
+        let result = plan_and_validate_directory_creation(
+            &root,
+            Path::new("../outside"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::InvalidPath(SandboxError::Escapes)));
     }
 
     #[test]
