@@ -132,6 +132,18 @@ fn plan_and_validate_directory_creation(
     Ok(plan)
 }
 
+// Creates each level a validated plan calls for, shallowest first.
+// create_dir rather than create_dir_all: the plan already did the
+// mkdir-p-equivalent work (and the security-critical validation that
+// went with it), so re-deriving "what's missing" via the recursive std
+// call here would be redundant and, worse, unvalidated.
+fn create_planned_directories(plan: &[SandboxPath]) -> Result<(), ToolError> {
+    for level in plan {
+        std::fs::create_dir(level.as_path()).map_err(|_| ToolError::IoFailure)?;
+    }
+    Ok(())
+}
+
 fn read_file(
     root: &Path,
     requested: &Path,
@@ -716,6 +728,29 @@ mod tests {
         );
 
         assert_eq!(result, Err(ToolError::InvalidPath(SandboxError::Escapes)));
+    }
+
+    // create_planned_directories: the mechanical filesystem step that
+    // actually creates each level a validated plan calls for.
+
+    #[test]
+    fn create_planned_directories_creates_every_planned_level_in_order() {
+        let root = TempDir::new();
+        let plan = SandboxPath::plan_directory_creation(root.path(), Path::new("a/b/c")).unwrap();
+
+        let result = create_planned_directories(&plan);
+
+        assert_eq!(result, Ok(()));
+        assert!(root.path().join("a").is_dir());
+        assert!(root.path().join("a/b").is_dir());
+        assert!(root.path().join("a/b/c").is_dir());
+    }
+
+    #[test]
+    fn create_planned_directories_is_a_noop_for_an_empty_plan() {
+        let result = create_planned_directories(&[]);
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
