@@ -1,9 +1,107 @@
 //! [`AnthropicClient`], an [`LlmClient`] implementation talking to
 //! Anthropic's Messages API.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::{ChatError, LlmResponse, ToolCall};
+use super::{ChatError, LlmResponse, Message, ToolCall, ToolDefinition};
+
+// Anthropic's tool_use/tool_result content wants a real JSON
+// object/id-based correlation, not Mistral's flat sibling-field shape —
+// a genuine sum type on the request side too, same reasoning as
+// AnthropicContentBlock below for the response side.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlockParam {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<AnthropicContentBlockParam>,
+}
+
+fn to_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::User { content } => AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlockParam::Text {
+                    text: content.clone(),
+                }],
+            },
+            Message::Assistant { content } => AnthropicMessage {
+                role: "assistant".to_string(),
+                content: vec![AnthropicContentBlockParam::Text {
+                    text: content.clone(),
+                }],
+            },
+            Message::ToolCalls { calls } => AnthropicMessage {
+                role: "assistant".to_string(),
+                content: calls
+                    .iter()
+                    .map(|call| AnthropicContentBlockParam::ToolUse {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        // Same invariant to_ollama_messages relies on:
+                        // this string only ever comes from
+                        // extract_anthropic_reply's own
+                        // Value::to_string() a few calls earlier — a
+                        // strict round-trip that cannot fail unless our
+                        // own code already corrupted it.
+                        input: serde_json::from_str(&call.arguments).expect(
+                            "ToolCall.arguments must be the JSON this client itself serialized",
+                        ),
+                    })
+                    .collect(),
+            },
+            Message::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlockParam::ToolResult {
+                    tool_use_id: tool_call_id.clone(),
+                    content: content.clone(),
+                }],
+            },
+        })
+        .collect()
+}
+
+// Flat shape — no {"type": "function", "function": {...}} wrapper like
+// Mistral/Ollama both use. Confirmed against Anthropic's own tool-use
+// docs, not guessed.
+#[derive(Debug, Serialize)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+fn to_anthropic_tools(tools: &[ToolDefinition]) -> Vec<AnthropicTool> {
+    tools
+        .iter()
+        .map(|tool| AnthropicTool {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            input_schema: tool.parameters.clone(),
+        })
+        .collect()
+}
 
 // Anthropic's response content is an array of typed blocks, not
 // Mistral/Ollama's flat content-or-tool_calls split. Internally tagged
@@ -106,7 +204,7 @@ fn extract_anthropic_reply(json: &str) -> Result<LlmResponse, ChatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ToolCall;
+    use crate::core::{Message, ToolCall, ToolDefinition};
 
     // extract_anthropic_reply: Anthropic's content is an array of typed
     // blocks (text/tool_use/thinking), not Mistral's flat content-or-
@@ -264,5 +362,130 @@ mod tests {
         let result = extract_anthropic_reply(json);
 
         assert!(matches!(result, Err(ChatError::Auth(_))));
+    }
+
+    // to_anthropic_messages / to_anthropic_tools: the request-building
+    // half, complementing extract_anthropic_reply's response parsing
+    // above. See docs/anthropic-provider.md's research notes for the
+    // real wire-shape differences from Mistral/Ollama this reflects.
+
+    #[test]
+    fn to_anthropic_messages_maps_user_and_assistant_roles() {
+        let messages = vec![
+            Message::User {
+                content: "hello".to_string(),
+            },
+            Message::Assistant {
+                content: "hi there".to_string(),
+            },
+        ];
+
+        let mapped = to_anthropic_messages(&messages);
+
+        assert_eq!(
+            mapped,
+            vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![AnthropicContentBlockParam::Text {
+                        text: "hello".to_string(),
+                    }],
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: vec![AnthropicContentBlockParam::Text {
+                        text: "hi there".to_string(),
+                    }],
+                },
+            ]
+        );
+    }
+
+    // Anthropic's tool_use.input wants a real JSON object, not Mistral's
+    // pre-stringified arguments — same parse-back round-trip
+    // to_ollama_messages already uses for the identical reason.
+    #[test]
+    fn to_anthropic_messages_maps_tool_calls_to_the_real_wire_shape() {
+        let messages = vec![Message::ToolCalls {
+            calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path": "a.txt"}"#.to_string(),
+            }],
+        }];
+
+        let mapped = to_anthropic_messages(&messages);
+
+        assert_eq!(
+            mapped,
+            vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: vec![AnthropicContentBlockParam::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.txt"}),
+                }],
+            }]
+        );
+    }
+
+    // Anthropic is id-based like Mistral (tool_use_id ~ tool_call_id),
+    // not name-based like Ollama — Message::ToolResult's name field is
+    // ignored here too (docs/anthropic-provider.md design question 3,
+    // confirmed against mistral.rs's identical existing pattern).
+    #[test]
+    fn to_anthropic_messages_maps_tool_result_to_the_real_wire_shape() {
+        let messages = vec![Message::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            content: "contents".to_string(),
+        }];
+
+        let mapped = to_anthropic_messages(&messages);
+
+        assert_eq!(
+            mapped,
+            vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlockParam::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "contents".to_string(),
+                }],
+            }]
+        );
+    }
+
+    // Flat shape — no {"type": "function", "function": {...}} wrapper
+    // like Mistral/Ollama both use. Confirmed against Anthropic's own
+    // tool-use docs, not guessed.
+    #[test]
+    fn to_anthropic_tools_maps_tool_definition_to_the_expected_schema() {
+        let tools = vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file's contents.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        }];
+
+        let mapped = to_anthropic_tools(&tools);
+        let value = serde_json::to_value(&mapped).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "name": "read_file",
+                    "description": "Read a file's contents.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            ])
+        );
     }
 }
