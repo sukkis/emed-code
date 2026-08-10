@@ -14,10 +14,25 @@ pub(crate) enum FileAccessSecurity {
     Loose,
 }
 
+// Mirrors FileAccessSecurity's shape exactly. Anthropic-specific today
+// (Claude Sonnet 5 runs adaptive thinking by default unless told
+// otherwise — see docs/anthropic-provider.md design question 9), but
+// named for the concept, not the provider, the same way ChatError's
+// ResponseTruncated/Refused variants are.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AnthropicThinking {
+    #[default]
+    Disabled,
+    Adaptive,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub(crate) struct Settings {
     #[serde(default)]
     pub(crate) file_access_security: FileAccessSecurity,
+    #[serde(default)]
+    pub(crate) anthropic_thinking: AnthropicThinking,
 }
 
 impl Settings {
@@ -82,5 +97,39 @@ mod tests {
         let settings = Settings::parse(r#"file_access_security = "yolo""#);
 
         assert_eq!(settings.file_access_security, FileAccessSecurity::Strict);
+    }
+
+    // anthropic_thinking mirrors file_access_security's own tests above —
+    // same fail-safe-to-default shape. The malformed-TOML fallback case
+    // isn't re-tested here: Settings::default() covers both fields via
+    // the same code path already proven by
+    // parse_defaults_to_strict_for_malformed_toml above.
+
+    #[test]
+    fn parse_defaults_to_disabled_for_an_empty_file() {
+        let settings = Settings::parse("");
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Disabled);
+    }
+
+    #[test]
+    fn parse_reads_an_explicit_disabled_value() {
+        let settings = Settings::parse(r#"anthropic_thinking = "disabled""#);
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Disabled);
+    }
+
+    #[test]
+    fn parse_reads_an_explicit_adaptive_value() {
+        let settings = Settings::parse(r#"anthropic_thinking = "adaptive""#);
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Adaptive);
+    }
+
+    #[test]
+    fn parse_defaults_to_disabled_for_an_unrecognized_value() {
+        let settings = Settings::parse(r#"anthropic_thinking = "yolo""#);
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Disabled);
     }
 }
