@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use super::{
-    ConfirmationChoice, CoreEvent, DiffLine, FileAccessSecurity, SandboxError, SandboxPath,
-    ToolCall, ToolDefinition,
+    ConfirmationChoice, CoreEvent, DiffLine, DiffLineText, FileAccessSecurity, SandboxError,
+    SandboxPath, ToolCall, ToolDefinition,
 };
 
 #[derive(Debug, PartialEq)]
@@ -142,6 +142,56 @@ fn create_planned_directories(plan: &[SandboxPath]) -> Result<(), ToolError> {
         std::fs::create_dir(level.as_path()).map_err(|_| ToolError::IoFailure)?;
     }
     Ok(())
+}
+
+// The confirmation-gated entry point the agent loop calls for a
+// "create_directory" tool call. Mirrors write_file_with_confirmation's
+// shape (validate first, so a forbidden or already-satisfied path never
+// even reaches a confirmation prompt) but doesn't share
+// propose_and_apply_write's tail — that helper writes one string of
+// content to one file, which doesn't fit a multi-level mkdir -p. An
+// empty plan (everything requested already exists) is the one case with
+// nothing to confirm, so it returns success immediately instead of
+// proposing a no-op.
+pub(crate) fn create_directory_with_confirmation(
+    root: &Path,
+    file_access_security: FileAccessSecurity,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    let args: PathArgs =
+        serde_json::from_str(&tool_call.arguments).map_err(|_| ToolError::MalformedArguments)?;
+    let requested = Path::new(&args.path);
+    let display_path = requested.to_string_lossy();
+
+    let plan = plan_and_validate_directory_creation(root, requested, file_access_security)?;
+
+    if plan.is_empty() {
+        return Ok(format!("{display_path} already exists"));
+    }
+
+    let diff: Vec<DiffLine> = plan
+        .iter()
+        .map(|level| {
+            DiffLine::Added(DiffLineText {
+                text: level.relative_path().to_string_lossy().into_owned(),
+                no_trailing_newline: false,
+            })
+        })
+        .collect();
+
+    let _ = tx.send(CoreEvent::WriteProposed {
+        path: display_path.to_string(),
+        diff,
+    });
+
+    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
+        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
+        ConfirmationChoice::Apply => {
+            create_planned_directories(&plan).map(|()| format!("created {display_path}"))
+        }
+    }
 }
 
 fn read_file(
@@ -751,6 +801,135 @@ mod tests {
         let result = create_planned_directories(&[]);
 
         assert_eq!(result, Ok(()));
+    }
+
+    // create_directory_with_confirmation: ties plan_and_validate_directory_
+    // creation and create_planned_directories together behind a
+    // WriteProposed confirmation, mirroring write_file_with_confirmation's
+    // test shape.
+
+    #[test]
+    fn create_directory_with_confirmation_applies_creation_when_confirmed() {
+        let root = TempDir::new();
+        let (tx, rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Apply).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/b"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("created a/b".to_string()));
+        assert!(root.path().join("a").is_dir());
+        assert!(root.path().join("a/b").is_dir());
+        match rx.try_recv().unwrap() {
+            CoreEvent::WriteProposed { path, diff } => {
+                assert_eq!(path, "a/b");
+                assert_eq!(
+                    diff,
+                    vec![
+                        DiffLine::Added(DiffLineText {
+                            text: "a".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Added(DiffLineText {
+                            text: "a/b".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                    ]
+                );
+            }
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_directory_with_confirmation_declines_without_creating() {
+        let root = TempDir::new();
+        let (tx, _rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Decline).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/b"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::WriteDeclined));
+        assert!(!root.path().join("a").exists());
+    }
+
+    // Same principle as write_file_with_confirmation's own blocked-path
+    // test: an invalid path must be rejected before ever asking for
+    // confirmation. confirm_rx never receives anything here, so if the
+    // implementation asked for confirmation first, this test would hang.
+    #[test]
+    fn create_directory_with_confirmation_rejects_a_blocked_path_without_asking() {
+        let root = TempDir::new();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/.ssh"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+        assert!(!root.path().join("a").exists());
+        assert!(rx.try_recv().is_err());
+    }
+
+    // The idempotent case from the design: everything requested already
+    // exists, so there's nothing to confirm — no WriteProposed at all.
+    // confirm_rx never receives anything here either, so an
+    // implementation that asked for confirmation anyway would hang.
+    #[test]
+    fn create_directory_with_confirmation_succeeds_immediately_when_everything_already_exists() {
+        let root = TempDir::new();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/b"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("a/b already exists".to_string()));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
