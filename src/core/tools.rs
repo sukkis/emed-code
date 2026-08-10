@@ -630,6 +630,29 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "old", "new"]
             }),
         },
+        ToolDefinition {
+            name: "create_directory".to_string(),
+            description: "Create a directory within the project, including any missing parent \
+                directories along the way (like mkdir -p). Call this directly to propose the \
+                change — the system automatically shows the user which directories would be \
+                created and requires their approval before anything happens, so do not ask the \
+                user for confirmation yourself first. If the directory (and every parent it \
+                needs) already exists, this succeeds immediately with nothing to confirm. Do \
+                not assume the directory has been created until a result confirms it; the user \
+                may decline."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the directory to create, relative to the \
+                            project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
     ]
 }
 
@@ -1752,15 +1775,15 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    // Pins down exactly what's advertised to the model. write_file and
-    // edit_file are both included here even though dispatch() itself
-    // never routes either — they're handled separately by
-    // write_file_with_confirmation/edit_file_with_confirmation (see
-    // run_agent_loop) — so this only guards tool_definitions() itself,
-    // not a dispatch/definitions correspondence that no longer holds
-    // for all five tools.
+    // Pins down exactly what's advertised to the model. write_file,
+    // edit_file, and create_directory are all included here even though
+    // dispatch() itself never routes any of them — they're handled
+    // separately by write_file_with_confirmation/edit_file_with_confirmation/
+    // create_directory_with_confirmation (see run_agent_loop) — so this
+    // only guards tool_definitions() itself, not a dispatch/definitions
+    // correspondence that no longer holds for all six tools.
     #[test]
-    fn tool_definitions_advertises_all_five_tools() {
+    fn tool_definitions_advertises_all_six_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1774,7 +1797,8 @@ mod tests {
                 "list_files",
                 "list_files_recursive",
                 "write_file",
-                "edit_file"
+                "edit_file",
+                "create_directory"
             ]
         );
     }
