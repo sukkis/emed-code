@@ -31,7 +31,7 @@ pub(crate) use diff::{generate_diff, generate_windowed_diff};
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
-pub(crate) use settings::{FileAccessSecurity, Settings};
+pub(crate) use settings::{AnthropicThinking, FileAccessSecurity, Settings};
 pub use system_prompt::AgentsMdStatus;
 use system_prompt::load_system_prompt;
 use tools::{

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ChatError, LlmResponse, Message, ToolCall, ToolDefinition};
+use super::{AnthropicThinking, ChatError, LlmResponse, Message, ToolCall, ToolDefinition};
 
 // Anthropic's tool_use/tool_result content wants a real JSON
 // object/id-based correlation, not Mistral's flat sibling-field shape —
@@ -101,6 +101,34 @@ fn to_anthropic_tools(tools: &[ToolDefinition]) -> Vec<AnthropicTool> {
             input_schema: tool.parameters.clone(),
         })
         .collect()
+}
+
+// Kept separate from AnthropicThinking itself rather than making one
+// enum serialize two different ways — a bare string for TOML
+// (settings.rs's own #[serde(rename_all = "lowercase")]) versus this
+// tagged-object wire shape. Fighting serde attributes to unify two
+// genuinely different shapes isn't simpler than two small types.
+fn anthropic_thinking_param(thinking: AnthropicThinking) -> serde_json::Value {
+    match thinking {
+        AnthropicThinking::Disabled => serde_json::json!({"type": "disabled"}),
+        AnthropicThinking::Adaptive => serde_json::json!({"type": "adaptive"}),
+    }
+}
+
+// Anthropic's /v1/messages request body. system is its own top-level
+// field, not a synthesized system-role message like Mistral/Ollama both
+// need — see the research notes in docs/anthropic-provider.md. No
+// "tools" key at all when there are none to advertise, matching
+// Mistral/Ollama's identical convention.
+#[derive(Debug, Serialize)]
+struct AnthropicRequest {
+    model: String,
+    system: String,
+    messages: Vec<AnthropicMessage>,
+    max_tokens: u32,
+    thinking: serde_json::Value,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicTool>,
 }
 
 // Anthropic's response content is an array of typed blocks, not
@@ -204,7 +232,7 @@ fn extract_anthropic_reply(json: &str) -> Result<LlmResponse, ChatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Message, ToolCall, ToolDefinition};
+    use crate::core::{AnthropicThinking, Message, ToolCall, ToolDefinition};
 
     // extract_anthropic_reply: Anthropic's content is an array of typed
     // blocks (text/tool_use/thinking), not Mistral's flat content-or-
@@ -484,6 +512,93 @@ mod tests {
                         "properties": { "path": { "type": "string" } },
                         "required": ["path"]
                     }
+                }
+            ])
+        );
+    }
+
+    // anthropic_thinking_param: maps Settings' AnthropicThinking to the
+    // wire shape — kept as its own small function/tests rather than
+    // trying to make AnthropicThinking itself serialize two different
+    // ways (a bare string for TOML, a tagged object for the request).
+
+    #[test]
+    fn anthropic_thinking_param_maps_disabled_to_the_expected_wire_shape() {
+        assert_eq!(
+            anthropic_thinking_param(AnthropicThinking::Disabled),
+            serde_json::json!({"type": "disabled"})
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_param_maps_adaptive_to_the_expected_wire_shape() {
+        assert_eq!(
+            anthropic_thinking_param(AnthropicThinking::Adaptive),
+            serde_json::json!({"type": "adaptive"})
+        );
+    }
+
+    // AnthropicRequest: Anthropic's /v1/messages request body. system is
+    // its own top-level field (not a synthesized system-role message
+    // like Mistral/Ollama both need) — see docs/anthropic-provider.md's
+    // research notes. No "tools" key at all when there are none to
+    // advertise, matching Mistral/Ollama's identical convention.
+    #[test]
+    fn anthropic_request_serializes_to_the_expected_shape() {
+        let request = AnthropicRequest {
+            model: "claude-sonnet-5".to_string(),
+            system: "be helpful".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlockParam::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+            max_tokens: 16000,
+            thinking: serde_json::json!({"type": "disabled"}),
+            tools: vec![],
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "model": "claude-sonnet-5",
+                "system": "be helpful",
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+                ],
+                "max_tokens": 16000,
+                "thinking": {"type": "disabled"}
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_request_includes_tools_when_present() {
+        let request = AnthropicRequest {
+            model: "claude-sonnet-5".to_string(),
+            system: String::new(),
+            messages: vec![],
+            max_tokens: 16000,
+            thinking: serde_json::json!({"type": "disabled"}),
+            tools: to_anthropic_tools(&[ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file's contents.".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            value["tools"],
+            serde_json::json!([
+                {
+                    "name": "read_file",
+                    "description": "Read a file's contents.",
+                    "input_schema": {"type": "object"}
                 }
             ])
         );
