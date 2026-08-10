@@ -2,8 +2,11 @@
 //! Anthropic's Messages API.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
-use super::{AnthropicThinking, ChatError, LlmResponse, Message, ToolCall, ToolDefinition};
+use super::{
+    AnthropicThinking, ChatError, LlmClient, LlmResponse, Message, ToolCall, ToolDefinition,
+};
 
 // Anthropic's tool_use/tool_result content wants a real JSON
 // object/id-based correlation, not Mistral's flat sibling-field shape —
@@ -226,6 +229,87 @@ fn extract_anthropic_reply(json: &str) -> Result<LlmResponse, ChatError> {
             Ok(error) => Err(ChatError::Auth(error.error.message)),
             Err(_) => Err(ChatError::MalformedResponse(parse_error.to_string())),
         },
+    }
+}
+
+const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_MODEL: &str = "claude-sonnet-5";
+// See docs/anthropic-provider.md design question 1: a fixed, non-
+// streaming-safe ceiling — Anthropic's own guidance flags non-streaming
+// requests above ~16K tokens as carrying real HTTP-timeout risk, and
+// streaming is out of scope for this increment.
+const ANTHROPIC_MAX_TOKENS: u32 = 16000;
+
+fn fetch_anthropic_reply(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    messages: Vec<AnthropicMessage>,
+    tools: Vec<AnthropicTool>,
+    thinking: AnthropicThinking,
+) -> Result<String, ChatError> {
+    let request = AnthropicRequest {
+        model: model.to_string(),
+        system: system.to_string(),
+        messages,
+        max_tokens: ANTHROPIC_MAX_TOKENS,
+        thinking: anthropic_thinking_param(thinking),
+        tools,
+    };
+
+    let mut response = ureq::post(ANTHROPIC_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .send_json(&request)
+        .map_err(|e| ChatError::Connection(e.to_string()))?;
+
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| ChatError::Connection(e.to_string()))
+}
+
+/// Talks to Anthropic's cloud API. Construct with
+/// [`AnthropicClient::new`], then use it wherever an [`LlmClient`] is
+/// needed — [`crate::core::Core::with_client`], for one.
+pub struct AnthropicClient {
+    api_key: Zeroizing<String>,
+    model: String,
+    thinking: AnthropicThinking,
+}
+
+impl AnthropicClient {
+    /// `api_key` is expected to already be resolved — see
+    /// [`crate::core::lookup_anthropic_api_key`]. `thinking` comes from
+    /// [`crate::core::Settings::anthropic_thinking`].
+    pub fn new(api_key: Zeroizing<String>, model: String, thinking: AnthropicThinking) -> Self {
+        AnthropicClient {
+            api_key,
+            model,
+            thinking,
+        }
+    }
+}
+
+impl LlmClient for AnthropicClient {
+    fn send(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ChatError> {
+        let anthropic_messages = to_anthropic_messages(messages);
+        let anthropic_tools = to_anthropic_tools(tools);
+        let body = fetch_anthropic_reply(
+            &self.api_key,
+            &self.model,
+            system,
+            anthropic_messages,
+            anthropic_tools,
+            self.thinking,
+        )?;
+        extract_anthropic_reply(&body)
     }
 }
 
@@ -602,5 +686,16 @@ mod tests {
                 }
             ])
         );
+    }
+
+    // Compile-time proof that AnthropicClient satisfies LlmClient, same
+    // as mistral_client_implements_llm_client/
+    // ollama_client_implements_llm_client. send() needs a real network
+    // round-trip (and a real API key), out of scope for a unit test —
+    // see the future tests/real_anthropic_smoke_test.rs.
+    #[test]
+    fn anthropic_client_implements_llm_client() {
+        fn assert_is_llm_client<C: LlmClient>() {}
+        assert_is_llm_client::<AnthropicClient>();
     }
 }
