@@ -91,7 +91,10 @@ fn mini_session_scroll_position_survives_a_real_reply_but_not_a_new_submit() {
             !text.starts_with("error: "),
             "expected a real reply, got: {text}"
         ),
-        LogEntry::Diff { .. } => panic!("unexpected diff entry — Ollama has no write_file tool"),
+        LogEntry::Diff { .. } => panic!(
+            "unexpected diff entry — these short factual prompts give no reason to call a \
+             write tool"
+        ),
     }
     assert_eq!(
         app.scroll_offset(),
