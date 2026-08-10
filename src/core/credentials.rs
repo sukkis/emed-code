@@ -43,9 +43,93 @@ pub fn lookup_mistral_api_key() -> Option<(Zeroizing<String>, CredentialSource)>
     resolve_mistral_api_key(pass_value, env_var_value)
 }
 
+const ANTHROPIC_PASS_KEY: &str = "emed-code/anthropic/api_key";
+const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
+
+// Duplicated from resolve_mistral_api_key rather than shared — see
+// docs/anthropic-provider.md's design question 5: two data points isn't
+// enough evidence a shared helper is the right call yet.
+fn resolve_anthropic_api_key(
+    pass_value: Option<Zeroizing<String>>,
+    env_var_value: Option<String>,
+) -> Option<(Zeroizing<String>, CredentialSource)> {
+    if let Some(key) = pass_value {
+        return Some((key, CredentialSource::Pass));
+    }
+    env_var_value.map(|key| (Zeroizing::new(key), CredentialSource::EnvVar))
+}
+
+pub fn anthropic_credential_log_message(source: &CredentialSource) -> &'static str {
+    match source {
+        CredentialSource::Pass => "Anthropic key: from getfrompass",
+        CredentialSource::EnvVar => {
+            "Anthropic key: from env var (no value emed-code/anthropic/api_key from getfrompass)"
+        }
+    }
+}
+
+/// Resolves the Anthropic API key: `getfrompass` first, falling back to
+/// the `ANTHROPIC_API_KEY` environment variable. `None` if neither has
+/// one.
+pub fn lookup_anthropic_api_key() -> Option<(Zeroizing<String>, CredentialSource)> {
+    let pass_value = getfrompass::try_get_from_pass(ANTHROPIC_PASS_KEY);
+    let env_var_value = std::env::var(ANTHROPIC_API_KEY_ENV_VAR).ok();
+    resolve_anthropic_api_key(pass_value, env_var_value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Anthropic's lookup mirrors Mistral's exactly (see resolve_mistral_api_key's
+    // own tests above) — duplicated rather than shared, per this increment's
+    // design decision (docs/anthropic-provider.md, design question 5): two
+    // data points isn't enough evidence a shared helper is the right call.
+
+    #[test]
+    fn resolve_anthropic_api_key_prefers_pass_when_both_are_available() {
+        let pass_value = Some(Zeroizing::new("from-pass".to_string()));
+        let env_var_value = Some("from-env".to_string());
+
+        let (key, source) = resolve_anthropic_api_key(pass_value, env_var_value).unwrap();
+
+        assert_eq!(*key, "from-pass");
+        assert_eq!(source, CredentialSource::Pass);
+    }
+
+    #[test]
+    fn resolve_anthropic_api_key_falls_back_to_env_var_when_pass_has_no_value() {
+        let pass_value = None;
+        let env_var_value = Some("from-env".to_string());
+
+        let (key, source) = resolve_anthropic_api_key(pass_value, env_var_value).unwrap();
+
+        assert_eq!(*key, "from-env");
+        assert_eq!(source, CredentialSource::EnvVar);
+    }
+
+    #[test]
+    fn resolve_anthropic_api_key_returns_none_when_neither_is_available() {
+        let result = resolve_anthropic_api_key(None, None);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn anthropic_credential_log_message_for_pass_names_getfrompass_not_pass() {
+        assert_eq!(
+            anthropic_credential_log_message(&CredentialSource::Pass),
+            "Anthropic key: from getfrompass"
+        );
+    }
+
+    #[test]
+    fn anthropic_credential_log_message_for_env_var_names_getfrompass_not_pass() {
+        assert_eq!(
+            anthropic_credential_log_message(&CredentialSource::EnvVar),
+            "Anthropic key: from env var (no value emed-code/anthropic/api_key from getfrompass)"
+        );
+    }
 
     // getfrompass's try_get_from_pass returns Option<Zeroizing<String>>,
     // not Result — None covers "no entry" and every other failure mode
