@@ -105,6 +105,34 @@ routed by tool name, not by which `LlmClient` is in use, so a local
 Ollama model reaches the exact same approval step a cloud Mistral model
 does.
 
+## Directory creation
+
+`create_directory` supports nested (`mkdir -p`-style) creation, which
+needs its own traversal check: symlink containment can normally only be
+verified by canonicalizing a path that already exists, and a
+naively-recursive creation would have no such check available for a
+level that doesn't exist yet. Two things close that gap instead: any
+`.`/`..` path component is rejected upfront, lexically, before touching
+the filesystem; and each level that *does* already exist is
+canonicalized and re-checked for containment as the requested path is
+walked one component at a time, so a symlink planted at any depth — not
+just the final one — is still caught. A not-yet-existing level is only
+safe to trust because both of those hold: no traversal component to
+exploit, and every shallower level already validated.
+
+Content-sensitivity filtering (see above) applies to every level a
+nested request would create, not only the final one — a restricted name
+partway down a path (e.g. `.ssh` as an intermediate directory) is
+refused just as it would be at the leaf.
+
+Directory creation goes through the same unsupervised-write protection
+as file writes: a human sees an itemized preview of every directory
+about to be created and must explicitly approve it before anything
+touches disk. The one difference from a file write: if the requested
+path (and every parent it needs) already exists, there's nothing to
+create, so it succeeds immediately with no confirmation prompt — there's
+no write to review.
+
 ## Settings tamper-resistance
 
 `~/.config/emed-code/settings.toml` (the file that controls

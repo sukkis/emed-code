@@ -20,6 +20,10 @@ Mistral's cloud API without leaving your terminal or tmux session.
 - **Never writes blind.** It can create or edit files too, but always
   shows a colored diff and waits for your explicit approval first —
   nothing is written to disk without you seeing it.
+- **Creates directories, not just files.** Ask it to put something
+  somewhere that doesn't exist yet, and it creates the whole path
+  first — parent directories included — through the same
+  itemized-preview-and-approve flow as every other write.
 - **Learns your project's conventions.** Drop an `AGENTS.md` in your
   project — and another at `~/.config/emed-code/AGENTS.md` for
   preferences you want everywhere — and both are folded into every
@@ -38,7 +42,7 @@ cargo run
 talks to a local Ollama instance. Want Mistral instead?
 
 ```
-cargo run -- --provider mistral --model codestral-latest
+cargo run -- --provider mistral --model mistral-medium-latest
 ```
 
 Mistral needs an API key — either a `getfrompass` entry
@@ -76,8 +80,6 @@ why.
 
 ## Roadmap
 
-- A directory-creation tool, with its own confirmation and security
-  posture
 - Token/context usage shown in the UI
 - Independent read/write file-access strictness settings
 - Syntax-highlighted diffs
