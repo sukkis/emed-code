@@ -22,16 +22,22 @@ mod settings;
 mod system_prompt;
 mod tools;
 
-pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
+pub use anthropic::AnthropicClient;
+pub use credentials::{
+    CredentialSource, anthropic_credential_log_message, credential_log_message,
+    lookup_anthropic_api_key, lookup_mistral_api_key,
+};
 pub use diff::{DiffLine, DiffLineText};
 pub use mistral::MistralClient;
 pub use ollama::OllamaClient;
+pub use settings::{AnthropicThinking, Settings};
 
+pub(crate) use anthropic::ANTHROPIC_MODEL;
 pub(crate) use diff::{generate_diff, generate_windowed_diff};
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
-pub(crate) use settings::{AnthropicThinking, FileAccessSecurity, Settings};
+pub(crate) use settings::FileAccessSecurity;
 pub use system_prompt::AgentsMdStatus;
 use system_prompt::load_system_prompt;
 use tools::{

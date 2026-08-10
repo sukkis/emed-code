@@ -19,20 +19,27 @@ pub(crate) enum FileAccessSecurity {
 // otherwise — see docs/anthropic-provider.md design question 9), but
 // named for the concept, not the provider, the same way ChatError's
 // ResponseTruncated/Refused variants are.
+//
+// pub, not pub(crate), unlike FileAccessSecurity: main.rs (a separate
+// binary crate depending on this one) needs to read this field to
+// construct AnthropicClient — Core::with_client's own internal
+// Settings::load() happens too late for that, after the client already
+// exists. FileAccessSecurity has no equivalent need; it's consumed
+// entirely inside Core/dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum AnthropicThinking {
+pub enum AnthropicThinking {
     #[default]
     Disabled,
     Adaptive,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub(crate) struct Settings {
+pub struct Settings {
     #[serde(default)]
     pub(crate) file_access_security: FileAccessSecurity,
     #[serde(default)]
-    pub(crate) anthropic_thinking: AnthropicThinking,
+    pub anthropic_thinking: AnthropicThinking,
 }
 
 impl Settings {
@@ -47,8 +54,9 @@ impl Settings {
     // The real entry point: resolves the real config path and reads it.
     // Not unit-tested directly, same as Core::with_client's real
     // std::env::current_dir() call — only the pure logic around it
-    // (parse, above) is.
-    pub(crate) fn load() -> Settings {
+    // (parse, above) is. pub, not pub(crate): main.rs calls this
+    // directly too now — see the AnthropicThinking doc comment above.
+    pub fn load() -> Settings {
         let contents = dirs::config_dir()
             .map(|dir| dir.join("emed-code").join("settings.toml"))
             .and_then(|path| std::fs::read_to_string(path).ok());

@@ -548,6 +548,7 @@ impl InputBox {
 pub enum ProviderLabel {
     Ollama,
     Mistral,
+    Anthropic,
 }
 
 impl ProviderLabel {
@@ -555,6 +556,7 @@ impl ProviderLabel {
         match self {
             ProviderLabel::Ollama => "local (ollama)",
             ProviderLabel::Mistral => "cloud (mistral)",
+            ProviderLabel::Anthropic => "cloud (anthropic)",
         }
     }
 }
