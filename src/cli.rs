@@ -23,8 +23,8 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = Provider::Ollama)]
     pub provider: Provider,
 
-    /// Model name, e.g. "codestral-latest" for Mistral (defaults to a
-    /// sensible model per provider)
+    /// Model name, e.g. "mistral-medium-latest" for Mistral (defaults to
+    /// a sensible model per provider)
     #[arg(long)]
     pub model: Option<String>,
 }
@@ -74,11 +74,11 @@ mod tests {
             "--provider",
             "mistral",
             "--model",
-            "codestral-latest",
+            "mistral-medium-latest",
         ])
         .unwrap();
 
-        assert_eq!(cli.resolved_model(), "codestral-latest");
+        assert_eq!(cli.resolved_model(), "mistral-medium-latest");
     }
 
     #[test]

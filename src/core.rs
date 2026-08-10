@@ -34,7 +34,8 @@ pub(crate) use settings::{FileAccessSecurity, Settings};
 pub use system_prompt::AgentsMdStatus;
 use system_prompt::load_system_prompt;
 use tools::{
-    dispatch, edit_file_with_confirmation, tool_definitions, write_file_with_confirmation,
+    create_directory_with_confirmation, dispatch, edit_file_with_confirmation, tool_definitions,
+    write_file_with_confirmation,
 };
 
 use std::fmt;
@@ -253,10 +254,10 @@ fn run_agent_loop(
                     // The model needs the full content either way (what
                     // was read, or why it failed) — only the CoreEvent
                     // sent to the TUI distinguishes Ok from Err.
-                    // write_file and edit_file both need the confirmation
-                    // channel dispatch doesn't have, so they're routed
-                    // separately rather than folded into dispatch's
-                    // uniform signature.
+                    // write_file, edit_file, and create_directory all need
+                    // the confirmation channel dispatch doesn't have, so
+                    // they're routed separately rather than folded into
+                    // dispatch's uniform signature.
                     let dispatch_result = if call.name == "write_file" {
                         write_file_with_confirmation(
                             root,
@@ -267,6 +268,14 @@ fn run_agent_loop(
                         )
                     } else if call.name == "edit_file" {
                         edit_file_with_confirmation(
+                            root,
+                            file_access_security,
+                            &call,
+                            tx,
+                            confirm_rx,
+                        )
+                    } else if call.name == "create_directory" {
+                        create_directory_with_confirmation(
                             root,
                             file_access_security,
                             &call,
@@ -979,6 +988,48 @@ mod tests {
             std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
             "hello"
         );
+    }
+
+    // Same shape as agent_loop_blocks_on_write_confirmation_then_applies_it
+    // above, proving create_directory is routed the same way — through
+    // the confirmation channel, not dispatch — rather than only
+    // exercising create_directory_with_confirmation directly the way
+    // tools.rs's own tests do.
+    #[test]
+    fn agent_loop_blocks_on_create_directory_confirmation_then_applies_it() {
+        let root = TempDir::new();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "newdir"}"#.to_string(),
+        };
+        let client = Arc::new(ScriptedClient::new(vec![
+            Ok(LlmResponse::ToolCalls(vec![tool_call])),
+            Ok(LlmResponse::Text("created it".to_string())),
+        ]));
+
+        let mut core = core_with_root(client, root.path().to_path_buf(), String::new());
+        core.submit_user_message("create a directory".to_string());
+
+        let events = poll_until_at_least(&mut core, 1, Duration::from_secs(1));
+        match &events[0] {
+            CoreEvent::WriteProposed { path, .. } => assert_eq!(path, "newdir"),
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+        assert!(!root.path().join("newdir").exists());
+
+        core.respond_to_confirmation(ConfirmationChoice::Apply);
+
+        let events = poll_until_at_least(&mut core, 2, Duration::from_secs(1));
+        assert!(matches!(
+            events[0],
+            CoreEvent::ToolCall { result: Ok(_), .. }
+        ));
+        assert_eq!(
+            events[1],
+            CoreEvent::AssistantChunk("created it".to_string())
+        );
+        assert!(root.path().join("newdir").is_dir());
     }
 
     #[test]

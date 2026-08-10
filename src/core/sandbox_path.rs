@@ -112,6 +112,69 @@ impl SandboxPath {
         })
     }
 
+    // For create_directory: requested may be a nested path (mkdir -p
+    // style) where some or all intermediate levels don't exist yet.
+    // Returns the ordered, shallowest-first list of levels that need
+    // creating — empty means the whole path already exists.
+    //
+    // Naively creating whatever's missing (e.g. create_dir_all) has no
+    // symlink protection for levels that don't exist, since
+    // canonicalize() can only resolve something already on disk. The
+    // escape risk only ever comes from two sources, and neither can
+    // hide in a not-yet-existing segment: a literal '.'/'..' component
+    // walking the path upward lexically (rejected upfront, below —
+    // this is the linchpin that makes trusting a not-yet-existing
+    // segment safe), or an *already-existing* symlink somewhere in the
+    // chain resolving outside root (caught by canonicalizing and
+    // re-checking containment at every level that does exist, not just
+    // the first or last).
+    pub(crate) fn plan_directory_creation(
+        root: &Path,
+        requested: &Path,
+    ) -> Result<Vec<Self>, SandboxError> {
+        use std::path::Component;
+
+        if requested
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        {
+            return Err(SandboxError::Escapes);
+        }
+
+        let canonical_root = root.canonicalize().map_err(|_| SandboxError::NotFound)?;
+
+        let mut to_create = Vec::new();
+        let mut accumulated = PathBuf::new();
+
+        for component in requested.components() {
+            accumulated.push(component);
+            let candidate = canonical_root.join(&accumulated);
+
+            match candidate.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.starts_with(&canonical_root) {
+                        return Err(SandboxError::Escapes);
+                    }
+                }
+                Err(_) => {
+                    // Doesn't exist yet — safe by construction: every
+                    // shallower prefix above was already validated,
+                    // and this segment has no '.'/'..' (checked
+                    // upfront), so it can't have escaped the sandbox.
+                    if !candidate.starts_with(&canonical_root) {
+                        return Err(SandboxError::Escapes);
+                    }
+                    to_create.push(SandboxPath {
+                        absolute: candidate,
+                        relative: accumulated.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(to_create)
+    }
+
     pub(crate) fn as_path(&self) -> &Path {
         &self.absolute
     }
@@ -310,6 +373,119 @@ mod tests {
             SandboxPath::new_for_write(root.path(), Path::new("sub/new.txt")).unwrap();
 
         assert_eq!(sandbox_path.relative_path(), Path::new("sub/new.txt"));
+    }
+
+    // plan_directory_creation: the nested (mkdir -p-style) validation
+    // walk for create_directory. Returns the ordered, shallowest-first
+    // list of levels that don't exist yet — empty means the whole
+    // requested path already exists (idempotent, nothing to create).
+
+    #[test]
+    fn plan_directory_creation_returns_every_level_when_nothing_exists_yet() {
+        let root = TempDir::new();
+
+        let plan = SandboxPath::plan_directory_creation(root.path(), Path::new("a/b/c")).unwrap();
+
+        let relative_paths: Vec<&Path> = plan.iter().map(|p| p.relative_path()).collect();
+        assert_eq!(
+            relative_paths,
+            vec![Path::new("a"), Path::new("a/b"), Path::new("a/b/c")]
+        );
+    }
+
+    #[test]
+    fn plan_directory_creation_skips_levels_that_already_exist() {
+        let root = TempDir::new();
+        std::fs::create_dir(root.path().join("a")).unwrap();
+
+        let plan = SandboxPath::plan_directory_creation(root.path(), Path::new("a/b/c")).unwrap();
+
+        let relative_paths: Vec<&Path> = plan.iter().map(|p| p.relative_path()).collect();
+        assert_eq!(relative_paths, vec![Path::new("a/b"), Path::new("a/b/c")]);
+    }
+
+    // The idempotent case: nothing needs creating, so create_directory
+    // (a later step) can succeed immediately with no confirmation
+    // prompt — there's no write to review.
+    #[test]
+    fn plan_directory_creation_returns_empty_when_everything_already_exists() {
+        let root = TempDir::new();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+
+        let plan = SandboxPath::plan_directory_creation(root.path(), Path::new("a/b")).unwrap();
+
+        assert_eq!(plan, Vec::new());
+    }
+
+    // The linchpin of the whole algorithm: without this upfront lexical
+    // rejection, a not-yet-existing segment couldn't be trusted as safe
+    // by construction, since canonicalize() can't verify a path that
+    // doesn't exist yet.
+    #[test]
+    fn plan_directory_creation_rejects_dotdot_traversal() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+
+        let result = SandboxPath::plan_directory_creation(&root, Path::new("a/../../outside"));
+
+        assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    #[test]
+    fn plan_directory_creation_rejects_a_curdir_component() {
+        let root = TempDir::new();
+
+        let result = SandboxPath::plan_directory_creation(root.path(), Path::new("./a"));
+
+        assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    #[test]
+    fn plan_directory_creation_rejects_an_absolute_path_outside_the_root() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = outer.path().join("outside");
+
+        let result = SandboxPath::plan_directory_creation(&root, &outside);
+
+        assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    // Proves the walk checks containment at EVERY level, not just the
+    // first or last — a symlink planted partway through a nested
+    // request must be caught the moment the walk reaches it, before
+    // even looking at what comes after it.
+    #[test]
+    #[cfg(unix)]
+    fn plan_directory_creation_catches_a_symlink_escape_at_an_intermediate_level() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside_dir = outer.path().join("outside_dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, root.join("link")).unwrap();
+
+        let result = SandboxPath::plan_directory_creation(&root, Path::new("link/b/c"));
+
+        assert_eq!(result, Err(SandboxError::Escapes));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn plan_directory_creation_catches_a_symlink_escape_at_the_final_existing_level() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        let outside_dir = outer.path().join("outside_dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, root.join("a").join("link")).unwrap();
+
+        let result = SandboxPath::plan_directory_creation(&root, Path::new("a/link"));
+
+        assert_eq!(result, Err(SandboxError::Escapes));
     }
 
     // Review focus for this step: a rejected symlink's error must not

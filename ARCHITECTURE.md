@@ -17,7 +17,7 @@ flowchart LR
         CoreStruct["Core"]
         Loop["agent loop"]
         Dispatch["dispatch()"]
-        Tools["read_file / list_files / write_file / edit_file"]
+        Tools["read_file / list_files / write_file / edit_file / create_directory"]
         Sandbox[["SandboxPath"]]
     end
 
@@ -277,6 +277,52 @@ established above (a model only weighs guidance written on a tool it's
 already considering calling) applies just as much to a tool it might
 call in error as to one it should call but doesn't.
 
+## Directory creation
+
+`create_directory` supports nested, `mkdir -p`-style creation, but
+deliberately doesn't call `std::fs::create_dir_all` or any other
+recursive std function. `SandboxPath::plan_directory_creation` does its
+own validated walk first, and `create_planned_directories` (`tools.rs`)
+just creates whatever that walk found missing, one level at a time.
+
+The reason for the custom walk: `canonicalize()`, the mechanism every
+other sandbox check in this codebase relies on to catch a symlink
+pointing outside the root, only works on a path that already exists. A
+naive `create_dir_all` has no way to symlink-check a level that doesn't
+exist yet. `plan_directory_creation` closes that gap with two
+observations. First, rejecting any `.`/`..` path component upfront —
+lexically, before touching the filesystem — means a not-yet-existing
+segment can only ever be a plain literal name; there's no traversal
+trick available to it. Second, walking the requested path one component
+at a time, canonicalizing and re-checking containment at every prefix
+that *does* already exist, catches a symlink planted at any depth the
+moment the walk reaches it, not just at the final level. Together, those
+two checks mean a not-yet-existing segment is safe to trust by
+construction: every shallower prefix was already validated, and the
+segment itself has no `.`/`..` to exploit. The walk returns the ordered,
+shallowest-first list of levels that don't yet exist — an empty list
+means the whole path already exists, which is what makes the tool
+idempotent for free.
+
+`plan_and_validate_directory_creation` (`tools.rs`) layers
+`is_content_restricted` over that list, checking *every* level the walk
+would create, not just the deepest one — a single leaf-only check would
+miss a restricted name partway down a nested path (e.g.
+`something.pem/real`, where `real` alone is the requested path's literal
+leaf).
+
+`create_directory_with_confirmation` doesn't go through
+`propose_and_apply_write` (see "The confirmation gate" below) — that
+helper is shaped around one content string going into one file, which
+doesn't fit a multi-level `mkdir -p`. It gets its own small propose/apply
+tail instead: an empty plan returns success immediately with no
+confirmation shown, since there's nothing to review; a non-empty plan
+becomes one `DiffLine::Added` per level, an itemized preview of every
+directory about to be created rather than one vague prompt.
+`create_planned_directories` itself has no rollback if it fails partway
+through a multi-level request — best-effort, the same non-transactional
+stance `write_file` already takes.
+
 ## Settings
 
 `Settings::load()` reads one setting, `file_access_security`
@@ -364,10 +410,10 @@ syntax highlighting.
 ## The confirmation gate
 
 Every other `Core`↔`App` interaction is one-directional — the
-background thread only ever *sends* `CoreEvent`s. `write_file` and
-`edit_file` need the opposite: the loop must pause mid-call, let the
-user see a diff, and only then know whether to write and what tool
-result to hand back to the model.
+background thread only ever *sends* `CoreEvent`s. `write_file`,
+`edit_file`, and `create_directory` need the opposite: the loop must
+pause mid-call, let the user see a diff, and only then know whether to
+write and what tool result to hand back to the model.
 
 A fresh `mpsc` channel is created on every `submit_user_message` call,
 mirroring the fresh thread spawned each time (a single long-lived
@@ -387,6 +433,10 @@ has a second pre-confirmation check with the same shape: `apply_edit`'s
 `replace_all` is set), or it fails with `ToolError::NoMatch`/
 `AmbiguousMatch` before a diff is ever generated — there's nothing real
 to confirm until `apply_edit` has actually produced a `new_content`.
+
+`create_directory_with_confirmation` shares this same channel and pause
+mechanism but not `propose_and_apply_write` itself — see "Directory
+creation" above for why it needs its own propose/apply tail.
 
 Once validated, both tools converge on `propose_and_apply_write` — each
 computes its own diff (`generate_diff` for `write_file`,

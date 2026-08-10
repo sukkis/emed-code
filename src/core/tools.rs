@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use super::{
-    ConfirmationChoice, CoreEvent, DiffLine, FileAccessSecurity, SandboxError, SandboxPath,
-    ToolCall, ToolDefinition,
+    ConfirmationChoice, CoreEvent, DiffLine, DiffLineText, FileAccessSecurity, SandboxError,
+    SandboxPath, ToolCall, ToolDefinition,
 };
 
 #[derive(Debug, PartialEq)]
@@ -102,6 +102,95 @@ fn is_content_restricted(relative_path: &Path) -> bool {
                 || name.ends_with(".key")
         }
         None => false,
+    }
+}
+
+// For create_directory: layers is_content_restricted over
+// SandboxPath::plan_directory_creation's output, checking every level
+// that would actually get created — not just the deepest one. A
+// single check against only the final requested path would miss a
+// restricted name at an intermediate level (e.g. "something.pem/real"
+// — is_content_restricted's .env/.pem/.key checks only look at a
+// path's own file name, so only the true leaf of a single checked path
+// would ever be caught; checking each planned level closes that gap).
+fn plan_and_validate_directory_creation(
+    root: &Path,
+    requested: &Path,
+    file_access_security: FileAccessSecurity,
+) -> Result<Vec<SandboxPath>, ToolError> {
+    let plan =
+        SandboxPath::plan_directory_creation(root, requested).map_err(ToolError::InvalidPath)?;
+
+    if file_access_security == FileAccessSecurity::Strict {
+        for level in &plan {
+            if is_content_restricted(level.relative_path()) {
+                return Err(ToolError::AccessDenied);
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+// Creates each level a validated plan calls for, shallowest first.
+// create_dir rather than create_dir_all: the plan already did the
+// mkdir-p-equivalent work (and the security-critical validation that
+// went with it), so re-deriving "what's missing" via the recursive std
+// call here would be redundant and, worse, unvalidated.
+fn create_planned_directories(plan: &[SandboxPath]) -> Result<(), ToolError> {
+    for level in plan {
+        std::fs::create_dir(level.as_path()).map_err(|_| ToolError::IoFailure)?;
+    }
+    Ok(())
+}
+
+// The confirmation-gated entry point the agent loop calls for a
+// "create_directory" tool call. Mirrors write_file_with_confirmation's
+// shape (validate first, so a forbidden or already-satisfied path never
+// even reaches a confirmation prompt) but doesn't share
+// propose_and_apply_write's tail — that helper writes one string of
+// content to one file, which doesn't fit a multi-level mkdir -p. An
+// empty plan (everything requested already exists) is the one case with
+// nothing to confirm, so it returns success immediately instead of
+// proposing a no-op.
+pub(crate) fn create_directory_with_confirmation(
+    root: &Path,
+    file_access_security: FileAccessSecurity,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<CoreEvent>,
+    confirm_rx: &mpsc::Receiver<ConfirmationChoice>,
+) -> Result<String, ToolError> {
+    let args: PathArgs =
+        serde_json::from_str(&tool_call.arguments).map_err(|_| ToolError::MalformedArguments)?;
+    let requested = Path::new(&args.path);
+    let display_path = requested.to_string_lossy();
+
+    let plan = plan_and_validate_directory_creation(root, requested, file_access_security)?;
+
+    if plan.is_empty() {
+        return Ok(format!("{display_path} already exists"));
+    }
+
+    let diff: Vec<DiffLine> = plan
+        .iter()
+        .map(|level| {
+            DiffLine::Added(DiffLineText {
+                text: level.relative_path().to_string_lossy().into_owned(),
+                no_trailing_newline: false,
+            })
+        })
+        .collect();
+
+    let _ = tx.send(CoreEvent::WriteProposed {
+        path: display_path.to_string(),
+        diff,
+    });
+
+    match confirm_rx.recv().unwrap_or(ConfirmationChoice::Decline) {
+        ConfirmationChoice::Decline => Err(ToolError::WriteDeclined),
+        ConfirmationChoice::Apply => {
+            create_planned_directories(&plan).map(|()| format!("created {display_path}"))
+        }
     }
 }
 
@@ -541,6 +630,29 @@ pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "old", "new"]
             }),
         },
+        ToolDefinition {
+            name: "create_directory".to_string(),
+            description: "Create a directory within the project, including any missing parent \
+                directories along the way (like mkdir -p). Call this directly to propose the \
+                change — the system automatically shows the user which directories would be \
+                created and requires their approval before anything happens, so do not ask the \
+                user for confirmation yourself first. If the directory (and every parent it \
+                needs) already exists, this succeeds immediately with nothing to confirm. Do \
+                not assume the directory has been created until a result confirms it; the user \
+                may decline."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the directory to create, relative to the \
+                            project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
     ]
 }
 
@@ -605,6 +717,242 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // plan_and_validate_directory_creation: layers is_content_restricted
+    // over SandboxPath::plan_directory_creation's output.
+
+    #[test]
+    fn plan_and_validate_directory_creation_allows_an_unrestricted_nested_path() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new("a/b/c"),
+            FileAccessSecurity::Strict,
+        );
+
+        let relative_paths: Vec<PathBuf> = result
+            .unwrap()
+            .iter()
+            .map(|p| p.relative_path().to_path_buf())
+            .collect();
+        assert_eq!(
+            relative_paths,
+            vec![
+                PathBuf::from("a"),
+                PathBuf::from("a/b"),
+                PathBuf::from("a/b/c")
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_and_validate_directory_creation_blocks_a_restricted_leaf() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new("a/.ssh"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    // The gap a single leaf-only check would miss: .ssh appears in the
+    // MIDDLE of the requested path, not at the end.
+    #[test]
+    fn plan_and_validate_directory_creation_blocks_a_restricted_intermediate_level() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new(".ssh/b"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+    }
+
+    #[test]
+    fn plan_and_validate_directory_creation_skips_the_content_check_in_loose_mode() {
+        let root = TempDir::new();
+
+        let result = plan_and_validate_directory_creation(
+            root.path(),
+            Path::new(".ssh/b"),
+            FileAccessSecurity::Loose,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn plan_and_validate_directory_creation_maps_a_sandbox_error() {
+        let outer = TempDir::new();
+        let root = outer.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+
+        let result = plan_and_validate_directory_creation(
+            &root,
+            Path::new("../outside"),
+            FileAccessSecurity::Strict,
+        );
+
+        assert_eq!(result, Err(ToolError::InvalidPath(SandboxError::Escapes)));
+    }
+
+    // create_planned_directories: the mechanical filesystem step that
+    // actually creates each level a validated plan calls for.
+
+    #[test]
+    fn create_planned_directories_creates_every_planned_level_in_order() {
+        let root = TempDir::new();
+        let plan = SandboxPath::plan_directory_creation(root.path(), Path::new("a/b/c")).unwrap();
+
+        let result = create_planned_directories(&plan);
+
+        assert_eq!(result, Ok(()));
+        assert!(root.path().join("a").is_dir());
+        assert!(root.path().join("a/b").is_dir());
+        assert!(root.path().join("a/b/c").is_dir());
+    }
+
+    #[test]
+    fn create_planned_directories_is_a_noop_for_an_empty_plan() {
+        let result = create_planned_directories(&[]);
+
+        assert_eq!(result, Ok(()));
+    }
+
+    // create_directory_with_confirmation: ties plan_and_validate_directory_
+    // creation and create_planned_directories together behind a
+    // WriteProposed confirmation, mirroring write_file_with_confirmation's
+    // test shape.
+
+    #[test]
+    fn create_directory_with_confirmation_applies_creation_when_confirmed() {
+        let root = TempDir::new();
+        let (tx, rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Apply).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/b"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("created a/b".to_string()));
+        assert!(root.path().join("a").is_dir());
+        assert!(root.path().join("a/b").is_dir());
+        match rx.try_recv().unwrap() {
+            CoreEvent::WriteProposed { path, diff } => {
+                assert_eq!(path, "a/b");
+                assert_eq!(
+                    diff,
+                    vec![
+                        DiffLine::Added(DiffLineText {
+                            text: "a".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                        DiffLine::Added(DiffLineText {
+                            text: "a/b".to_string(),
+                            no_trailing_newline: false,
+                        }),
+                    ]
+                );
+            }
+            other => panic!("expected WriteProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_directory_with_confirmation_declines_without_creating() {
+        let root = TempDir::new();
+        let (tx, _rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
+        confirm_tx.send(ConfirmationChoice::Decline).unwrap();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/b"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::WriteDeclined));
+        assert!(!root.path().join("a").exists());
+    }
+
+    // Same principle as write_file_with_confirmation's own blocked-path
+    // test: an invalid path must be rejected before ever asking for
+    // confirmation. confirm_rx never receives anything here, so if the
+    // implementation asked for confirmation first, this test would hang.
+    #[test]
+    fn create_directory_with_confirmation_rejects_a_blocked_path_without_asking() {
+        let root = TempDir::new();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/.ssh"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Err(ToolError::AccessDenied));
+        assert!(!root.path().join("a").exists());
+        assert!(rx.try_recv().is_err());
+    }
+
+    // The idempotent case from the design: everything requested already
+    // exists, so there's nothing to confirm — no WriteProposed at all.
+    // confirm_rx never receives anything here either, so an
+    // implementation that asked for confirmation anyway would hang.
+    #[test]
+    fn create_directory_with_confirmation_succeeds_immediately_when_everything_already_exists() {
+        let root = TempDir::new();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_confirm_tx, confirm_rx) = mpsc::channel();
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "create_directory".to_string(),
+            arguments: r#"{"path": "a/b"}"#.to_string(),
+        };
+
+        let result = create_directory_with_confirmation(
+            root.path(),
+            FileAccessSecurity::Strict,
+            &tool_call,
+            &tx,
+            &confirm_rx,
+        );
+
+        assert_eq!(result, Ok("a/b already exists".to_string()));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1427,15 +1775,15 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    // Pins down exactly what's advertised to the model. write_file and
-    // edit_file are both included here even though dispatch() itself
-    // never routes either — they're handled separately by
-    // write_file_with_confirmation/edit_file_with_confirmation (see
-    // run_agent_loop) — so this only guards tool_definitions() itself,
-    // not a dispatch/definitions correspondence that no longer holds
-    // for all five tools.
+    // Pins down exactly what's advertised to the model. write_file,
+    // edit_file, and create_directory are all included here even though
+    // dispatch() itself never routes any of them — they're handled
+    // separately by write_file_with_confirmation/edit_file_with_confirmation/
+    // create_directory_with_confirmation (see run_agent_loop) — so this
+    // only guards tool_definitions() itself, not a dispatch/definitions
+    // correspondence that no longer holds for all six tools.
     #[test]
-    fn tool_definitions_advertises_all_five_tools() {
+    fn tool_definitions_advertises_all_six_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1449,7 +1797,8 @@ mod tests {
                 "list_files",
                 "list_files_recursive",
                 "write_file",
-                "edit_file"
+                "edit_file",
+                "create_directory"
             ]
         );
     }

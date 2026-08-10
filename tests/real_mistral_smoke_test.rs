@@ -75,8 +75,8 @@ fn submit_user_message_gets_a_real_reply_from_mistral() {
                 events[0]
             )
         }
-        // write_file isn't advertised to any provider yet — impossible
-        // for a real model to trigger this today.
+        // Tools are advertised on every request, so this is reachable in
+        // principle — this prompt just gives no reason to call one.
         CoreEvent::WriteProposed { .. } => panic!(
             "unexpected write proposal for a prompt needing none: {:?}",
             events[0]
@@ -312,5 +312,57 @@ fn submit_user_message_prefers_edit_file_over_write_file_for_a_targeted_change()
         edit_file_attempted && !write_file_attempted,
         "expected edit_file to be used and write_file never attempted for a targeted change, \
          got: {all_events:?}"
+    );
+}
+
+// Regression guard for the real capability create_directory adds:
+// write_file's new_for_write requires the parent directory to already
+// exist (see sandbox_path.rs), so before create_directory existed there
+// was no way for a model to satisfy "put a new file somewhere that
+// doesn't exist yet" at all. Doesn't hint at create_directory by name —
+// the prompt only implies the parent is missing, same "low-ambiguity but
+// not spelled out" spirit as the other real-model tests in this file.
+// Declines every proposal rather than applying any of them, same
+// reasoning as the edit_file-vs-write_file test above — this is about
+// which tool got reached for, not about actually creating files in this
+// repo. Asserts create_directory was attempted at some point, not a
+// strict ordering relative to write_file — a model that tries write_file
+// first, sees it fail, then recovers via create_directory is still a
+// pass; only never reaching for create_directory at all is the failure
+// this guards against.
+#[test]
+fn submit_user_message_reaches_for_create_directory_for_a_file_in_a_missing_directory() {
+    let (api_key, _source) = lookup_mistral_api_key().expect(
+        "no Mistral API key found via getfrompass (emed-code/mistral/api_key) or MISTRAL_API_KEY",
+    );
+    let mut core = Core::with_client(Arc::new(MistralClient::new(
+        api_key,
+        "mistral-medium-latest".to_string(),
+    )));
+
+    core.submit_user_message(
+        "Create a new file at examples/smoke-test/output.txt containing the text \"hello\"."
+            .to_string(),
+    );
+
+    let mut all_events = Vec::new();
+    loop {
+        let events = poll_until_write_proposed_or_final(&mut core, Duration::from_secs(60));
+        let proposed = matches!(events.last(), Some(CoreEvent::WriteProposed { .. }));
+        all_events.extend(events);
+        if !proposed {
+            break;
+        }
+        core.respond_to_confirmation(ConfirmationChoice::Decline);
+    }
+
+    let create_directory_attempted = all_events.iter().any(
+        |event| matches!(event, CoreEvent::ToolCall { name, .. } if name == "create_directory"),
+    );
+
+    assert!(
+        create_directory_attempted,
+        "expected create_directory to be used for a file inside a directory that doesn't \
+         exist yet, got: {all_events:?}"
     );
 }
