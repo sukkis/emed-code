@@ -7,6 +7,9 @@ mistral:
 ollama:
     cargo test --features local --test real_ollama_smoke_test
 
+anthropic:
+    cargo test --features local --test real_anthropic_smoke_test
+
 fmt:
     cargo fmt --check
 

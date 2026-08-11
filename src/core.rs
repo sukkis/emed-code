@@ -12,6 +12,7 @@
 //! input live in [`crate::tui`] instead, which only ever talks to
 //! `Core` through the calls above.
 
+mod anthropic;
 mod credentials;
 mod diff;
 mod mistral;
@@ -21,16 +22,22 @@ mod settings;
 mod system_prompt;
 mod tools;
 
-pub use credentials::{CredentialSource, credential_log_message, lookup_mistral_api_key};
+pub use anthropic::AnthropicClient;
+pub use credentials::{
+    CredentialSource, anthropic_credential_log_message, credential_log_message,
+    lookup_anthropic_api_key, lookup_mistral_api_key,
+};
 pub use diff::{DiffLine, DiffLineText};
 pub use mistral::MistralClient;
 pub use ollama::OllamaClient;
+pub use settings::{AnthropicThinking, Settings};
 
+pub(crate) use anthropic::ANTHROPIC_MODEL;
 pub(crate) use diff::{generate_diff, generate_windowed_diff};
 pub(crate) use mistral::MISTRAL_MODEL;
 pub(crate) use ollama::OLLAMA_MODEL;
 pub(crate) use sandbox_path::{SandboxError, SandboxPath};
-pub(crate) use settings::{FileAccessSecurity, Settings};
+pub(crate) use settings::FileAccessSecurity;
 pub use system_prompt::AgentsMdStatus;
 use system_prompt::load_system_prompt;
 use tools::{
@@ -170,6 +177,21 @@ pub enum ChatError {
     Connection(String),
     MalformedResponse(String),
     Auth(String),
+    // No message payload, unlike the three above: the meaning is the
+    // fixed fact itself (hit the response-length limit), not a
+    // provider-supplied string — same shape as ToolError::WriteDeclined.
+    // Anthropic-specific today (the only provider with a hard,
+    // deliberately small max_tokens cap covering thinking + response
+    // combined), but the variant itself doesn't name Anthropic — nothing
+    // stops Mistral/Ollama from returning it too if they ever grow the
+    // same check.
+    ResponseTruncated,
+    // Same reasoning as ResponseTruncated: a fixed fact (the model
+    // declined to answer), not a provider message. Surfaces Anthropic's
+    // stop_reason: "refusal" — a real HTTP 200 with no error status, so
+    // without this it would otherwise be silently mis-parsed as an
+    // empty reply rather than reported.
+    Refused,
 }
 
 impl fmt::Display for ChatError {
@@ -180,6 +202,11 @@ impl fmt::Display for ChatError {
                 write!(f, "malformed response: {message}")
             }
             ChatError::Auth(message) => write!(f, "authentication error: {message}"),
+            ChatError::ResponseTruncated => write!(
+                f,
+                "the model's reply was cut off after hitting the response length limit"
+            ),
+            ChatError::Refused => write!(f, "the model declined to respond to this request"),
         }
     }
 }

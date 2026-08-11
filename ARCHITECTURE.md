@@ -24,6 +24,7 @@ flowchart LR
     subgraph Providers["LlmClient implementations"]
         Ollama["OllamaClient"]
         Mistral["MistralClient"]
+        Anthropic["AnthropicClient"]
     end
 
     App -- "submit_user_message" --> CoreStruct
@@ -35,8 +36,10 @@ flowchart LR
     Tools --> Sandbox
     Loop -- "LlmClient::send" --> Ollama
     Loop -- "LlmClient::send" --> Mistral
+    Loop -- "LlmClient::send" --> Anthropic
     Ollama -.-> OllamaAPI[("local Ollama")]
     Mistral -.-> MistralAPI[("Mistral API")]
+    Anthropic -.-> AnthropicAPI[("Anthropic API")]
 ```
 
 `core` holds conversation state, provider round-trips, and tool
@@ -63,16 +66,22 @@ concurrency of its own to manage.
 `Arc<dyn LlmClient + Send + Sync>` and calls one method:
 
 ```rust
-fn send(&self, messages: &[Message], tools: &[ToolDefinition])
+fn send(&self, system: &str, messages: &[Message], tools: &[ToolDefinition])
     -> Result<LlmResponse, ChatError>;
 ```
 
 Adding a provider means writing a new `LlmClient` implementation, not
-touching `Core`. `LlmResponse` is `Text(String)` for a final answer or
-`ToolCalls(Vec<ToolCall>)` for one or more requested tool invocations;
-each provider maps the shared `Message` history into its own private
-wire-format type before sending, and never sees `Message` beyond that
-mapping step.
+touching `Core` — true across all three current implementations
+(`OllamaClient`, `MistralClient`, `AnthropicClient`), each with a
+genuinely different wire shape. `LlmResponse` is `Text(String)` for a
+final answer or `ToolCalls(Vec<ToolCall>)` for one or more requested
+tool invocations; each provider maps the shared `Message` history (and
+`system`) into its own private wire-format type before sending, and
+never sees `Message` beyond that mapping step. `system` being a
+parameter of `send` itself, not folded into `messages`, fits Anthropic's
+Messages API directly — `system` is its own top-level request field
+there, not a message with `role: "system"` like Mistral/Ollama both
+synthesize.
 
 `Arc`, not `Box`: the concrete client isn't known until a `--provider`
 flag is parsed at startup, so this is dynamic dispatch, not generics.
@@ -133,11 +142,15 @@ correct conversation, not whether the calls are grouped into one
 message or several.
 
 `Message::ToolResult` carries both a `tool_call_id` and the tool's own
-`name`, even though Mistral's wire format only ever needs the id.
-Ollama's `/api/chat` has no id concept at all — it correlates a result
-back to its request purely by tool name — so `OllamaClient` needs the
-name sitting directly on the result rather than scanning back through
-history for the matching `ToolCalls` entry. `OllamaClient` also
+`name`, even though Mistral's wire format only ever needs the id —
+Anthropic's does too (`tool_use_id`), confirmed by checking
+`mistral.rs`'s own mapping before writing `anthropic.rs`'s: both
+providers' `ToolResult` handling ignores `name` via `..`, needing no new
+field for a second id-based provider. Ollama's `/api/chat` has no id
+concept at all — it correlates a result back to its request purely by
+tool name — so `OllamaClient` needs the name sitting directly on the
+result rather than scanning back through history for the matching
+`ToolCalls` entry. `OllamaClient` also
 synthesizes its own per-turn `ToolCall.id` (a simple counter; Ollama's
 response never includes one), used only for this project's own internal
 bookkeeping and never sent back over the wire. The one residual gap,
@@ -323,6 +336,121 @@ directory about to be created rather than one vague prompt.
 through a multi-level request — best-effort, the same non-transactional
 stance `write_file` already takes.
 
+## Talking to Anthropic
+
+`AnthropicClient` is the third `LlmClient` implementation, and the
+first one where the wire format is structurally different enough to be
+worth its own section rather than a footnote on Mistral/Ollama's.
+
+**Content is a sum type, not a flat struct with optional fields.**
+Mistral and Ollama's own wire messages are one flat struct per message,
+with `content`/`tool_calls` as mutually-exclusive optional sibling
+fields — a reasonable fit for their actual wire shape. Anthropic's
+`messages[].content` is a genuine array of typed blocks (`text`,
+`tool_use`, `tool_result`, `thinking`, and others this project doesn't
+use), including for a plain text-only reply. `AnthropicContentBlock`
+(response side) and `AnthropicContentBlockParam` (request side) are
+Rust enums tagged on the wire's own `"type"` field
+(`#[serde(tag = "type", rename_all = "snake_case")]`) — the direct,
+honest representation of a real sum type, not a flattened struct
+pretending to be one. A `tool_use` block can also appear as a *sibling*
+of a `text` block in the same reply (e.g. "Let me check that file."
+next to the actual tool call) — something that can't happen on Mistral,
+where `content` is `null` whenever `tool_calls` is populated. Handled
+the same way regardless: a tool call always wins, accompanying text is
+dropped, matching the precedent Mistral/Ollama already set — just
+exercised for real here in a way it never was before.
+
+**`thinking` is configurable, defaulting off, and the parser has to
+handle it either way.** Claude Sonnet 5 runs adaptive thinking by
+default — omitting the `thinking` request parameter doesn't mean "no
+thinking," it means "adaptive thinking anyway." Two consequences: first,
+`max_tokens` (see below) caps thinking *and* response text combined, so
+leaving thinking on by default would raise how often the response gets
+cut off from ordinary reasoning overhead, not genuinely large output;
+second, emed-code has no UI surface that renders thinking content at
+all. `Settings::anthropic_thinking` (an `AnthropicThinking` enum,
+`Disabled`/`Adaptive`, mirroring `FileAccessSecurity`'s shape) defaults
+to `Disabled`. But because it's a *setting*, not a fixed decision, a
+user can flip it on — so `AnthropicContentBlock` needs a `Thinking`
+variant regardless of the default, parsed and silently discarded
+(declared as an empty struct variant: serde doesn't reject unknown
+fields unless told to, so there's nothing to name to make a `thinking`
+block's real fields — text, a signature — get ignored). A trailing
+`#[serde(other)]` catch-all variant covers any block type this project
+doesn't know about yet, so Anthropic adding a new content-block kind in
+the future degrades to "one block ignored," not "the whole response
+fails to parse."
+
+**`max_tokens: 16000` is a fixed, non-streaming-safe ceiling, not a
+guess.** Streaming is explicitly out of scope for now — every
+`LlmClient::send` call is synchronous, matching Mistral/Ollama, and
+adding it would touch every provider at once, not just this one.
+Anthropic's own guidance
+flags non-streaming requests above roughly 16K output tokens as
+carrying real HTTP-timeout risk, since the request can genuinely take
+that long to generate that much output; 16000 sits at that boundary
+deliberately, not picked for any per-task reason. A `write_file` call
+whose content would exceed that limit truncates
+(`stop_reason: "max_tokens"`) rather than silently succeeding with
+partial content — see `ChatError::ResponseTruncated` below.
+
+**Two new `ChatError` variants, both detected before normal parsing.**
+`extract_anthropic_reply` checks the response's `stop_reason` first:
+`"max_tokens"` becomes `ChatError::ResponseTruncated`, `"refusal"`
+becomes `ChatError::Refused` (Anthropic's safety classifiers can decline
+a request outright — a real `HTTP 200` with empty or partial content,
+not a transport-level error, so without this case it would otherwise be
+silently mis-parsed as an empty or truncated ordinary reply rather than
+reported). Neither carries a message payload, unlike `Connection`/
+`MalformedResponse`/`Auth` — the meaning *is* the fixed fact, nothing
+provider-supplied to include, same shape `ToolError::WriteDeclined`
+already uses elsewhere in this codebase. Both flow through the existing
+`ChatError` → `CoreEvent::Error` → chat-log path with zero new UI
+plumbing — the error-surfacing mechanism Mistral/Ollama already
+established just works for a third provider's new failure shapes too.
+
+**A tool's schema is flatter than Mistral/Ollama's, not more complex.**
+`AnthropicTool` is `{name, description, input_schema}` directly — no
+`{"type": "function", "function": {...}}` wrapper. The one place
+`to_anthropic_tools` ends up simpler than its counterparts, confirmed
+against Anthropic's own docs rather than assumed by analogy.
+
+**Credential lookup is duplicated from Mistral's, not shared.**
+`lookup_anthropic_api_key`/`resolve_anthropic_api_key` are a structural
+copy of `lookup_mistral_api_key`/`resolve_mistral_api_key`, not a call
+into shared logic — deliberately, matching this project's standing
+stance on generalizing from too few data points (the same reasoning
+`Message`/`ToolCall`'s own shared-vs-per-provider shape already follows
+for Ollama's name-based vs. Mistral/Anthropic's id-based correlation).
+Two near-identical implementations is the honest state of two data
+points; revisit if a third provider's credential lookup would make the
+duplication itself the thing worth fixing.
+
+**`Settings` had to become `pub`, not just `pub(crate)`, for the first
+time.** `main.rs` and the `emed_code` library are two separate crates
+(Cargo builds both `src/lib.rs` and `src/main.rs` into their own
+crates when both exist), with the binary depending on the library the
+way any external consumer would. `pub(crate)` — what `Settings`,
+`AnthropicThinking`, and `Settings::load()` all were — means "visible
+anywhere inside *this* crate," which never included `main.rs`. This
+never mattered before: `Core::with_client` loads `Settings` entirely
+internally, so nothing outside the library ever needed to touch it.
+`AnthropicClient::new` breaks that — `main.rs` has to know
+`anthropic_thinking` *before* `Core::with_client` exists to construct
+the client it's about to receive, so `main.rs` now calls
+`Settings::load()` a second time, independently of `Core`'s own
+internal call. Visibility widened narrowly, not wholesale:
+`AnthropicThinking`, `Settings` itself, and the `anthropic_thinking`
+field became `pub`; `FileAccessSecurity` and the `file_access_security`
+field stayed `pub(crate)`, since nothing outside the library needs
+those — they're consumed entirely inside `Core`/`dispatch`. The
+resulting double `Settings::load()` call (once in `main.rs`, once again
+inside `Core::with_client`) is a known, accepted duplication — two tiny
+startup file reads, not a per-request cost — not a reason to change
+`Core::with_client`'s public signature for every existing caller over
+one provider's need.
+
 ## Settings
 
 `Settings::load()` reads one setting, `file_access_security`
@@ -473,13 +601,17 @@ unaffected either way — it's checked before any key ever reaches `App`.
 ## Error handling
 
 Provider errors are `ChatError` (`Connection`, `MalformedResponse`,
-`Auth`), with hand-written `Display`/`std::error::Error` impls rather
-than a derive-macro crate — a handful of variants is a small enough
-amount of code that writing it directly is more instructive than
-depending on something to generate it. `ChatError::Auth` exists for
-Mistral's API-key rejection case; `OllamaClient` has no way to trigger
-it (no credentials involved), but the enum is shared across every
-`LlmClient` implementation.
+`Auth`, `ResponseTruncated`, `Refused`), with hand-written `Display`/
+`std::error::Error` impls rather than a derive-macro crate — a handful
+of variants is a small enough amount of code that writing it directly is
+more instructive than depending on something to generate it.
+`ChatError::Auth` exists for a rejected API key — both Mistral's and
+Anthropic's error envelopes map to it; `OllamaClient` has no way to
+trigger it (no credentials involved), but the enum is shared across
+every `LlmClient` implementation. `ResponseTruncated`/`Refused` are
+Anthropic-specific today (see "Talking to Anthropic" above) but don't
+name Anthropic in the variant itself — nothing stops Mistral/Ollama from
+returning them too if either ever grows the same kind of check.
 
 `extract_mistral_reply` handles the fact that a Mistral response can be
 one of two shapes — a success envelope or an error envelope — with no
@@ -524,28 +656,33 @@ either way.
 
 ## Credentials
 
-`MistralClient::new` takes an already-resolved API key rather than
-performing its own `getfrompass`/env-var lookup — resolving *which*
-source supplies the key, and what happens if neither has one, are
-startup-wiring concerns that belong to `main.rs`, not the client. This
-keeps `MistralClient` scoped to one responsibility: given a key and a
-model, do the HTTP round-trip and map errors correctly.
-`lookup_mistral_api_key` tries `getfrompass` first, falling back to the
-`MISTRAL_API_KEY` env var only when `getfrompass` has no value — see
-`SECURITY.md` for the credential-handling specifics.
+`MistralClient::new` (and `AnthropicClient::new` the same way) takes an
+already-resolved API key rather than performing its own
+`getfrompass`/env-var lookup — resolving *which* source supplies the
+key, and what happens if neither has one, are startup-wiring concerns
+that belong to `main.rs`, not the client. This keeps each client scoped
+to one responsibility: given a key and a model, do the HTTP round-trip
+and map errors correctly. `lookup_mistral_api_key`/
+`lookup_anthropic_api_key` each try `getfrompass` first, falling back to
+their own env var (`MISTRAL_API_KEY`/`ANTHROPIC_API_KEY`) only when
+`getfrompass` has no value — see `SECURITY.md` for the
+credential-handling specifics.
 
 ## Startup wiring
 
 `main.rs` parses CLI flags, resolves the model and provider, and
 constructs the matching `LlmClient` before entering the render loop.
-For Mistral, this is also where the API key lookup happens and its
-result acted on: on success, a startup line reports which source
-supplied it (never the value); on failure, `main` returns an error
-before any terminal setup happens, rather than opening with no working
-provider. The active provider is shown as a static label in the chat
-title for the whole session — parsed once at startup, with no
-live-switching mechanism, matching how the underlying CLI selection
-itself is a one-time choice.
+For Mistral and Anthropic, this is also where the API key lookup
+happens and its result acted on: on success, a startup line reports
+which source supplied it (never the value); on failure, `main` returns
+an error before any terminal setup happens, rather than opening with no
+working provider. Anthropic's branch does one thing neither of the
+other two does: calls `Settings::load()` itself, to read
+`anthropic_thinking` before `AnthropicClient::new` can be constructed —
+see "Talking to Anthropic" above for why. The active provider is shown
+as a static label in the chat title for the whole session — parsed once
+at startup, with no live-switching mechanism, matching how the
+underlying CLI selection itself is a one-time choice.
 
 ## Testing strategy
 
@@ -563,10 +700,22 @@ observable state (log content, input cleared) rather than mocking
 and the full path still gets exercised by actually running the app.
 
 Some behavior can only be verified against a real external service —
-Ollama locally, or the real Mistral API. Those tests live in their own
-files under `tests/`, gated with `#![cfg(feature = "local")]`, and only
-run via `cargo test --features local` (`just test`); a plain `cargo
-test`/CI run never compiles them.
+Ollama locally, or the real Mistral/Anthropic APIs. Those tests live in
+their own files under `tests/`, gated with `#![cfg(feature = "local")]`,
+and only run via `cargo test --features local` (`just test`, or
+`just mistral`/`just ollama`/`just anthropic` individually); a plain
+`cargo test`/CI run never compiles them. `real_anthropic_smoke_test.rs`
+is deliberately thinner than the Mistral/Ollama equivalents — two cheap,
+low-ambiguity prompts (a plain reply, one obvious tool call) rather than
+the fuller reliability suites those two accumulated over time. Manual
+testing found real cost risk in open-ended or looping prompts against
+Anthropic specifically — one exchange cost more than half of a small
+real-money test budget, since every request resends the entire growing
+history at full price with no prompt caching yet (see
+"Conversation history" above) — so the automated smoke test stays
+intentionally narrow: proving the wire mapping works end-to-end, not a
+standing reliability suite that runs — and spends — on every
+invocation.
 
 ## Terminal/TUI mechanics
 

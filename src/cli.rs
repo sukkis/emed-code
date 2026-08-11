@@ -11,6 +11,7 @@ use clap::{Parser, ValueEnum};
 pub enum Provider {
     Ollama,
     Mistral,
+    Anthropic,
 }
 
 /// emed-code — a terminal AI coding assistant.
@@ -43,6 +44,7 @@ fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::Ollama => crate::core::OLLAMA_MODEL,
         Provider::Mistral => crate::core::MISTRAL_MODEL,
+        Provider::Anthropic => crate::core::ANTHROPIC_MODEL,
     }
 }
 
@@ -65,6 +67,14 @@ mod tests {
 
         assert_eq!(cli.provider, Provider::Mistral);
         assert_eq!(cli.resolved_model(), "mistral-small-latest");
+    }
+
+    #[test]
+    fn cli_defaults_to_claude_sonnet_5_when_provider_is_anthropic_and_no_model_given() {
+        let cli = Cli::try_parse_from(["emed-code", "--provider", "anthropic"]).unwrap();
+
+        assert_eq!(cli.provider, Provider::Anthropic);
+        assert_eq!(cli.resolved_model(), "claude-sonnet-5");
     }
 
     #[test]

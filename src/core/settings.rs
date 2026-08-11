@@ -14,10 +14,32 @@ pub(crate) enum FileAccessSecurity {
     Loose,
 }
 
+// Mirrors FileAccessSecurity's shape exactly. Anthropic-specific today
+// (Claude Sonnet 5 runs adaptive thinking by default unless told
+// otherwise — see docs/anthropic-provider.md design question 9), but
+// named for the concept, not the provider, the same way ChatError's
+// ResponseTruncated/Refused variants are.
+//
+// pub, not pub(crate), unlike FileAccessSecurity: main.rs (a separate
+// binary crate depending on this one) needs to read this field to
+// construct AnthropicClient — Core::with_client's own internal
+// Settings::load() happens too late for that, after the client already
+// exists. FileAccessSecurity has no equivalent need; it's consumed
+// entirely inside Core/dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicThinking {
+    #[default]
+    Disabled,
+    Adaptive,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub(crate) struct Settings {
+pub struct Settings {
     #[serde(default)]
     pub(crate) file_access_security: FileAccessSecurity,
+    #[serde(default)]
+    pub anthropic_thinking: AnthropicThinking,
 }
 
 impl Settings {
@@ -32,8 +54,9 @@ impl Settings {
     // The real entry point: resolves the real config path and reads it.
     // Not unit-tested directly, same as Core::with_client's real
     // std::env::current_dir() call — only the pure logic around it
-    // (parse, above) is.
-    pub(crate) fn load() -> Settings {
+    // (parse, above) is. pub, not pub(crate): main.rs calls this
+    // directly too now — see the AnthropicThinking doc comment above.
+    pub fn load() -> Settings {
         let contents = dirs::config_dir()
             .map(|dir| dir.join("emed-code").join("settings.toml"))
             .and_then(|path| std::fs::read_to_string(path).ok());
@@ -82,5 +105,39 @@ mod tests {
         let settings = Settings::parse(r#"file_access_security = "yolo""#);
 
         assert_eq!(settings.file_access_security, FileAccessSecurity::Strict);
+    }
+
+    // anthropic_thinking mirrors file_access_security's own tests above —
+    // same fail-safe-to-default shape. The malformed-TOML fallback case
+    // isn't re-tested here: Settings::default() covers both fields via
+    // the same code path already proven by
+    // parse_defaults_to_strict_for_malformed_toml above.
+
+    #[test]
+    fn parse_defaults_to_disabled_for_an_empty_file() {
+        let settings = Settings::parse("");
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Disabled);
+    }
+
+    #[test]
+    fn parse_reads_an_explicit_disabled_value() {
+        let settings = Settings::parse(r#"anthropic_thinking = "disabled""#);
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Disabled);
+    }
+
+    #[test]
+    fn parse_reads_an_explicit_adaptive_value() {
+        let settings = Settings::parse(r#"anthropic_thinking = "adaptive""#);
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Adaptive);
+    }
+
+    #[test]
+    fn parse_defaults_to_disabled_for_an_unrecognized_value() {
+        let settings = Settings::parse(r#"anthropic_thinking = "yolo""#);
+
+        assert_eq!(settings.anthropic_thinking, AnthropicThinking::Disabled);
     }
 }

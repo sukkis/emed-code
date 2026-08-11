@@ -7,11 +7,12 @@ choices; this document tracks position, not rationale.
 ## Overview
 
 emed-code hands an LLM the ability to read, and eventually write, files
-in your project, plus your Mistral API key if you use the cloud
-provider. The threats that follow from that:
+in your project, plus your Mistral or Anthropic API key if you use one
+of the cloud providers. The threats that follow from that:
 
-- **Credential leakage** — the Mistral API key ending up somewhere it
-  shouldn't (logs, error messages, a request going to the wrong place).
+- **Credential leakage** — a cloud provider's API key ending up
+  somewhere it shouldn't (logs, error messages, a request going to the
+  wrong place).
 - **Sandbox escape** — a tool call reading or writing outside the
   directory you launched emed-code from.
 - **Sensitive-file exposure** — a tool reading (and thereby sending to
@@ -30,14 +31,17 @@ Each is addressed below under its own heading.
 
 ## Credential handling
 
-The Mistral API key is resolved via `getfrompass` first, falling back
-to the `MISTRAL_API_KEY` environment variable only when `getfrompass`
-has no value. Only the non-panicking `try_get_from_pass` is ever
-called — never a write function. The key is held as `Zeroizing<String>`
-regardless of source, used only to build the outgoing
-`Authorization` header, and never appears in a `ChatError` or any log
-line — a startup message reports *which source* supplied the key, never
-the value.
+Both cloud providers' API keys follow the identical pattern: resolved
+via `getfrompass` first (`emed-code/mistral/api_key` /
+`emed-code/anthropic/api_key`), falling back to the matching
+environment variable (`MISTRAL_API_KEY` / `ANTHROPIC_API_KEY`) only
+when `getfrompass` has no value. Only the non-panicking
+`try_get_from_pass` is ever called — never a write function. Each key
+is held as `Zeroizing<String>` regardless of source, used only to build
+the outgoing auth header (`Authorization: Bearer` for Mistral,
+`x-api-key` for Anthropic — different header, identical protection),
+and never appears in a `ChatError` or any log line — a startup message
+reports *which source* supplied the key, never the value.
 
 A missing key produces a clear error before the terminal UI even opens,
 rather than the app starting with no working provider.
@@ -45,10 +49,11 @@ rather than the app starting with no working provider.
 ## Local-first default and provider transparency
 
 A plain `cargo run`, with no flags, always defaults to local Ollama —
-never Mistral — so using a cloud provider is always an explicit choice.
-The active provider is shown in the chat title for the entire session,
-not just in a startup line that scrolls out of view once the terminal
-UI takes over, so it's never ambiguous whether a cloud call is in play.
+never a cloud provider — so talking to Mistral or Anthropic is always
+an explicit choice. The active provider is shown in the chat title for
+the entire session, not just in a startup line that scrolls out of view
+once the terminal UI takes over, so it's never ambiguous whether a
+cloud call is in play.
 
 ## Sandboxed file access
 
@@ -100,10 +105,10 @@ shown explicitly rather than ever being normalized away, since the
 approval is only meaningful if the preview genuinely matches what
 happens on disk.
 
-This applies identically to both providers — the confirmation gate is
-routed by tool name, not by which `LlmClient` is in use, so a local
-Ollama model reaches the exact same approval step a cloud Mistral model
-does.
+This applies identically across all three providers — the confirmation
+gate is routed by tool name, not by which `LlmClient` is in use, so a
+local Ollama model reaches the exact same approval step a cloud Mistral
+or Anthropic model does.
 
 ## Directory creation
 
@@ -177,6 +182,15 @@ model response at a fixed small number of attempts before ending the
 exchange with a clear error. This doesn't compound with the tool-call
 cap above — an empty response never produces a tool call, so the two
 counters never add to each other's cost.
+
+**Known gap**: the cap bounds total call *count*, not call *rate* or
+*continued relevance*. Manual testing against the Anthropic provider
+found a model continuing to call tools well past an explicit user
+correction ("don't implement, just note it") — comfortably under the
+40-call cap, but enough consecutive calls in a row to hit the
+provider's own rate limit. The cap doesn't detect "this task should
+have stopped," only "this task made too many calls total." Not
+addressed yet.
 
 ## Dependency vulnerability scanning
 

@@ -1,7 +1,8 @@
 use clap::Parser;
 use emed_code::cli::{Cli, Provider};
 use emed_code::core::{
-    Core, MistralClient, OllamaClient, credential_log_message, lookup_mistral_api_key,
+    AnthropicClient, Core, MistralClient, OllamaClient, Settings, anthropic_credential_log_message,
+    credential_log_message, lookup_anthropic_api_key, lookup_mistral_api_key,
 };
 use emed_code::tui::{App, ProviderLabel, draw, is_quit_key};
 use ratatui::crossterm::event::{self, Event};
@@ -16,6 +17,7 @@ fn main() -> io::Result<()> {
     let provider_label = match cli.provider {
         Provider::Ollama => ProviderLabel::Ollama,
         Provider::Mistral => ProviderLabel::Mistral,
+        Provider::Anthropic => ProviderLabel::Anthropic,
     };
 
     let core = match cli.provider {
@@ -29,6 +31,22 @@ fn main() -> io::Result<()> {
             })?;
             println!("{}", credential_log_message(&source));
             Core::with_client(Arc::new(MistralClient::new(api_key, model)))
+        }
+        Provider::Anthropic => {
+            let (api_key, source) = lookup_anthropic_api_key().ok_or_else(|| {
+                io::Error::other(
+                    "no Anthropic API key found (set ANTHROPIC_API_KEY, or add \
+                     emed-code/anthropic/api_key via getfrompass)",
+                )
+            })?;
+            println!("{}", anthropic_credential_log_message(&source));
+            // A second Settings::load() beyond Core::with_client's own
+            // internal one — main.rs needs anthropic_thinking before
+            // Core::with_client exists to construct the client it's
+            // about to receive. Two tiny startup file reads, not a
+            // per-request cost; see docs/anthropic-provider.md.
+            let thinking = Settings::load().anthropic_thinking;
+            Core::with_client(Arc::new(AnthropicClient::new(api_key, model, thinking)))
         }
     };
 
