@@ -2,14 +2,15 @@
 
 A fast, keyboard-driven AI coding assistant that lives in your
 terminal — pair with a local [Ollama](https://ollama.com) model or
-Mistral's cloud API without leaving your terminal or tmux session.
+Mistral's or Anthropic's cloud APIs without leaving your terminal or
+tmux session.
 
 ## Why emed-code
 
 - **Your choice of brain.** Talk to a local Ollama model — free and
-  private — or Mistral's cloud API for stronger answers, one flag
-  apart. The active choice is always shown right in the chat title, so
-  you're never surprised by a cloud call.
+  private — or Mistral's or Anthropic's cloud APIs for stronger
+  answers, one flag apart. The active choice is always shown right in
+  the chat title, so you're never surprised by a cloud call.
 - **Remembers the conversation.** Follow-up questions just work — no
   need to repeat context turn after turn.
 - **Understands your project.** It can read and list files to answer
@@ -39,20 +40,21 @@ Mistral's cloud API without leaving your terminal or tmux session.
 cargo run
 ```
 
-talks to a local Ollama instance. Want Mistral instead?
+talks to a local Ollama instance. Want a cloud model instead?
 
 ```
 cargo run -- --provider mistral --model mistral-medium-latest
+cargo run -- --provider anthropic
 ```
 
-Mistral needs an API key — either a `getfrompass` entry
-(`emed-code/mistral/api_key`) or the `MISTRAL_API_KEY` env var works.
+Both cloud providers need their own API key — either a `getfrompass`
+entry (`emed-code/mistral/api_key` or `emed-code/anthropic/api_key`) or
+the matching env var (`MISTRAL_API_KEY`/`ANTHROPIC_API_KEY`) works.
 Ask it things like "what files are in this project?", "read Cargo.toml
 and tell me the package name", or "add a `.gitignore` entry for
 `target/`" — reads and writes are both sandboxed to wherever you
 launched it from, and any write shows you a diff to approve first. This
-works the same way whether you're talking to a local Ollama model or
-Mistral's cloud API.
+works the same way no matter which of the three you're talking to.
 
 Want to change which files it's willing to touch? Copy
 `settings.toml.example` to `~/.config/emed-code/settings.toml` and edit
@@ -73,10 +75,10 @@ just test
 
 runs everything, including tests against real external services: a
 local Ollama instance (model: `mistral-nemo` — `ollama list` to check
-it's pulled) and the real Mistral API (needs an API key, same as
-above). `just ci` (or plain `cargo test`) skips those and runs only
-what's self-contained. See `ARCHITECTURE.md` for how it's built and
-why.
+it's pulled) and the real Mistral and Anthropic APIs (each needs its
+own API key, same as above). `just ci` (or plain `cargo test`) skips
+those and runs only what's self-contained. See `ARCHITECTURE.md` for
+how it's built and why.
 
 ## Roadmap
 
